@@ -185,6 +185,63 @@ def get_memory():
     mem.setdefault("first_day", str(date.today()))
     return mem
 
+# ------------------------------------------------------- #85 স্মৃতির ওজন
+# ওজন আলাদা ফাইলে থাকে (fact_weights.json: {fact_text: weight}) যাতে
+# memory.json-এর পুরোনো ফরম্যাট একদম না বদলায়। ডিফল্ট ওজন ১, সর্বোচ্চ ৯৯।
+FACT_WEIGHTS_FILE = DATA / "fact_weights.json"
+FACT_ARCHIVE_FILE = DATA / "fact_archive.json"
+
+
+def _fact_weights_load():
+    w = load_json(FACT_WEIGHTS_FILE, {})
+    return w if isinstance(w, dict) else {}
+
+
+def _fact_weights_save(w):
+    try:
+        save_json(FACT_WEIGHTS_FILE, w)
+    except Exception:
+        pass
+
+
+def fact_weights_aligned(facts):
+    """facts-এর ক্রম অনুযায়ী ওজনের parallel list (ডিফল্ট ১)।"""
+    w = _fact_weights_load()
+    out = []
+    for f in facts or []:
+        try:
+            out.append(max(1, min(99, int(w.get(str(f), 1)))))
+        except Exception:
+            out.append(1)
+    return out
+
+
+def bump_fact_weights(fact_texts):
+    """যেসব fact সত্যিই context/prompt-এ গেল, তাদের ওজন +১ (সর্বোচ্চ ৯৯)।"""
+    if not fact_texts:
+        return
+    w = _fact_weights_load()
+    changed = False
+    for f in fact_texts:
+        key = str(f)
+        try:
+            cur = int(w.get(key, 1))
+        except Exception:
+            cur = 1
+        nw = min(99, cur + 1)
+        if nw != cur or key not in w:
+            w[key] = nw
+            changed = True
+    if changed:
+        _fact_weights_save(w)
+
+
+def _fact_weight_forget(fact_text):
+    w = _fact_weights_load()
+    if str(fact_text) in w:
+        w.pop(str(fact_text), None)
+        _fact_weights_save(w)
+
 
 def get_version():
     ver = load_json(VERSION_FILE, {})
@@ -550,6 +607,10 @@ def ask_gemini(user_text, mem, quality=False, image=None):
         _record(None, 0, False)
         return None
     facts = "; ".join(mem.get("facts", [])[-10:])
+    try:
+        bump_fact_weights(list(mem.get("facts", [])[-10:]))
+    except Exception:
+        pass
     likes = ", ".join(mem.get("likes", [])[-10:])
     system = get_prompt() + f"\nমনে থাকা তথ্য: {facts}\nপছন্দ: {likes}"
     _layered = layered_memory_block(mem)
@@ -3118,7 +3179,11 @@ def backup_api(data):
                   "conversations": convos_load(),
                   "pins": pins_load(),
                   "notes": _notes,
-                  "tasks": load_json(AWAY_FILE, []) if AWAY_FILE.exists() else []}
+                  "tasks": load_json(AWAY_FILE, []) if AWAY_FILE.exists() else [],
+                  "daily_q": load_json(DAILY_Q_FILE, {}) if DAILY_Q_FILE.exists() else {},
+                  "reminders": load_json(REMINDERS_FILE, []) if REMINDERS_FILE.exists() else [],
+                  "fact_weights": load_json(FACT_WEIGHTS_FILE, {}) if FACT_WEIGHTS_FILE.exists() else {},
+                  "fact_archive": load_json(FACT_ARCHIVE_FILE, []) if FACT_ARCHIVE_FILE.exists() else []}
         _fname = f"sokhi-{kind}-{datetime.now().strftime('%Y%m%d')}.json"
         return {"ok": True, "filename": _fname, "bundle": bundle}
     if action == "import":
@@ -3131,7 +3196,9 @@ def backup_api(data):
         try:
             _snap.mkdir(parents=True, exist_ok=True)
             for _src in (CONFIG_FILE, MEMORY_FILE, CONVERSATIONS_FILE,
-                         PINS_FILE, DATA / "notes.txt", AWAY_FILE):
+                         PINS_FILE, DATA / "notes.txt", AWAY_FILE,
+                         DAILY_Q_FILE, REMINDERS_FILE, FACT_WEIGHTS_FILE,
+                         FACT_ARCHIVE_FILE):
                 try:
                     if _src.exists():
                         shutil.copy2(_src, _snap / _src.name)
@@ -3169,8 +3236,412 @@ def backup_api(data):
         _btasks = bundle.get("tasks")
         if isinstance(_btasks, list):
             save_json(AWAY_FILE, _btasks[-50:])
+        _bdq = bundle.get("daily_q")
+        if isinstance(_bdq, dict):
+            save_json(DAILY_Q_FILE, _bdq)
+        _brem = bundle.get("reminders")
+        if isinstance(_brem, list):
+            save_json(REMINDERS_FILE, _brem[-200:])
+        _bfw = bundle.get("fact_weights")
+        if isinstance(_bfw, dict):
+            save_json(FACT_WEIGHTS_FILE, _bfw)
+        _bfa = bundle.get("fact_archive")
+        if isinstance(_bfa, list):
+            save_json(FACT_ARCHIVE_FILE, _bfa[-500:])
         return {"ok": True, "snapshot": _snap.name, "restored": restored}
     return {"ok": False, "error": "কী করতে হবে বুঝতে পারিনি — action ঠিক করে পাঠাও।"}
+
+
+# =====================================================================
+#  v1.4.0 — Worker B: #700 daily hard question, #109 reminder rules,
+#  #100 weekly board (lite), #52 self-doctor (lite)
+#  সব state DATA-র ভিতরে; Gemini key কোথাও output-এ যায় না।
+# =====================================================================
+DAILY_Q_FILE = DATA / "daily_q.json"
+REMINDERS_FILE = DATA / "reminders.json"
+_WEEKDAY_KEYS = ("sat", "sun", "mon", "tue", "wed", "thu", "fri")
+
+
+# ------------------------------------------------ #700 দৈনিক কঠিন প্রশ্ন
+def _dailyq_candidates():
+    """প্রার্থী প্রশ্ন: আগে ভুলের খাতা, না থাকলে অফলাইন ব্যাংক (সব বিষয়)।
+
+    ভুলের খাতার আসল আকার (exam_answer থেকে): {q, options, correct(সঠিক
+    উত্তরের TEXT), your_answer, subject, topic, date} — তাই 'answer' index
+    থাকলে সেটা, না থাকলে 'correct' text থেকে index বের করা হয়।"""
+    cands = []
+    book = load_json(_WRONG_BOOK_FILE, [])
+    if isinstance(book, list):
+        for e in book:
+            if not isinstance(e, dict):
+                continue
+            q = e.get("q")
+            opts = e.get("options")
+            if not q or not isinstance(opts, list) or len(opts) < 2:
+                continue
+            ans = None
+            if isinstance(e.get("answer"), int) and 0 <= e["answer"] < len(opts):
+                ans = e["answer"]
+            elif e.get("correct") is not None:
+                try:
+                    ans = [str(o) for o in opts].index(str(e["correct"]))
+                except ValueError:
+                    continue
+            if ans is None:
+                continue
+            cands.append({"q": str(q),
+                          "options": [str(o) for o in opts[:4]],
+                          "answer": int(ans),
+                          "topic": str(e.get("topic") or "ভুলের খাতা"),
+                          "source": "ভুলের খাতা"})
+    if cands:
+        return cands
+    pooled = []
+    for subj, qs_ in OFFLINE_BANK.items():
+        for it in qs_ or []:
+            if (isinstance(it, dict) and it.get("q")
+                    and isinstance(it.get("options"), list)
+                    and isinstance(it.get("answer"), int)
+                    and 0 <= it["answer"] < len(it["options"])):
+                pooled.append({"q": str(it["q"]),
+                               "options": [str(o) for o in it["options"][:4]],
+                               "answer": int(it["answer"]),
+                               "topic": str(it.get("topic") or subj),
+                               "source": subj})
+    return pooled
+
+
+def _dailyq_today_state():
+    """আজকের state; তারিখ বদলালে নতুন প্রশ্ন বেছে সেভ করে।"""
+    today = str(date.today())
+    st = load_json(DAILY_Q_FILE, {})
+    if isinstance(st, dict) and st.get("date") == today and st.get("q"):
+        return st
+    cands = _dailyq_candidates()
+    if not cands:
+        return None
+    pick = cands[date.today().toordinal() % len(cands)]
+    st = {"date": today, "q": pick["q"], "options": pick["options"],
+          "answer": pick["answer"], "topic": pick["topic"],
+          "source": pick["source"], "done": False, "revealed": False}
+    save_json(DAILY_Q_FILE, st)
+    return st
+
+
+def dailyq_get():
+    """GET /api/dailyq — উত্তরের index/text কখনোই পাঠানো হয় না।"""
+    st = _dailyq_today_state()
+    if not st:
+        return {"ok": True, "done": True, "date": str(date.today()),
+                "question": None}
+    return {"ok": True, "done": bool(st.get("done")),
+            "date": st.get("date"),
+            "question": {"q": st.get("q"), "options": st.get("options"),
+                         "topic": st.get("topic"),
+                         "source": st.get("source")}}
+
+
+def dailyq_api(data):
+    """POST /api/dailyq — action: 'reveal' | 'skip'."""
+    data = data if isinstance(data, dict) else {}
+    action = str(data.get("action") or "").strip()
+    st = _dailyq_today_state()
+    if action == "reveal":
+        if not st:
+            return {"ok": False, "error": "আজকের জন্য কোনো প্রশ্ন পাইনি।"}
+        st["revealed"] = True
+        st["done"] = True
+        save_json(DAILY_Q_FILE, st)
+        ans = int(st.get("answer", 0))
+        opts = st.get("options") or []
+        return {"ok": True, "answer_index": ans,
+                "answer_text": opts[ans] if 0 <= ans < len(opts) else ""}
+    if action == "skip":
+        if st:
+            st["done"] = True
+            save_json(DAILY_Q_FILE, st)
+        return {"ok": True}
+    return {"ok": False,
+            "error": "action হতে হবে 'reveal' বা 'skip'।"}
+
+
+# ------------------------------------------------ #109 রিমাইন্ডার নিয়ম
+def _reminders_load():
+    items = load_json(REMINDERS_FILE, [])
+    return items if isinstance(items, list) else []
+
+
+def _reminders_save(items):
+    save_json(REMINDERS_FILE, items[-200:])
+
+
+def reminders_api(data):
+    """POST /api/reminders — action: 'list' | 'add' | 'delete'.
+    GET /api/reminders এই একই ফাংশনকে {'action':'list'} দিয়ে ডাকে।"""
+    data = data if isinstance(data, dict) else {}
+    action = str(data.get("action") or "list").strip()
+    if action == "list":
+        return {"ok": True, "rules": _reminders_load()}
+    if action == "add":
+        text = str(data.get("text") or "").strip()
+        if not text or len(text) > 200:
+            return {"ok": False,
+                    "error": "রিমাইন্ডারের লেখা খালি নয়, সর্বোচ্চ ২০০ অক্ষর হতে হবে।"}
+        tm = str(data.get("time") or "").strip()
+        m = re.match(r"^(\d{2}):(\d{2})$", tm)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            return {"ok": False,
+                    "error": "সময়টা HH:MM আকারে দাও, যেমন 07:30।"}
+        days = str(data.get("days") or "daily").strip()
+        if days != "daily":
+            parts = [d.strip() for d in days.split(",") if d.strip()]
+            if not parts or any(d not in _WEEKDAY_KEYS for d in parts):
+                return {"ok": False,
+                        "error": "বার হতে হবে 'daily' অথবা sat,sun,mon,tue,wed,thu,fri থেকে বেছে কমা দিয়ে।"}
+            days = ",".join(parts)
+        rules = _reminders_load()
+        ids = []
+        for r in rules:
+            if isinstance(r, dict):
+                try:
+                    ids.append(int(r.get("id", 0)))
+                except Exception:
+                    pass
+        rule = {"id": (max(ids) + 1) if ids else 1, "text": text,
+                "time": tm, "days": days, "created": str(date.today())}
+        rules.append(rule)
+        _reminders_save(rules)
+        return {"ok": True, "rules": rules}
+    if action == "delete":
+        try:
+            rid = int(data.get("id"))
+        except Exception:
+            return {"ok": False, "error": "নিয়মের id ঠিক করে পাঠাও।"}
+        rules = [r for r in _reminders_load()
+                 if not (isinstance(r, dict) and r.get("id") == rid)]
+        _reminders_save(rules)
+        return {"ok": True, "rules": rules}
+    return {"ok": False,
+            "error": "action হতে হবে 'list', 'add' বা 'delete'।"}
+
+
+# ------------------------------------------------ #100 সাপ্তাহিক বোর্ড-সভা lite
+def board_text():
+    """গত ৭ দিনের সারসংক্ষেপ — শুধু বিদ্যমান ডেটা থেকে, সহজ বাংলায়।
+
+    সতর্কতা: study-progress.json-এ cumulative গণনা + last_date থাকে,
+    সাপ্তাহিক delta পাওয়া যায় না — তাই মোট হিসাবটা 'সার্বিক' বলে
+    পরিষ্কার লেখা হয়, আর ৭ দিনের অংশটা শুধু last_date দিয়ে দেখানো হয়।"""
+    today = date.today()
+    lines = ["🗓️ সাপ্তাহিক বোর্ড-সভা রিপোর্ট",
+             f"তৈরি: {now_str()} (গত ৭ দিনের চিত্র যেখানে তারিখ আছে)",
+             ""]
+    prog = load_json(_STUDY_PROGRESS_FILE, {})
+    if not isinstance(prog, dict):
+        prog = {}
+    tot_sessions = tot_mocks = tot_steps = 0
+    active = []
+    for subj, ent in prog.items():
+        if not isinstance(ent, dict):
+            continue
+        tot_sessions += int(ent.get("sessions", 0) or 0)
+        tot_mocks += int(ent.get("mock_tests", 0) or 0)
+        tot_steps += int(ent.get("total_steps", 0) or 0)
+        try:
+            ld = date.fromisoformat(str(ent.get("last_date") or ""))
+            if 0 <= (today - ld).days <= 6:
+                active.append((subj, ent))
+        except Exception:
+            pass
+    lines.append("📚 পড়াশোনা — সক্রিয় বিষয় ও সর্বশেষ অগ্রগতি")
+    if prog:
+        lines.append(f"• সার্বিক হিসাব: সেশন {_bn_num(tot_sessions)}টি, "
+                     f"মক টেস্ট {_bn_num(tot_mocks)}টি, ধাপ {_bn_num(tot_steps)}টি")
+        if active:
+            for subj, ent in active:
+                lines.append(f"• {subj}: শেষ টপিক — "
+                             f"{ent.get('last_topic') or '—'} "
+                             f"(শেষ পড়া: {ent.get('last_date') or '—'})")
+        else:
+            lines.append("• গত ৭ দিনে কোনো বিষয়ে নতুন অগ্রগতির রেকর্ড নেই।")
+    else:
+        lines.append("• এখনো কোনো পড়ার রেকর্ড নেই।")
+    lines.append("")
+    book = load_json(_WRONG_BOOK_FILE, [])
+    if not isinstance(book, list):
+        book = []
+    recent_wrong = 0
+    for e in book:
+        if isinstance(e, dict):
+            try:
+                d0 = date.fromisoformat(str(e.get("date") or ""))
+                if 0 <= (today - d0).days <= 6:
+                    recent_wrong += 1
+            except Exception:
+                pass
+    lines.append("📕 ভুলের খাতা")
+    lines.append(f"• মোট ভুল প্রশ্ন জমা: {_bn_num(len(book))}টি")
+    lines.append(f"• গত ৭ দিনে নতুন ভুল: {_bn_num(recent_wrong)}টি")
+    lines.append("")
+    tasks = away_load()
+    pending = sum(1 for t in tasks
+                  if isinstance(t, dict) and t.get("status") == "অপেক্ষায়")
+    shown = sum(1 for t in tasks
+                if isinstance(t, dict) and t.get("status") == "দেখানো হয়েছে")
+    done_like = sum(1 for t in tasks
+                    if isinstance(t, dict)
+                    and str(t.get("status") or "") in ("সম্পন্ন", "done", "শেষ"))
+    lines.append("✅ কাজের তালিকা")
+    lines.append(f"• মোট কাজ: {_bn_num(len(tasks))}টি — অপেক্ষায় "
+                 f"{_bn_num(pending)}টি, দেখানো হয়েছে {_bn_num(shown)}টি, "
+                 f"সম্পন্ন চিহ্নিত {_bn_num(done_like)}টি")
+    lines.append("")
+    mem = get_memory()
+    store = convos_load()
+    items = [it for it in store.get("items", []) if isinstance(it, dict)]
+    n_msgs = sum(len(it.get("messages", []) or []) for it in items)
+    lines.append("🧠 স্মৃতি ও কথোপকথন")
+    lines.append(f"• মনে রাখা তথ্য: {_bn_num(len(mem.get('facts', []) or []))}টি")
+    lines.append(f"• মোট কথাবার্তা (interaction): "
+                 f"{_bn_num(int(mem.get('interaction_count', 0) or 0))}টি")
+    lines.append(f"• কথোপকথন: {_bn_num(len(items))}টি "
+                 f"(মোট বার্তা {_bn_num(n_msgs)}টি)")
+    return "\n".join(lines)
+
+
+def board_api():
+    return {"ok": True, "text": board_text(), "generated": now_str()}
+
+
+# ------------------------------------------------ #52 নিজের ডাক্তার lite
+def doctor_report():
+    """নিজের স্বাস্থ্য-পরীক্ষা — শুধু রিপোর্ট, কোনো auto-fix নয়।
+    Gemini key কখনোই দেখানো হয় না (শুধু বসানো আছে/নেই বলা হয়)।
+
+    নোট: ফাইলে আসল self_test() ফাংশন নেই — ওই নামটা শুধু PLUGIN_TEMPLATE
+    string-এর ভিতরে plugin-দের জন্য; তাই এখানে নিজের ছোট checks চালানো হয়।"""
+    checks = []
+
+    def _add(name, ok, detail, suggestion=""):
+        checks.append({"name": name, "status": "ok" if ok else "warn",
+                       "detail": detail,
+                       "suggestion": "" if ok else suggestion})
+
+    try:
+        _ver = get_version().get("version", "?")
+    except Exception:
+        _ver = "?"
+    _add("অ্যাপের ভার্সন", True,
+         f"চলমান ভার্সন v{_ver} (কোডের ভার্সন v{APP_VERSION})")
+    try:
+        _probe = DATA / ".doctor-probe.tmp"
+        _probe.write_text("ok", encoding="utf-8")
+        try:
+            _probe.unlink()
+        except Exception:
+            pass
+        _add("ডেটা ফোল্ডারে লেখা যায়", True,
+             "data ফোল্ডারে লিখতে পারছি — স্মৃতি ও সেটিংস সেভ হবে।")
+    except Exception as e:
+        _add("ডেটা ফোল্ডারে লেখা যায়", False, f"লিখতে পারিনি: {e}",
+             "data ফোল্ডারটা অন্য প্রোগ্রামে খোলা আছে কিনা দেখো; "
+             "ল্যাপটপ একবার রিস্টার্ট দিয়ে আবার চেষ্টা করো।")
+    for _label, _file in (("স্মৃতির ফাইল (memory.json)", MEMORY_FILE),
+                          ("কথোপকথনের ফাইল (conversations.json)",
+                           CONVERSATIONS_FILE)):
+        try:
+            if not _file.exists():
+                _add(_label, True,
+                     "ফাইল এখনো তৈরি হয়নি — নতুন ইনস্টলে এটা স্বাভাবিক।")
+            else:
+                json.loads(_file.read_text(encoding="utf-8"))
+                _add(_label, True, "ফাইল ঠিকঠাক পড়া যাচ্ছে (JSON ঠিক আছে)।")
+        except Exception as e:
+            _add(_label, False, f"ফাইল পড়তে সমস্যা: {e}",
+                 "ব্যাকআপ থেকে restore করে দেখো, অথবা Saba-কে এই "
+                 "রিপোর্টটা পাঠাও। ফাইলটা নিজে হাতে এডিট কোরো না।")
+    try:
+        _kw = ("error", "ত্রুটি", "failed", "traceback", "429")
+        _hits = 0
+        _last = ""
+        if CHANGELOG.exists():
+            _cl = CHANGELOG.read_text(encoding="utf-8",
+                                      errors="ignore").splitlines()[-15:]
+            for _ln in _cl:
+                if any(k in _ln.lower() for k in _kw):
+                    _hits += 1
+                    _last = _ln.strip()[:120]
+        if _hits == 0:
+            _add("সাম্প্রতিক লগে ত্রুটি", True,
+                 "CHANGELOG-এর শেষ লাইনগুলোতে ত্রুটির চিহ্ন পাইনি।")
+        else:
+            _add("সাম্প্রতিক লগে ত্রুটি", False,
+                 f"ত্রুটি-জাতীয় লাইন {_bn_num(_hits)}টি। সর্বশেষ: {_last}",
+                 "একই ত্রুটি বারবার এলে Saba-কে এই রিপোর্টটা পাঠাও।")
+    except Exception as e:
+        _add("সাম্প্রতিক লগে ত্রুটি", False, f"লগ পড়তে পারিনি: {e}",
+             "CHANGELOG.md ফাইলটা অ্যাপের ফোল্ডারে আছে কিনা দেখো।")
+    _gerr = (_last_gemini_error.get("info") or "").strip()
+    if not _gerr:
+        try:
+            _gl = DATA / "gemini-error.log"
+            if _gl.exists():
+                _gll = [x for x in _gl.read_text(
+                    encoding="utf-8", errors="ignore").splitlines()
+                    if x.strip()]
+                _gerr = _gll[-1][:200] if _gll else ""
+        except Exception:
+            _gerr = ""
+    _key_set = bool((get_config().get("gemini_api_key") or "").strip())
+    if not _key_set:
+        _add("স্মার্ট মাথা (Gemini)", True,
+             "key বসানো নেই — অফলাইন মাথায় চলছি (এটা সমস্যা নয়)।"
+             + (f" শেষ লগের ত্রুটি: {_gerr[:120]}" if _gerr else ""))
+    elif _gerr:
+        _add("স্মার্ট মাথা (Gemini)", False,
+             "key বসানো আছে, তবে শেষ চেষ্টায় ত্রুটি ছিল: " + _gerr[:160],
+             "ত্রুটিতে 429 থাকলে ফ্রি লিমিট — একটু পরে আবার চেষ্টা করো। "
+             "নেট সংযোগটাও একবার দেখে নাও।")
+    else:
+        _add("স্মার্ট মাথা (Gemini)", True,
+             "key বসানো আছে, সাম্প্রতিক কোনো ত্রুটি নেই।")
+    _edge = bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe"))
+    try:
+        _vstat = tts_engine_status()
+    except Exception:
+        _vstat = ""
+    _verr = (VOICE_STATE.get("error") or "").strip()
+    _add("গলা (Edge TTS)", bool(_edge and not _verr),
+         f"অবস্থা: {_vstat}"
+         + (f"; শেষ গলার ত্রুটি: {_verr[:120]}" if _verr else ""),
+         "edge-tts না থাকলে ব্রাউজারের গলা চলবে। Sokhi আবার চালু করলে "
+         "সে নিজে edge-tts বসানোর চেষ্টা করে।")
+    try:
+        _du = shutil.disk_usage(BASE)
+        _free_gb = _du.free / (1024 ** 3)
+        _add("ডিস্কে ফাঁকা জায়গা", _free_gb >= 0.5,
+             f"ফাঁকা আছে প্রায় {_free_gb:.1f} GB।",
+             "ডিস্ক প্রায় ভরে গেছে — অপ্রয়োজনীয় বড় ফাইল সরিয়ে "
+             "জায়গা করো।")
+    except Exception as e:
+        _add("ডিস্কে ফাঁকা জায়গা", False, f"মাপতে পারিনি: {e}",
+             "PC-র ডিস্কের অবস্থা নিজে একবার দেখে নাও।")
+    _bad = sum(1 for c in checks if c["status"] != "ok")
+    lines = ["🩺 নিজের ডাক্তার — স্বাস্থ্য রিপোর্ট",
+             f"তৈরি: {now_str()}", ""]
+    for c in checks:
+        lines.append(("✅ " if c["status"] == "ok" else "⚠️ ")
+                     + c["name"] + ": " + c["detail"])
+        if c["status"] != "ok" and c["suggestion"]:
+            lines.append("   প্রস্তাবিত পদক্ষেপ: " + c["suggestion"])
+    lines.append("")
+    if _bad == 0:
+        lines.append("সারসংক্ষেপ: সব ঠিক আছে।")
+    else:
+        lines.append(f"সারসংক্ষেপ: {_bn_num(_bad)}টি বিষয়ে মনোযোগ দরকার "
+                     "(উপরে দেখো)। আমি নিজে থেকে কিছু ঠিক করিনি — "
+                     "সিদ্ধান্ত তোমার।")
+    return {"ok": True, "text": "\n".join(lines), "checks": checks}
 
 
 def memory_api(data):
@@ -3185,9 +3656,11 @@ def memory_api(data):
             return {"ok": False, "error": "তথ্যের নম্বরটা ঠিক করে পাঠাও।"}
         facts = mem.setdefault("facts", [])
         if 0 <= idx < len(facts):
-            facts.pop(idx)
+            _removed = facts.pop(idx)
             save_json(MEMORY_FILE, mem)
-            return {"ok": True, "facts": facts}
+            _fact_weight_forget(_removed)
+            return {"ok": True, "facts": facts,
+                    "fact_weights": fact_weights_aligned(facts)}
         return {"ok": False, "error": "এই নম্বরের কোনো তথ্য পাইনি।"}
     if action == "add_fact":
         text = str(data.get("text") or "").strip()
@@ -3195,7 +3668,34 @@ def memory_api(data):
             return {"ok": False, "error": "যে তথ্যটা মনে রাখতে হবে, সেটা লিখে দাও।"}
         mem.setdefault("facts", []).append(text[:500])
         save_json(MEMORY_FILE, mem)
-        return {"ok": True, "facts": mem["facts"]}
+        _w = _fact_weights_load()
+        _w.setdefault(text[:500], 1)
+        _fact_weights_save(_w)
+        return {"ok": True, "facts": mem["facts"],
+                "fact_weights": fact_weights_aligned(mem["facts"])}
+    if action == "archive_fact":
+        # #85: delete_fact-এর মতোই সরায়, তবে আগে fact_archive.json-এ রাখে।
+        try:
+            idx = int(data.get("index"))
+        except Exception:
+            return {"ok": False, "error": "তথ্যের নম্বরটা ঠিক করে পাঠাও।"}
+        facts = mem.setdefault("facts", [])
+        if 0 <= idx < len(facts):
+            _arch = facts.pop(idx)
+            _lst = load_json(FACT_ARCHIVE_FILE, [])
+            if not isinstance(_lst, list):
+                _lst = []
+            _lst.append({"text": _arch, "archived": str(date.today())})
+            try:
+                save_json(FACT_ARCHIVE_FILE, _lst[-500:])
+            except Exception:
+                pass
+            save_json(MEMORY_FILE, mem)
+            _fact_weight_forget(_arch)
+            return {"ok": True, "facts": facts,
+                    "fact_weights": fact_weights_aligned(facts),
+                    "archived": _arch}
+        return {"ok": False, "error": "এই নম্বরের কোনো তথ্য পাইনি।"}
     if action == "delete_note":
         try:
             idx = int(data.get("index"))
@@ -4958,6 +5458,10 @@ def handle_message(text):
             return insights_text(mem)
         if "কী কী মনে" in text or "কি মনে রেখেছ" in text or "what do you remember" in low:
             facts = mem["facts"]
+            try:
+                bump_fact_weights(list(facts))
+            except Exception:
+                pass
             if not facts:
                 return "ভাইয়া, এখনো তেমন কিছু মনে রাখিনি। 'মনে রেখো: ...' বলে বললেই আমি সারাজীবন মনে রাখব, তোমার PC-তেই থাকবে।"
             return "ভাইয়া, যা যা মনে রেখেছি:\n" + "\n".join("• " + f for f in facts)
@@ -4982,6 +5486,11 @@ def handle_message(text):
             return exam_status_text()
         if "পড়ার অগ্রগতি" in text:
             return study_progress_text()
+        if ("সাপ্তাহিক রিপোর্ট" in text or "বোর্ড সভা" in text
+                or "সাপ্তাহিক বোর্ড" in text):
+            return board_text()
+        if "নিজের ডাক্তার" in text or "স্বাস্থ্য পরীক্ষা" in text:
+            return doctor_report()["text"]
         if exam_active() and re.match(r"^\s*(ক|খ|গ|ঘ|a|b|c|d|১|২|৩|৪|1|2|3|4)\s*[).।]?\s*$", text):
             return exam_answer(text)
 
@@ -5418,6 +5927,7 @@ function startLive(){
 function stopLive(){liveOn=false;setMood('calm');const b=document.getElementById('livebtn');b.classList.remove('on');b.textContent='লাইভ';
  document.getElementById('orb').classList.remove('listening');try{recog&&recog.abort()}catch(e){}setStatus('লাইভ বন্ধ')}
 function listen(){
+ if(speakingNow)try{stopSpeak()}catch(e){} /* v1.4 #113 barge-in: live শোনা শুরু হলেই বলা থামবে */
  if(!liveOn||speakingNow)return;
  const R=window.SpeechRecognition||window.webkitSpeechRecognition;if(!R)return;
  recog=new R();recog.lang='bn-BD';recog.interimResults=false;
@@ -5676,6 +6186,7 @@ async function fetchReply(t,speakIt){
  const reply=j.reply;
  if(stopRequested){stopRequested=false;add(reply,'sokhi',{instant:true});showSuggestions(reply);return}
  add(reply,'sokhi',{reveal:true});
+ if(window.v14TaskDetect)window.v14TaskDetect(t); /* v1.4 #75 */
  maybeSpeak(reply,t,speakIt);
  showSuggestions(reply)}
 function autoGrowText(){
@@ -5714,7 +6225,7 @@ window.SokhiChat={
    else if(e.key==='ArrowUp'&&el.value===''&&el.selectionStart===0){
     const mine=document.querySelectorAll('#chat .msg.me');
     if(mine.length){e.preventDefault();startEdit(mine[mine.length-1])}}});
-  el.addEventListener('input',autoGrowText)}
+  el.addEventListener('input',autoGrowText);el.addEventListener('input',function(){if(speakingNow)try{stopSpeak()}catch(e){}})} /* v1.4 #113 barge-in: লিখতে শুরু করলেই বলা থামবে */
  document.addEventListener('keydown',e=>{
   if((e.ctrlKey||e.metaKey)&&(e.key==='k'||e.key==='K')){e.preventDefault();const t2=document.getElementById('text');if(t2)t2.focus()}
   else if(e.key==='Escape'){stopAll()}});
@@ -5792,6 +6303,7 @@ async function testKey(){
  const j=await api('/api/testkey',{});
  document.getElementById('keymsg').textContent=j.message;}
 function mic(){
+ try{stopSpeak()}catch(e){} /* v1.4 #113 barge-in: মাইক শুরু হলেই বলা থামবে */
  const R=window.SpeechRecognition||window.webkitSpeechRecognition;
  if(!R){alert('এই ব্রাউজারে গলা-শোনা নেই Chrome ব্যবহার করো');return}
  const r=new R();r.lang='bn-BD';r.onresult=e=>{document.getElementById('text').value=e.results[0][0].transcript;send(true)};r.start()}
@@ -6055,6 +6567,7 @@ body.focus #layout{grid-template-columns:minmax(0,1fr);max-width:980px}
 /* আইডিয়া ৩২: mic() পুনর্সংজ্ঞা — এই appended script-এর ঘোষণা আগেরটিকে বদলে দেয়।
    interimResults=true: বলতে বলতেই আংশিক লেখা composer-এ দেখা যাবে, final এলে send(true)। */
 function mic(){
+ try{stopSpeak()}catch(e){} /* v1.4 #113 barge-in: মাইক শুরু হলেই বলা থামবে */
  const R=window.SpeechRecognition||window.webkitSpeechRecognition;
  if(!R){alert('এই ব্রাউজারে গলা-শোনা নেই — Chrome ব্যবহার করো');return}
  const r=new R();r.lang='bn-BD';r.interimResults=true;r.continuous=false;
@@ -6771,6 +7284,7 @@ function startWake(){
    return}
   if(wakeRec!==r)return;wakeRec=null;
   if(wakeOn&&!fe3LiveOn()&&!fe3Speaking()){clearTimeout(wakeRestart);wakeRestart=setTimeout(startWake,800)}};
+ try{stopSpeak()}catch(e){} /* v1.4 #113 barge-in */
  try{r.start()}catch(e){if(wakeRec===r)wakeRec=null}}
 function stopWake(clearFlag){
  clearTimeout(wakeRestart);
@@ -6836,6 +7350,363 @@ buildFe3Engines();
 try{if(typeof pin==='function'&&pin())loadActiveIntoChat()}catch(e){}
 })();
 
+</script>
+<script>
+/*BW14-START — Worker B v1.4.0 UI (integrator-trimmed): board/doctor
+  buttons + memory weights section. (#700 card and #109 UI/engine are
+  Worker A's block below — duplicates removed at merge.)
+  Uses the page's global api()/apiGet()/add() from the main script. */
+(function(){
+"use strict";
+function el(id){return document.getElementById(id)}
+function bwGet(p){
+  if(typeof apiGet==="function")return apiGet(p);
+  return fetch(p,{headers:{"X-PIN":(typeof pin==="function"?pin():"")}})
+    .then(function(r){return r.json()});
+}
+function bwPost(p,b){
+  if(typeof api==="function")return api(p,b);
+  return fetch(p,{method:"POST",
+    headers:{"Content-Type":"application/json",
+             "X-PIN":(typeof pin==="function"?pin():"")},
+    body:JSON.stringify(b)}).then(function(r){return r.json()});
+}
+function bwSay(t){
+  if(typeof add==="function"){
+    add(t,"sokhi");
+    if(typeof scrollChatToBottom==="function")scrollChatToBottom();
+  }
+}
+window.bw14Board=function(){
+  bwGet("/api/board").then(function(j){
+    bwSay((j&&j.text)||"রিপোর্ট পাইনি।");
+  }).catch(function(){bwSay("সাপ্তাহিক রিপোর্ট আনতে পারলাম না।")});
+};
+window.bw14Doctor=function(){
+  bwGet("/api/doctor").then(function(j){
+    bwSay((j&&j.text)||"রিপোর্ট পাইনি।");
+  }).catch(function(){bwSay("স্বাস্থ্য রিপোর্ট আনতে পারলাম না।")});
+};
+/* ---------------- স্মৃতির ওজন সেকশন (#pane-memory-তে যোগ) ---------------- */
+function bwRenderWeights(){
+  var pane=el("pane-memory");
+  if(!pane)return;
+  var scroll=el("fe2memscroll")||pane;
+  var sec=el("bw14weights");
+  if(!sec){
+    sec=document.createElement("div");
+    sec.id="bw14weights";sec.style.marginTop="16px";
+    scroll.appendChild(sec);
+  }
+  bwGet("/api/memory").then(function(j){
+    var facts=(j&&j.facts)||[];
+    var wts=(j&&j.fact_weights)||[];
+    sec.innerHTML="";
+    var h=document.createElement("div");h.className="secttl";
+    h.textContent="স্মৃতির ওজন (বেশি → কম)";
+    sec.appendChild(h);
+    if(!facts.length){
+      var d=document.createElement("div");d.className="small";
+      d.textContent="কিছু নেই।";sec.appendChild(d);return;
+    }
+    var items=facts.map(function(f,i){
+      return {f:f,i:i,w:(typeof wts[i]==="number"?wts[i]:1)};
+    });
+    items.sort(function(a,b){return (b.w-a.w)||(a.i-b.i)});
+    items.forEach(function(it){
+      var row=document.createElement("div");
+      row.style.cssText="display:flex;gap:6px;align-items:center;margin-top:4px;font-size:13.5px";
+      var s=document.createElement("span");s.style.flex="1";
+      s.textContent=String(it.f);row.appendChild(s);
+      var badge=document.createElement("span");badge.className="small";
+      badge.textContent="ওজন "+it.w;row.appendChild(badge);
+      sec.appendChild(row);
+    });
+    var low=items.filter(function(it){return it.w<=1}).slice(0,10);
+    if(low.length){
+      var ph=document.createElement("div");ph.className="secttl";
+      ph.style.marginTop="12px";
+      ph.textContent="আর্কাইভ প্রস্তাব (কম ওজনের তথ্য — সিদ্ধান্ত তোমার)";
+      sec.appendChild(ph);
+      low.forEach(function(it){
+        var row=document.createElement("div");
+        row.style.cssText="display:flex;gap:6px;align-items:center;margin-top:4px;font-size:13.5px";
+        var s=document.createElement("span");s.style.flex="1";
+        s.textContent=String(it.f);row.appendChild(s);
+        var b=document.createElement("button");
+        b.textContent="আর্কাইভ";b.style.fontSize="12px";
+        b.addEventListener("click",function(){
+          bwPost("/api/memory",{action:"archive_fact",index:it.i})
+          .then(function(){
+            if(window.fe2Tab)window.fe2Tab("memory");
+            setTimeout(bwRenderWeights,400);
+          }).catch(function(){});
+        });
+        row.appendChild(b);sec.appendChild(row);
+      });
+    }
+  }).catch(function(){});
+}
+/* ---------------- কার্ড তৈরি + বুট ---------------- */
+function bwBuild(){
+  var left=el("leftcol");
+  if(left&&!el("bw14card")){
+    var card=document.createElement("div");
+    card.className="card";card.id="bw14card";
+    var h=document.createElement("h3");
+    h.textContent="বোর্ড • ডাক্তার";
+    card.appendChild(h);
+    var row=document.createElement("div");
+    row.style.cssText="display:flex;gap:6px;flex-wrap:wrap";
+    var b1=document.createElement("button");
+    b1.textContent="🗓️ সাপ্তাহিক রিপোর্ট";b1.style.fontSize="13px";
+    b1.addEventListener("click",window.bw14Board);row.appendChild(b1);
+    var b2=document.createElement("button");
+    b2.textContent="🩺 নিজের ডাক্তার";b2.style.fontSize="13px";
+    b2.addEventListener("click",window.bw14Doctor);row.appendChild(b2);
+    card.appendChild(row);
+    left.appendChild(card);
+  }
+  bwRenderWeights();
+}
+if(document.readyState==="loading"){
+  document.addEventListener("DOMContentLoaded",bwBuild);
+}else{
+  bwBuild();
+}
+setInterval(bwRenderWeights,60000);
+})();
+/*BW14-END*/
+
+</script>
+<script>
+/* ============================================================
+   v1.4.0 — Worker A (front-end): #113 barge-in বোতাম, #75 কথা থেকে
+   কাজ ধরা, #700 দৈনিক কঠিন প্রশ্ন, #109 রিমাইন্ডার নিয়ম (UI + ইঞ্জিন)
+   ============================================================ */
+(function(){
+'use strict';
+function $(id){return document.getElementById(id)}
+function v14Speaking(){try{return !!speakingNow}catch(e){return false}}
+function v14Exam(){try{return !!examActive}catch(e){return false}}
+window.v14StopSpeak=function(){try{stopSpeak()}catch(e){}};
+
+/* ---------- ছোট style ---------- */
+var st=document.createElement('style');
+st.textContent=
+ '#v14stopbtn{position:fixed;right:16px;bottom:96px;z-index:90;display:none;align-items:center;gap:6px;'+
+ 'padding:12px 18px;border-radius:999px;font-size:15px;font-weight:600;background:#c0392b;color:#fff;'+
+ 'border:1px solid #e74c3c;box-shadow:0 4px 18px rgba(0,0,0,.45);cursor:pointer}'+
+ '#v14stopbtn.on{display:inline-flex}'+
+ '.v14chip{margin:4px 0 10px 44px;padding:10px 12px;background:var(--panel2);border:1px solid var(--accent);'+
+ 'border-radius:10px;font-size:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;max-width:92%}'+
+ '.v14chip button{padding:5px 12px;font-size:13px}'+
+ '#v14dailyq{border:1px solid var(--accent);background:var(--panel);border-radius:var(--radius);'+
+ 'padding:12px 14px;margin-bottom:10px;box-shadow:var(--shadow);font-size:14.5px}'+
+ '#v14dailyq .opts{margin:8px 0 8px 20px;line-height:1.9}'+
+ '#v14dailyq .opt-right{background:rgba(46,204,113,.25);border-radius:6px;padding:1px 8px;font-weight:700}'+
+ '#v14dailyq button{padding:6px 14px;font-size:13.5px;margin-right:8px}'+
+ '.v14remrow{display:flex;gap:6px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}'+
+ '.v14remrow span{flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}'+
+ '.v14remrow button{flex:none;padding:3px 8px;font-size:12px}';
+document.head.appendChild(st);
+
+/* ---------- #113: বলার সময় সবসময়-দেখা ⏹ থামো বোতাম ---------- */
+var stopBtn=document.createElement('button');
+stopBtn.id='v14stopbtn';stopBtn.type='button';stopBtn.textContent='⏹ থামো';
+stopBtn.title='Sokhi-র বলা এখনই থামাও';
+stopBtn.addEventListener('click',function(){window.v14StopSpeak()});
+document.body.appendChild(stopBtn);
+setInterval(function(){
+ stopBtn.classList.toggle('on',v14Speaking());
+},300);
+
+/* ---------- #75: কথা থেকে কাজ ধরা ---------- */
+var V14_INTENT=['করতে হবে','করা লাগবে','করতে চাই','কিনতে হবে','কিনতে চাই','যেতে হবে','দিতে হবে','নিতে হবে','আনতে হবে'];
+var V14_TIME=['কাল','আগামীকাল','পরশু','শুক্রবার','শনিবার','রবিবার','সোমবার','মঙ্গলবার','বুধবার','বৃহস্পতিবার','সকালে','বিকেলে','রাতে','tomorrow'];
+var V14_INTENT_EN=['need to','have to','buy'];
+var v14Proposed={};
+var v14ChipEl=null;
+function v14HasAny(s,list){for(var i=0;i<list.length;i++){if(s.indexOf(list[i])!==-1)return true}return false}
+window.v14TaskDetect=function(t){
+ try{
+  if(v14Exam())return;
+  var raw=String(t||'').trim();if(!raw)return;
+  if(v14Proposed[raw])return;
+  if(v14ChipEl&&v14ChipEl.parentNode)return; /* একবারে একটাই chip */
+  var low=raw.toLowerCase();
+  var intent=v14HasAny(raw,V14_INTENT)||v14HasAny(low,V14_INTENT_EN);
+  if(!intent)return;
+  var timed=v14HasAny(raw,V14_TIME)||low.indexOf('tomorrow')!==-1;
+  if(!timed&&raw.length<=12)return;
+  v14Proposed[raw]=1;
+  var chat=$('chat');if(!chat)return;
+  var chip=document.createElement('div');chip.className='v14chip';
+  var label=document.createElement('span');
+  label.textContent='📝 এটা কাজে যোগ করবো? — '+(raw.length>60?raw.slice(0,60)+'…':raw);
+  var yes=document.createElement('button');yes.type='button';yes.textContent='যোগ করো';
+  var no=document.createElement('button');no.type='button';no.textContent='না';
+  no.addEventListener('click',function(){chip.remove();if(v14ChipEl===chip)v14ChipEl=null});
+  yes.addEventListener('click',async function(){
+   yes.disabled=true;no.disabled=true;
+   try{await api('/api/tasks',{text:raw});
+    chip.textContent='✓ যোগ হয়েছে';
+    setTimeout(function(){chip.remove();if(v14ChipEl===chip)v14ChipEl=null},4000);
+   }catch(e){yes.disabled=false;no.disabled=false;label.textContent='যোগ করা গেল না — আবার চেষ্টা করো: '+raw}
+  });
+  chip.appendChild(label);chip.appendChild(yes);chip.appendChild(no);
+  chat.appendChild(chip);v14ChipEl=chip;
+  if(typeof scrollChatToBottom==='function')scrollChatToBottom();
+ }catch(e){}
+};
+
+/* ---------- #700: দৈনিক কঠিন প্রশ্ন ---------- */
+var v14DailyTried=false;
+async function v14DailyQ(){
+ if(v14DailyTried)return;v14DailyTried=true;
+ var j=null;
+ try{j=await apiGet('/api/dailyq')}catch(e){return}
+ if(!j||!j.ok||j.done||!j.question)return;
+ var chat=$('chat');if(!chat)return;
+ if($('v14dailyq'))return;
+ var q=j.question;
+ var card=document.createElement('div');card.id='v14dailyq';
+ var head=document.createElement('div');head.className='secttl';
+ head.textContent='🌟 আজকের কঠিন প্রশ্ন ('+(q.topic||'সাধারণ')+')';
+ card.appendChild(head);
+ var qt=document.createElement('div');qt.textContent=q.q||'';card.appendChild(qt);
+ var opts=document.createElement('div');opts.className='opts';
+ var optEls=[];
+ (q.options||[]).forEach(function(o,i){
+  var d=document.createElement('div');d.textContent=(i+1)+'. '+o;opts.appendChild(d);optEls.push(d)});
+ card.appendChild(opts);
+ var btnRow=document.createElement('div');
+ var reveal=document.createElement('button');reveal.type='button';reveal.textContent='উত্তর দেখো';
+ var skip=document.createElement('button');skip.type='button';skip.textContent='আজ থাক';
+ reveal.addEventListener('click',async function(){
+  reveal.disabled=true;skip.disabled=true;
+  try{
+   var r=await api('/api/dailyq',{action:'reveal'});
+   if(r&&r.ok){
+    if(typeof r.answer_index==='number'&&optEls[r.answer_index])optEls[r.answer_index].classList.add('opt-right');
+    var ans=document.createElement('div');ans.style.marginTop='8px';ans.style.fontWeight='600';
+    ans.textContent='✓ সঠিক উত্তর: '+(r.answer_text||((q.options||[])[r.answer_index]||''));
+    card.appendChild(ans);
+    var done=document.createElement('div');done.className='small';done.textContent='আজকের প্রশ্ন শেষ — কাল আবার নতুন প্রশ্ন আসবে।';
+    card.appendChild(done);
+   }else{reveal.disabled=false;skip.disabled=false}
+  }catch(e){reveal.disabled=false;skip.disabled=false}
+ });
+ skip.addEventListener('click',async function(){
+  skip.disabled=true;reveal.disabled=true;
+  try{await api('/api/dailyq',{action:'skip'})}catch(e){}
+  card.remove();
+ });
+ btnRow.appendChild(reveal);btnRow.appendChild(skip);
+ card.appendChild(btnRow);
+ chat.insertBefore(card,chat.firstChild);
+}
+setTimeout(v14DailyQ,1800);
+
+/* ---------- #109: রিমাইন্ডার নিয়ম (UI + ফায়ারিং ইঞ্জিন) ---------- */
+var V14_DAYS=[['daily','প্রতিদিন'],['sat','শনিবার'],['sun','রবিবার'],['mon','সোমবার'],['tue','মঙ্গলবার'],['wed','বুধবার'],['thu','বৃহস্পতিবার'],['fri','শুক্রবার']];
+var V14_DAYNAME={daily:'প্রতিদিন',sat:'শনিবার',sun:'রবিবার',mon:'সোমবার',tue:'মঙ্গলবার',wed:'বুধবার',thu:'বৃহস্পতিবার',fri:'শুক্রবার'};
+var V14_WDKEY=['sun','mon','tue','wed','thu','fri','sat'];
+var v14RemRules=[];
+var v14RemLastLoad=0;
+function v14DaysLabel(days){
+ if(!days||days==='daily')return 'প্রতিদিন';
+ return String(days).split(',').map(function(d){return V14_DAYNAME[d.trim()]||d.trim()}).join(', ')}
+function v14RenderReminders(){
+ var list=$('v14remlist');if(!list)return;
+ list.innerHTML='';
+ if(!v14RemRules.length){
+  var d=document.createElement('div');d.className='small';d.textContent='এখনো কোনো রিমাইন্ডার নিয়ম নেই।';list.appendChild(d);return}
+ v14RemRules.forEach(function(r){
+  var row=document.createElement('div');row.className='v14remrow';
+  var sp=document.createElement('span');
+  sp.textContent='⏰ '+(r.text||'')+' — '+(r.time||'')+' ('+v14DaysLabel(r.days)+')';
+  var del=document.createElement('button');del.type='button';del.textContent='✕';
+  del.title='মুছে ফেলো';
+  del.addEventListener('click',async function(){
+   try{var j=await api('/api/reminders',{action:'delete',id:r.id});
+    if(j&&j.rules)v14RemRules=j.rules;else await v14LoadReminders(true);
+   }catch(e){await v14LoadReminders(true)}
+   v14RenderReminders()});
+  row.appendChild(sp);row.appendChild(del);list.appendChild(row)})}
+async function v14LoadReminders(force){
+ var now=Date.now();
+ if(!force&&now-v14RemLastLoad<800)return;
+ v14RemLastLoad=now;
+ try{var j=await apiGet('/api/reminders');
+  if(j&&j.ok&&Array.isArray(j.rules))v14RemRules=j.rules;
+ }catch(e){}
+ v14RenderReminders()}
+function v14BuildReminders(){
+ var pane=$('pane-tasks');if(!pane||$('v14remsec'))return;
+ var sec=document.createElement('div');sec.id='v14remsec';sec.style.marginTop='16px';
+ var ttl=document.createElement('div');ttl.className='secttl';ttl.textContent='⏰ রিমাইন্ডার নিয়ম';sec.appendChild(ttl);
+ var list=document.createElement('div');list.id='v14remlist';sec.appendChild(list);
+ var form=document.createElement('div');form.style.cssText='display:flex;gap:6px;flex-wrap:wrap;margin-top:8px';
+ var txt=document.createElement('input');txt.id='v14remtext';txt.type='text';txt.placeholder='রিমাইন্ডারের কথা লেখো…';txt.style.flex='1';txt.style.minWidth='140px';
+ var tim=document.createElement('input');tim.id='v14remtime';tim.type='time';tim.value='08:00';
+ var sel=document.createElement('select');sel.id='v14remdays';
+ V14_DAYS.forEach(function(pair){var o=document.createElement('option');o.value=pair[0];o.textContent=pair[1];sel.appendChild(o)});
+ var addB=document.createElement('button');addB.type='button';addB.textContent='যোগ করো';
+ addB.addEventListener('click',async function(){
+  var v=txt.value.trim();if(!v)return;
+  var tm=tim.value||'08:00';
+  try{var j=await api('/api/reminders',{action:'add',text:v,time:tm,days:sel.value});
+   if(j&&j.rules)v14RemRules=j.rules;else await v14LoadReminders(true);
+   txt.value='';v14RenderReminders();
+  }catch(e){try{setStatus('রিমাইন্ডার যোগ করা গেল না')}catch(e2){}}
+ });
+ form.appendChild(txt);form.appendChild(tim);form.appendChild(sel);form.appendChild(addB);
+ sec.appendChild(form);
+ var hint=document.createElement('div');hint.className='small';hint.style.marginTop='6px';
+ hint.textContent='সময় হলে Sokhi চ্যাটে জানাবে আর গলায় বলবে (শান্ত সময়ে শুধু চ্যাটে)।';
+ sec.appendChild(hint);
+ pane.appendChild(sec);
+ v14RenderReminders()}
+/* Tasks ট্যাব খুললেই রিমাইন্ডার লোড — showTab মোড়ক + বোতাম listener (দুটোই, dedupe আছে) */
+try{
+ var origShowTab=window.showTab;
+ if(typeof origShowTab==='function'){
+  window.showTab=function(name){
+   origShowTab(name);
+   if(name==='tasks'){v14BuildReminders();v14LoadReminders(false)}}}
+}catch(e){}
+var tb=$('tabbtn-tasks');
+if(tb)tb.addEventListener('click',function(){v14BuildReminders();v14LoadReminders(false)});
+v14BuildReminders();
+v14LoadReminders(true);
+setInterval(v14LoadReminders,300000);
+/* ফায়ারিং ইঞ্জিন: প্রতি ৩০ সেকেন্ডে যাচাই */
+function v14RemTick(){
+ try{
+  if(!v14RemRules.length)return;
+  var now=new Date();
+  var hhmm=('0'+now.getHours()).slice(-2)+':'+('0'+now.getMinutes()).slice(-2);
+  var wd=V14_WDKEY[now.getDay()];
+  var dateStr=now.getFullYear()+'-'+('0'+(now.getMonth()+1)).slice(-2)+'-'+('0'+now.getDate()).slice(-2);
+  v14RemRules.forEach(function(r){
+   if(!r||r.time!==hhmm)return;
+   var days=r.days||'daily';
+   if(days!=='daily'){
+    var parts=String(days).split(',').map(function(d){return d.trim()});
+    if(parts.indexOf(wd)===-1)return}
+   var key='v14rem_fired_'+r.id+'_'+dateStr;
+   try{if(localStorage.getItem(key))return;localStorage.setItem(key,'1')}catch(e){}
+   var msg='⏰ রিমাইন্ডার: '+(r.text||'');
+   try{if(typeof add==='function')add(msg,'sokhi')}catch(e){}
+   var quiet=false;
+   try{quiet=!!(window.sokhiQuietNow&&window.sokhiQuietNow())}catch(e){}
+   if(!quiet){try{if(typeof speak==='function')speak('রিমাইন্ডার: '+(r.text||''))}catch(e){}}
+  });
+ }catch(e){}
+}
+setInterval(v14RemTick,30000);
+})();
 </script>
 </body></html>"""
 
@@ -6926,7 +7797,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/memory":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
-            return self._json(get_memory())
+            _mem = get_memory()
+            _mem["fact_weights"] = fact_weights_aligned(_mem.get("facts", []))
+            return self._json(_mem)
         if self.path == "/api/agents":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
@@ -6962,10 +7835,26 @@ class Handler(BaseHTTPRequestHandler):
                                           "count": len(it.get("messages", []))}
                                          for it in _store.get("items", [])
                                          if isinstance(it, dict)]})
+        if self.path == "/api/dailyq":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            return self._json(dailyq_get())
+        if self.path == "/api/reminders":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            return self._json(reminders_api({"action": "list"}))
+        if self.path == "/api/board":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            return self._json(board_api())
+        if self.path == "/api/doctor":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            return self._json(doctor_report())
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback", "/api/pins", "/api/backup"):
+        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback", "/api/pins", "/api/backup", "/api/dailyq", "/api/reminders"):
             return self._json({"error": "not found"}, 404)
         if not self._pin_ok():
             return self._json({"error": "pin"}, 403)
@@ -7123,6 +8012,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(pins_api(data))
         if self.path == "/api/backup":
             return self._json(backup_api(data))
+        if self.path == "/api/dailyq":
+            return self._json(dailyq_api(data))
+        if self.path == "/api/reminders":
+            return self._json(reminders_api(data))
         if self.path == "/api/whiteboard":
             if data.get("action") == "clear":
                 wb_clear()
@@ -7238,7 +8131,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 
 def main():
