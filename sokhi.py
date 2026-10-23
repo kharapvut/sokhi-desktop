@@ -164,6 +164,7 @@ def get_config():
     cfg.setdefault("quiet_end", "")
     cfg.setdefault("reply_language", "বাংলা")
     cfg.setdefault("wake_word", False)
+    cfg.setdefault("echo_guard", True)
     cfg.setdefault("dim_start", "")
     cfg.setdefault("dim_end", "")
     cfg.setdefault("dim_level", 0.6)
@@ -9516,7 +9517,7 @@ def pins_api(data):
 _BACKUP_CONFIG_KEYS = ("city", "tts_voice", "tts_preset", "tts_rate",
                        "tts_pitch", "voice_rate", "call_name", "reply_style",
                        "reply_language", "quiet_start", "quiet_end",
-                       "dim_start", "dim_end", "dim_level", "wake_word",
+                       "dim_start", "dim_end", "dim_level", "wake_word", "echo_guard",
                        "update_url", "auto_self_upgrade", "bridge_enabled",
                        "computer_use_enabled", "away_mode", "gemini_model")
 
@@ -12860,7 +12861,7 @@ function add(t,who,opts){
  if(who==='sokhi')refreshRegenButtons();
  return d}
 let edgeOk=null, speakingNow=false, currentAudio=null, speakToken=0;
-function stopSpeak(){speakToken++;try{speechSynthesis.cancel()}catch(e){} if(currentAudio){try{currentAudio.pause()}catch(e){} currentAudio=null} speakingNow=false;document.getElementById('orb').classList.remove('talking');setMood('calm')}
+function stopSpeak(){speakToken++;try{speechSynthesis.cancel()}catch(e){} if(currentAudio){try{currentAudio.pause()}catch(e){} currentAudio=null} speakingNow=false;document.getElementById('orb').classList.remove('talking');setMood('calm');try{echoNoteEnd()}catch(e){}}
 function chunksOf(t){
  const clean=t.replace(/[•\*\#]/g,' ').replace(/\n+/g,'। ');
  const parts=clean.split(/(?<=[।!?…])\s*/).map(s=>s.trim()).filter(Boolean);
@@ -12882,6 +12883,7 @@ function synthSpeak(text,rate){
 async function speak(t,rate){
  t=String(t==null?'':t).replace(/\[\[CHART:[^\]]*\]\]/g,'').replace(/\n{3,}/g,'\n\n'); // #47: চার্ট-মার্কার কখনো পড়া হবে না
  if(!t.trim())return; // #47: শুধু মার্কার থাকলে বলার কিছু নেই
+ echoNoteSpoken(t); /* v1.9.1 echo guard: যা বলা হচ্ছে মনে রাখো */
  const my=++speakToken;speakingNow=true;setMood('speaking');const orb=document.getElementById('orb');orb.classList.add('talking');
  const chunks=(t&&t.length<180)?[t]:chunksOf(t);
  try{for(const c of chunks){
@@ -12889,7 +12891,52 @@ async function speak(t,rate){
   if(edgeOk!==false){try{await edgeSpeak(c,rate);edgeOk=true;continue}catch(e){edgeOk=false}}
   if(my!==speakToken)break;
   await synthSpeak(c,rate)}}catch(e){}
- if(my===speakToken){orb.classList.remove('talking');speakingNow=false;setMood(liveOn?'listening':'calm')}}
+ if(my===speakToken){orb.classList.remove('talking');speakingNow=false;setMood(liveOn?'listening':'calm');echoNoteEnd()}}
+/* ---------- v1.9.1 echo guard: নিজের কণ্ঠ চেনা ----------
+   বাগ: লাইভ মোডে স্পিকার থেকে Sokhi-র নিজের বলা কথা মাইকে ফিরে এসে
+   আবার ইনপুট হয়ে যেত — Sokhi নিজে নিজেকেই উত্তর দিত (loop)।
+   সমাধান: speak() যা বলছে তা মনে রাখা হয় (echoNoteSpoken); বলা শেষের
+   ECHO_TAIL_MS (800ms) পর্যন্ত জানালা খোলা থাকে (echoNoteEnd)।
+   recognition থেকে আসা লেখা dispatch-এর আগে isEchoOfSpeech() যাচাই করে —
+   মিললে নীরবে ফেলে দেওয়া হয় (শুধু status line-এ নোট, chat-এ নয়)।
+   মিলের নিয়ম (echoNorm: ছোট হাতের, যতিচিহ্ন ছাড়া, বাংলা সংখ্যা→ASCII):
+     (ক) containment: শোনা লেখা (≥৬ অক্ষর) বলা কথার অংশ, অথবা বলা কথা
+         (≥৬ অক্ষর) শোনা লেখার অংশ (echo + বাড়তি শব্দ);
+     (খ) টোকেন-overlap: |A∩B| / min(|A|,|B|) ≥ 0.6 (ECHO_OVERLAP_MIN)
+         এবং মেলা আলাদা টোকেন ≥ ২;
+     (গ) একটিমাত্র লম্বা শব্দ (≥৪ অক্ষর) হুবহু মিললে।
+   সম্পূর্ণ আলাদা কথা (আসল barge-in) কখনো আটকায় না — ওপরে কোনো নিয়মেই
+   মিলবে না। জানালার বাইরে (বলা শেষের 800ms পর) একই কথা বললেও আসল ইনপুট।
+   টগল: সেটিংসের echo_guard (ডিফল্ট চালু); বন্ধ = v1.9.0 আচরণ। */
+let echoGuardOn=true;
+try{echoGuardOn=localStorage.getItem('sokhi_echoguard')!=='0'}catch(e){}
+let echoSpoken={norm:'',tokens:[],until:0};
+const ECHO_TAIL_MS=800,ECHO_OVERLAP_MIN=0.6;
+function echoNorm(s){
+ return String(s==null?'':s).toLowerCase()
+  .replace(/[০-৯]/g,function(d){return '০১২৩৪৫৬৭৮৯'.indexOf(d)})
+  .replace(/[\u200B-\u200D\uFEFF]/g,'')
+  .replace(/[।॥,.!?;:'"“”‘’«»()\[\]{}<>|/\\@#$%^&*_+=~`\-–—•·…]/g,' ')
+  .replace(/\s+/g,' ').trim()}
+function echoNoteSpoken(t){
+ const n=echoNorm(t);
+ echoSpoken={norm:n,tokens:n?n.split(' '):[],until:Date.now()+86400000}}
+function echoNoteEnd(){
+ if(echoSpoken.norm)echoSpoken.until=Date.now()+ECHO_TAIL_MS}
+function isEchoOfSpeech(txt){
+ try{
+  if(!echoGuardOn)return false;
+  if(!echoSpoken.norm||!echoSpoken.tokens.length)return false;
+  if(!speakingNow&&Date.now()>echoSpoken.until)return false;
+  const n=echoNorm(txt);if(!n)return false;
+  const sp=echoSpoken.norm;
+  if(n.length>=6&&sp.indexOf(n)>=0)return true;
+  if(sp.length>=6&&n.indexOf(sp)>=0)return true;
+  const tt=n.split(' '),st=new Set(echoSpoken.tokens),seen=new Set();let inter=0;
+  for(const w of tt){if(st.has(w)&&!seen.has(w)){seen.add(w);inter++}}
+  if(inter>=2&&inter/Math.min(tt.length,echoSpoken.tokens.length)>=ECHO_OVERLAP_MIN)return true;
+  if(tt.length===1&&inter===1&&tt[0].length>=4)return true;
+  return false}catch(e){return false}}
 let liveOn=false, recog=null;
 function setStatus(x){document.getElementById('status').textContent=x}
 function toggleLive(){liveOn?stopLive():startLive()}
@@ -12910,6 +12957,7 @@ function listen(){
  recog.onresult=async e=>{
   document.getElementById('orb').classList.remove('listening');
   const txt=e.results[0][0].transcript.trim();if(!txt){listen();return}
+  if(isEchoOfSpeech(txt)){try{console.debug('echo guard: নিজের কণ্ঠ ফেলে দেওয়া হলো')}catch(e){} setStatus('🔇 নিজের কণ্ঠ ফেলে দেওয়া হলো');listen();return}
   if(/লাইভ বন্ধ|থামো|স্টপ/.test(txt)){add(txt,'me');stopLive();add('লাইভ বন্ধ করলাম।','sokhi');return}
   add(txt,'me');setStatus('🤔 ভাবছি…');setMood('thinking');
   try{const j=await api('/api/chat',{message:txt});add(j.reply,'sokhi');setStatus('🗣️ বলছি…');await speak(j.reply,moodRate(txt))}catch(err){}
@@ -13313,7 +13361,7 @@ function mic(){
  try{stopSpeak()}catch(e){} /* v1.4 #113 barge-in: মাইক শুরু হলেই বলা থামবে */
  const R=window.SpeechRecognition||window.webkitSpeechRecognition;
  if(!R){alert('এই ব্রাউজারে গলা-শোনা নেই Chrome ব্যবহার করো');return}
- const r=new R();r.lang='bn-BD';r.onresult=e=>{document.getElementById('text').value=e.results[0][0].transcript;send(true)};r.start()}
+ const r=new R();r.lang='bn-BD';r.onresult=e=>{const _et=e.results[0][0].transcript;if(isEchoOfSpeech(_et)){setStatus('🔇 নিজের কণ্ঠ ফেলে দেওয়া হলো');return}document.getElementById('text').value=_et;send(true)};r.start()}
 
 /* ---------- panels: weather + news (5 min) ---------- */
 let lastWeather='';
@@ -13585,7 +13633,7 @@ function mic(){
    const res=e.results[i];
    if(res.isFinal)finalTxt+=res[0].transcript;else interim+=res[0].transcript}
   if(el)el.value=finalTxt||interim;
-  if(finalTxt)send(true)};
+  if(finalTxt){if(isEchoOfSpeech(finalTxt)){if(el)el.value='';setStatus('🔇 নিজের কণ্ঠ ফেলে দেওয়া হলো')}else send(true)}};
  try{r.start()}catch(err){}}
 (function(){
 'use strict';
@@ -13900,6 +13948,9 @@ function buildSettingsExtras(){
   '<hr><div class="secttl">Wake word</div>'+
   '<label style="font-size:13px;display:flex;gap:8px;align-items:center;margin-top:6px"><input id="fe3wake" type="checkbox"> নাম ধরে ডাকলে জাগবে ("সখি" / "Sokhi")</label>'+
   '<div class="hint">Chrome-এ মাইকের অনুমতি লাগবে, ট্যাব খোলা থাকতে হবে; শুনতে পেলেই লাইভ মোড চালু হবে।</div>'+
+  '<hr><div class="secttl">নিজের কণ্ঠ চেনা (Echo guard)</div>'+
+  '<label style="font-size:13px;display:flex;gap:8px;align-items:center;margin-top:6px"><input id="fe3echoguard" type="checkbox" checked> 🔇 নিজের কণ্ঠ চেনা (echo guard)</label>'+
+  '<div class="hint">চালু থাকলে স্পিকার থেকে Sokhi-র নিজের বলা কথা মাইকে ফিরে এলেও তা ইনপুট হবে না — লাইভ মোডে Sokhi নিজে নিজেকে উত্তর দেবে না। আসল বাধা (barge-in) আগের মতোই চলবে। হেডফোন ছাড়া লাইভ চালালে চালু রাখাই ভালো।</div>'+
   '<hr><div class="secttl">রাতের Auto-dim</div>'+
   '<label style="font-size:13px;display:flex;gap:8px;align-items:center;margin-top:6px"><input id="fe3dimon" type="checkbox"> রাতে স্ক্রিন নিজে থেকে ম্লান হবে</label>'+
   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:13px">শুরু <input id="fe3dimstart" type="time" value="21:00"> শেষ <input id="fe3dimend" type="time" value="06:00"></div>'+
@@ -13937,6 +13988,8 @@ function buildSettingsExtras(){
  const wk=$('fe3wake');
  if(wk){try{wk.checked=localStorage.getItem('sokhi_wake')==='1'}catch(e){}
   wk.addEventListener('change',function(){fe3SetWake(wk.checked)})}
+ const eg=$('fe3echoguard');
+ if(eg){eg.checked=echoGuardOn;eg.addEventListener('change',function(){fe3SetEchoGuard(eg.checked)})}
  try{const dm=fe3DimMirror();
   if(dm&&(dm.start||dm.end||dm.level!=null||dm.enabled!=null)){
    const don=$('fe3dimon');if(don)don.checked=!!dm.enabled;
@@ -13975,6 +14028,7 @@ async function updateBrain(){
     try{localStorage.setItem('sokhi_quiet',JSON.stringify({enabled:!!(s.quiet_start&&s.quiet_end),quiet_start:s.quiet_start||'',quiet_end:s.quiet_end||'',start:s.quiet_start||'',end:s.quiet_end||''}))}catch(e){}}
    if(s.reply_language){const lg=$('fe3lang');if(lg&&Array.prototype.slice.call(lg.options).some(function(o){return o.value===s.reply_language}))lg.value=s.reply_language}
    if(s.wake_word!=null){const wk2=$('fe3wake');if(wk2)wk2.checked=!!s.wake_word;wakeOn=!!s.wake_word;try{localStorage.setItem('sokhi_wake',wakeOn?'1':'0')}catch(e){}if(wakeOn)setTimeout(startWake,1200)}
+   if(s.echo_guard!=null){echoGuardOn=!!s.echo_guard;try{localStorage.setItem('sokhi_echoguard',echoGuardOn?'1':'0')}catch(e){}const eg3=$('fe3echoguard');if(eg3)eg3.checked=echoGuardOn}
    if(s.dim_start||s.dim_end||s.dim_level!=null){
     const dm2={enabled:!!(s.dim_start&&s.dim_end),start:s.dim_start||'21:00',end:s.dim_end||'06:00',level:s.dim_level!=null?parseFloat(s.dim_level):0.6};
     try{localStorage.setItem('sokhi_dim',JSON.stringify(dm2))}catch(e){}
@@ -14271,7 +14325,7 @@ function startWake(){
  r.onresult=function(ev){
   let txt='';
   try{for(let i=0;i<ev.results.length;i++)txt+=ev.results[i][0].transcript+' '}catch(err){}
-  if(/সখি|সখী|শখি|sokhi|sakhi/i.test(txt)){
+  if(/সখি|সখী|শখি|sokhi|sakhi/i.test(txt)&&!isEchoOfSpeech(txt)){
    stopWake(false);
    setStatus('👂 ডাক শুনেছি!');
    if(typeof startLive==='function')startLive();
@@ -14306,6 +14360,14 @@ function fe3SetWake(on){
  try{api('/api/settings',{wake_word:wakeOn}).catch(function(){})}catch(e){}
  const wk=$('fe3wake');if(wk)wk.checked=wakeOn;
  if(wakeOn)startWake();else stopWake(false)}
+/* v1.9.1: echo guard টগল — fe3SetWake-এর একই ধরন (localStorage + সার্ভার) */
+function fe3SetEchoGuard(on){
+ echoGuardOn=!!on;
+ try{localStorage.setItem('sokhi_echoguard',echoGuardOn?'1':'0')}catch(e){}
+ try{api('/api/settings',{echo_guard:echoGuardOn}).catch(function(){})}catch(e){}
+ const egx=$('fe3echoguard');if(egx)egx.checked=echoGuardOn;
+ setStatus(echoGuardOn?'🔇 নিজের কণ্ঠ চেনা চালু':'🔊 নিজের কণ্ঠ চেনা বন্ধ')}
+window.fe3SetEchoGuard=fe3SetEchoGuard;
 /* ---------- H: ব্যাকআপ / রিস্টোর / Sync ---------- */
 async function fe3ExportBackup(kind){
  const msg=$('fe3backupmsg');
@@ -15189,7 +15251,7 @@ class Handler(BaseHTTPRequestHandler):
                                "knowledge": len(load_json(KNOW_FILE, {})),
                                "auto_upgrade": bool(get_config().get("auto_self_upgrade", True)),
                                "voice_engine": tts_engine_status(), "voice_rate": _clamp_voice_rate(get_config().get("voice_rate", 1.0)),
-                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
+                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "echo_guard": bool(get_config().get("echo_guard", True)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
         if self.path == "/api/memory":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
@@ -15314,6 +15376,9 @@ class Handler(BaseHTTPRequestHandler):
             if "wake_word" in data:
                 cfg = get_config(); cfg["wake_word"] = bool(data.get("wake_word")); save_config(cfg)
                 return self._json({"ok": True, "wake_word": cfg["wake_word"]})
+            if "echo_guard" in data:
+                cfg = get_config(); cfg["echo_guard"] = bool(data.get("echo_guard")); save_config(cfg)
+                return self._json({"ok": True, "echo_guard": cfg["echo_guard"]})
             if "dim_start" in data or "dim_end" in data:
                 cfg = get_config()
                 for _dk in ("dim_start", "dim_end"):
@@ -15568,7 +15633,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 
 
 def main():
@@ -15623,6 +15688,8 @@ def main():
         log_change("আপগ্রেড: v1.8.0 — deferred ৩টি: #47 আসল ডেটা থেকে inline SVG চার্ট/ধারণা-মানচিত্র, #49 Gemini মডেল বাছাই (auto/custom + fallback নোটিশ), #50 কণ্ঠ বাছাই (Edge নাবনিতা/প্রদীপ + ব্রাউজারের গলা) ও কণ্ঠ পরীক্ষা বোতাম")
         register_capability("v19-elite", "ELITE প্যাক: ভুলের খরচ/অগ্রগতির গ্রাফ/অভিক্ষেপ বিশ্লেষণ, ফাঁদ ও বাদ-দেওয়ার অনুশীলন, চাপ-সিমুলেশন, ক্যাম্পেইন পরিকল্পক ও মাইলফলক, ইঞ্জিন-রেডি প্যানেল, রিভিশন সূচি/পকেট সার/দ্বৈত মূল্যায়ন/সাহস বার্তা")
         log_change("আপগ্রেড: v1.9.0 — ELITE ব্যাচ: #763/#764/#765 বিশ্লেষণ, #755/#756/#759 প্রশিক্ষণ ও চাপ-সিমুলেশন, #766/#662/#767/#769/#770/#781/#782/#783/#784 পরিকল্পনা, ইঞ্জিন-রেডি #754/#757/#760/#761/#762/#768/#771/#776/#778/#779/#780, সুইপ #667/#703/#716/#729/#753")
+        register_capability("v191-echoguard", "Echo guard: স্পিকার থেকে নিজের কণ্ঠ মাইকে ফিরে এলে চিনে ফেলে দেয় — লাইভ মোডে নিজে নিজেকে উত্তর দেয় না; আসল barge-in আগের মতোই; সেটিংসে টগল (ডিফল্ট চালু)")
+        log_change("আপগ্রেড: v1.9.1 — বাগ-ফিক্স: লাইভ মোডে Sokhi নিজের বলা কথা স্পিকার→মাইক echo-তে শুনে নিজেকেই উত্তর দিত; echo guard যোগ হলো — speak()-এ বলা কথা মনে রেখে recognition-ইনপুট মিলিয়ে ফেলে দেয় (বলা চলাকালে + শেষের ৮০০ms), barge-in অক্ষত; সেটিংসে 'নিজের কণ্ঠ চেনা (echo guard)' টগল")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
