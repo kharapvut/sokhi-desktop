@@ -3377,6 +3377,78 @@ def jobprep_handle(query):
     return None
 
 
+
+
+# ================= v1.7.0: #697 মাস্টারি টেস্ট (interactive) =================
+_MASTERY_FILE = DATA / "study-mastery-session.json"
+
+
+def _mastery_load():
+    st = load_json(_MASTERY_FILE, None)
+    return st if isinstance(st, dict) and st.get("questions") else None
+
+
+def _mastery_fmt(st):
+    q = st["questions"][st["idx"]]
+    opts = "\n".join(f"{_OPT_LETTERS[i]}) {op}" for i, op in enumerate(q["options"]))
+    return (f"প্রশ্ন {_bn_num(st['idx'] + 1)}/{_bn_num(len(st['questions']))} "
+            f"(বিষয়: {st['subject']}, টপিক: {q.get('topic', 'সাধারণ')})\n"
+            f"{q['q']}\n{opts}\n"
+            "উত্তরটা লেখো (ক/খ/গ/ঘ বা অপশনের হুবহু লেখা)। থামাতে বলো: 'মাস্টারি থামাও'।")
+
+
+def mastery_start(subject):
+    """Bank-প্রশ্ন (4 options, int answer) অন্তত ৩টা থাকলে interactive
+    মাস্টারি সেশন শুরু করে; নইলে None (display mode-এ যাবে)।"""
+    try:
+        qs = [q for q in mastery_questions(subject)
+              if isinstance(q.get("options"), list) and len(q["options"]) == 4
+              and isinstance(q.get("answer"), int)]
+    except Exception:
+        return None
+    if len(qs) < 3:
+        return None
+    qs = qs[:5]
+    st = {"subject": subject, "idx": 0, "score": 0, "total": len(qs),
+          "questions": qs}
+    _study_save(_MASTERY_FILE, st)
+    return ("🏆 মাস্টারি টেস্ট শুরু হলো! মোট " + _bn_num(st["total"]) +
+            "টি প্রশ্ন — একে একে উত্তর দাও।\n\n" + _mastery_fmt(st))
+
+
+def mastery_active():
+    return _mastery_load() is not None
+
+
+def mastery_answer(text):
+    st = _mastery_load()
+    if not st:
+        return None
+    if "মাস্টারি থামাও" in text or "মাস্টারি বন্ধ" in text:
+        _study_delete(_MASTERY_FILE)
+        return "মাস্টারি টেস্ট থামিয়ে দিলাম। আবার চাইলে বলো: 'মাস্টারি টেস্ট <বিষয়>'।"
+    q = st["questions"][st["idx"]]
+    picked = _parse_answer(text, q)
+    if picked is None:
+        return None
+    correct = int(q["answer"])
+    if picked == correct:
+        st["score"] += 1
+        fb = f"✅ ঠিক হয়েছে! সঠিক উত্তর: {_OPT_LETTERS[correct]}) {q['options'][correct]}"
+    else:
+        fb = (f"❌ ভুল হয়েছে। তুমি দিয়েছ: {_OPT_LETTERS[picked]}) {q['options'][picked]}\n"
+              f"সঠিক উত্তর: {_OPT_LETTERS[correct]}) {q['options'][correct]}")
+    st["idx"] += 1
+    if st["idx"] >= len(st["questions"]):
+        verdict = mastery_grade(st["score"], st["total"])
+        out = (fb + f"\n\n🏁 মাস্টারি টেস্ট শেষ! স্কোর: "
+               f"{_bn_num(st['score'])}/{_bn_num(st['total'])}\n" + verdict)
+        _study_delete(_MASTERY_FILE)
+        return out
+    _study_save(_MASTERY_FILE, st)
+    return fb + "\n\n" + _mastery_fmt(st)
+
+
 # ------------------------------------------------------------- TTS voice
 # Best free Bangla female voice: Microsoft Edge TTS, bn-BD-NabanitaNeural
 # (natural female). Needs the free `edge-tts` tool on Bhaiya's laptop —
@@ -7649,6 +7721,12 @@ def handle_message(text):
         if "পড়ার অগ্রগতি" in text:
             return study_progress_text()
         # --- v1.5.0 study pack (Wave-2: #654/#655/#664/#697/#721/#725/#748/#759)
+        if "মাস্টারি টেস্ট" in text and not exam_active():
+            _msubj = _detect_subject(text, low)
+            if _msubj:
+                _mstart = mastery_start(_msubj)
+                if _mstart:
+                    return _mstart
         _sp = study_pack_handle(text, low)
         if _sp:
             return _sp
@@ -7657,6 +7735,10 @@ def handle_message(text):
             return board_text()
         if "নিজের ডাক্তার" in text or "স্বাস্থ্য পরীক্ষা" in text:
             return doctor_report()["text"]
+        if not exam_active() and mastery_active():
+            _ma = mastery_answer(text)
+            if _ma:
+                return _ma
         # --- v1.6.0 jobprep knowledge packs (#787/#788/#789/#796/#836/#943/#944/#945/#946/#949/#922/#923)
         _jp = jobprep_handle(text)
         if _jp:
@@ -10534,7 +10616,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 
 def main():
