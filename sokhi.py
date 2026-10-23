@@ -3181,6 +3181,3893 @@ def chart_reply(text):
 
 # -*- coding: utf-8 -*-
 """
+Desktop Sokhi v1.9.0 — Elite Analysis Feature Pack (analysis cluster)
+======================================================================
+Self-contained snippets for integration into sokhi.py (v1.9.0).
+Coordinator: paste this whole file at top level in sokhi.py AFTER the
+v1.5 study-pack block (i.e. after study_pack_handle's def) and BEFORE
+the daily-pack section — see INTEGRATION-ANALYSIS.md for the exact
+anchors — then wire the one dispatch block described there.
+
+Features:
+  #763 ea_wrong_cost_text()        ভুলের খরচ র‍্যাঙ্কিং
+  #764 ea_progress_series()        অগ্রগতির ডেটা-সিরিজ (machine-readable)
+       ea_progress_curve_text()    অগ্রগতি-বক্ররেখা (text বার-কার্ভ)
+  #765 ea_projection_text()        প্রস্তুতি অভিক্ষেপ (F8-ধাঁচের + campaign)
+
+House rules honoured:
+  * 100% free, offline-only — reads ONLY OFFLINE_BANK, OFFLINE_LESSONS,
+    study-progress.json, study-wrong-book.json and growth-diary.json.
+    No web, no Gemini.
+  * Never fabricates statistics — every number is a count/sum of what
+    actually exists in those banks/files. Insufficient data -> an
+    honest "এখনো ডেটা নেই" / "তথ্য এখনো কম" Bangla line, never
+    invented numbers. #763 says plainly in its own text that the
+    "খরচ" is marks lost in mock/practice — NOT real-exam marks.
+  * Pure-ish functions: data can be injected via parameters (used by
+    test_elite_analysis_pack.py). When a parameter is None, the
+    function falls back to the module globals of the host sokhi.py,
+    looked up at CALL time via globals().get(...) with the EXACT
+    existing host names: OFFLINE_BANK, OFFLINE_LESSONS, load_json,
+    _STUDY_PROGRESS_FILE, _WRONG_BOOK_FILE, FF_GROWTH_FILE.
+  * Bangla digits via a LOCAL ea_bn() helper (self-contained mirror of
+    the study pack's _bn() / the host's _bn_num), so the pack works
+    standalone in tests.
+  * ALL top-level symbols carry the ea_/EA_ prefix, so this pack can
+    never collide with the sibling v1.9 packs (et_, ep_, ee_, es_)
+    or with host code. (ea_bn mirrors the study pack's _bn, and
+    EA_NO_DATA mirrors its _NO_DATA = "এখনো ডেটা নেই".)
+
+Verified data shapes (host sokhi.py):
+  study-progress.json:
+    {subject: {sessions:int, mock_tests:int, total_steps:int,
+               weak:[str], last_topic:str, last_date:"YYYY-MM-DD"}}
+  study-wrong-book.json (max 500): list of dicts, each:
+    {"q": str, "options": [str x4], "correct": str (correct option TEXT),
+     "your_answer": str (picked option TEXT), "subject": str,
+     "topic": str, "date": "YYYY-MM-DD"}
+  growth-diary.json (max 120): list of dicts, each:
+    {"date": "YYYY-MM-DD", "facts": int, "likes": int,
+     "learned_notes": int, "rules": int, "knowledge": int,
+     "interactions": int}   (host global: FF_GROWTH_FILE)
+  OFFLINE_BANK:
+    {subject: [{"q": str, "options": [str x4], "answer": int (0-3),
+                "topic": str}]}
+  OFFLINE_LESSONS:
+    {subject: [{"topic": str, "text": str, "check_q": str,
+                "check_answers": [str], "alt": str}]}
+"""
+
+import math
+from collections import Counter
+from datetime import date, timedelta
+
+# ------------------------------------------------------------------ digits
+
+EA_BN_DIGITS_MAP = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+
+
+def ea_bn(x):
+    """Local mirror of the study pack's _bn() / host _bn_num():
+    English digits -> Bangla digits."""
+    return str(x).translate(EA_BN_DIGITS_MAP)
+
+
+EA_NO_DATA = "এখনো ডেটা নেই"
+
+
+def ea_fmt_num(x):
+    """সংখ্যা দেখানোর জন্য: পূর্ণসংখ্যা হলে দশমিক ছাড়া, নাহলে ১ ঘর
+    দশমিক (Bangla digits-এ)।"""
+    try:
+        x = float(x)
+    except Exception:
+        return ea_bn(x)
+    if x == int(x):
+        return ea_bn(int(x))
+    return ea_bn(f"{x:.1f}")
+
+
+def ea_parse_date(x):
+    """date / 'YYYY-MM-DD' str -> date, না পারলে None।"""
+    if x is None:
+        return None
+    if isinstance(x, date):
+        return x
+    try:
+        return date.fromisoformat(str(x)[:10])
+    except Exception:
+        return None
+
+
+def ea_resolve_today(today=None):
+    d = ea_parse_date(today)
+    return d if d is not None else date.today()
+
+
+# ------------------------------------------------------- global fallbacks
+# These helpers deliberately look names up in globals() at CALL time, so
+# (a) the pack works when pasted into sokhi.py (host globals win), and
+# (b) tests can stub elite_analysis_pack.OFFLINE_BANK etc. or pass data
+# directly. (Copied in style from the study pack's _resolve_* helpers.)
+
+
+def ea_resolve_bank(bank=None):
+    if bank is not None:
+        return bank if isinstance(bank, dict) else {}
+    g = globals().get("OFFLINE_BANK")
+    return g if isinstance(g, dict) else {}
+
+
+def ea_resolve_lessons(lessons=None):
+    if lessons is not None:
+        return lessons if isinstance(lessons, dict) else {}
+    g = globals().get("OFFLINE_LESSONS")
+    return g if isinstance(g, dict) else {}
+
+
+def ea_load_via_host(path, default):
+    fn = globals().get("load_json")
+    if callable(fn) and path is not None:
+        try:
+            return fn(path, default)
+        except Exception:
+            return default
+    return default
+
+
+def ea_resolve_progress(progress=None):
+    if progress is not None:
+        return progress if isinstance(progress, dict) else {}
+    path = globals().get("_STUDY_PROGRESS_FILE")
+    data = ea_load_via_host(path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def ea_resolve_wrong(wrong=None):
+    if wrong is not None:
+        return wrong if isinstance(wrong, list) else []
+    path = globals().get("_WRONG_BOOK_FILE")
+    data = ea_load_via_host(path, [])
+    return data if isinstance(data, list) else []
+
+
+def ea_resolve_diary(diary=None):
+    if diary is not None:
+        return diary if isinstance(diary, list) else []
+    path = globals().get("FF_GROWTH_FILE")
+    if path is None:
+        path = globals().get("EA_GROWTH_FILE")
+    if path is None:
+        path = globals().get("_GROWTH_DIARY_FILE")
+    data = ea_load_via_host(path, [])
+    return data if isinstance(data, list) else []
+
+
+def ea_wrongs_by_day(wrong):
+    """তারিখওয়ালা wrong-book এন্ট্রি থেকে {date: count} (Counter)।
+    তারিখহীন/ভাঙা এন্ট্রি বাদ — কিছু বানানো হয় না।"""
+    c = Counter()
+    for w in wrong or []:
+        if not isinstance(w, dict):
+            continue
+        d = ea_parse_date(w.get("date"))
+        if d is not None:
+            c[d] += 1
+    return c
+
+
+# =====================================================================
+#  #763 ভুলের খরচ র‍্যাঙ্কিং
+# =====================================================================
+
+def ea_wrong_weight(entry_date, today_d):
+    """একটা ভুলের recency-ওজন (সূত্রটা ea_wrong_cost_text-এর রিপোর্টেও
+    লেখা থাকে):
+      শেষ ৩০ দিনের মধ্যে ভুল      -> ×২
+      ৩১–৯০ দিন আগের ভুল          -> ×১.৫
+      ৯০ দিনের বেশি পুরনো ভুল     -> ×১
+      তারিখ নেই / পড়া যায়নি      -> ×১ (সবচেয়ে কম ধরা হয়)
+    ভবিষ্যতের তারিখ থাকলে বয়স ০ ধরা হয় (মানে ×২ ঘরে পড়ে)।"""
+    d = ea_parse_date(entry_date)
+    if d is None:
+        return 1.0
+    age = (today_d - d).days
+    if age < 0:
+        age = 0
+    if age <= 30:
+        return 2.0
+    if age <= 90:
+        return 1.5
+    return 1.0
+
+
+def ea_wrong_cost_text(wrong=None, today=None):
+    """Wrong-book-কে (বিষয়, টপিক) ধরে গুনে recency-ওজনসহ 'খরচ' স্কোরে
+    সাজানো র‍্যাঙ্কিং + বিষয়ভিত্তিক মোট।
+
+    সতর্ক বাক্য (রিপোর্টেও থাকে): এই 'খরচ' মানে মক টেস্ট/অনুশীলনীতে
+    যেসব প্রশ্নে নম্বর হারিয়েছ তার ধারণা — এটা আসল পরীক্ষার নম্বর
+    নয়, আর ভবিষ্যতের পরীক্ষায় ঠিক কত নম্বর যাবে তাও নয়। শুধু কোন
+    টপিকে বেশি অনুশীলন দরকার, সেটা বোঝার জন্য সাজানো তালিকা।"""
+    wrong = ea_resolve_wrong(wrong)
+    rows_in = [w for w in (wrong or []) if isinstance(w, dict)]
+    if not rows_in:
+        return (f"{EA_NO_DATA} — ভুলের খাতা খালি। এখনো কোনো মক টেস্টে "
+                "ভুল জমা হয়নি, তাই খরচের হিসাব করার কিছু নেই। মক টেস্ট "
+                "দিলে ভুলগুলো এখানে জমবে, তখন র‍্যাঙ্কিং দেখতে পাবে।")
+    today_d = ea_resolve_today(today)
+
+    groups = {}   # (subject, topic) -> [count, score, last_date_str]
+    subjects = {}  # subject -> [count, score]
+    for w in rows_in:
+        subj = str(w.get("subject") or "অজানা বিষয়")
+        topic = str(w.get("topic") or "সাধারণ")
+        wt = ea_wrong_weight(w.get("date"), today_d)
+        d = ea_parse_date(w.get("date"))
+        dstr = str(d) if d is not None else ""
+        g = groups.setdefault((subj, topic), [0, 0.0, ""])
+        g[0] += 1
+        g[1] += wt
+        if dstr > g[2]:
+            g[2] = dstr
+        s = subjects.setdefault(subj, [0, 0.0])
+        s[0] += 1
+        s[1] += wt
+
+    ranked = sorted(groups.items(),
+                    key=lambda kv: (-kv[1][1], -kv[1][0], kv[0][0], kv[0][1]))
+    total_n = sum(v[0] for v in groups.values())
+    total_score = sum(v[1] for v in groups.values())
+
+    lines = ["💸 ভুলের খরচ র‍্যাঙ্কিং",
+             "খরচ-স্কোরের সূত্র: সাম্প্রতিক ভুলের ওজন বেশি — শেষ ৩০ দিনের "
+             "ভুল ×২, ৩১–৯০ দিন আগের ভুল ×১.৫, তার চেয়ে পুরনো (বা "
+             "তারিখহীন) ভুল ×১। স্কোর = সব ভুলের ওজনের যোগফল।",
+             "সতর্কতা: এই 'খরচ' মানে মক টেস্ট আর অনুশীলনীতে যেসব প্রশ্নে "
+             "তুমি নম্বর হারিয়েছ, তার হিসাব — এটা আসল পরীক্ষার নম্বর "
+             "নয়। কোন টপিকে আগে অনুশীলন দরকার, সেটা ঠিক করতেই এই তালিকা।",
+             "",
+             f"মোট ভুল: {ea_bn(total_n)}টি, মোট খরচ-স্কোর: "
+             f"{ea_fmt_num(total_score)}।",
+             "",
+             "টপিক ধরে খরচ (বেশি থেকে কম):"]
+    cap = 15
+    for (subj, topic), (cnt, score, last) in ranked[:cap]:
+        last_txt = f", শেষ ভুল: {ea_bn(last)}" if last else ""
+        lines.append(f"• {subj} / {topic} — {ea_bn(cnt)}বার ভুল, "
+                     f"স্কোর {ea_fmt_num(score)}{last_txt}")
+    if len(ranked) > cap:
+        lines.append(f"(আরও {ea_bn(len(ranked) - cap)}টি টপিক আছে — "
+                     "শীর্ষগুলো আগে ঠিক করলেই বেশিরভাগ খরচ কমবে।)")
+    lines.append("")
+    lines.append("বিষয় ধরে মোট খরচ:")
+    for subj, (cnt, score) in sorted(subjects.items(),
+                                     key=lambda kv: (-kv[1][1], kv[0])):
+        lines.append(f"• {subj} — {ea_bn(cnt)}টি ভুল, "
+                     f"স্কোর {ea_fmt_num(score)}")
+    lines.append("")
+    lines.append("পরামর্শ: তালিকার একদম উপরের টপিকটা শিক্ষক মোডে ধাপে "
+                 "ধাপে শিখে আবার মক টেস্ট দাও — খরচ কমতে শুরু করবে।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #764 অগ্রগতি-বক্ররেখা
+# =====================================================================
+
+def ea_progress_series(wrong=None, diary=None):
+    """Machine-readable অগ্রগতি-সিরিজ (ইন্টিগ্রেটর চাইলে এটা v1.8-এর
+    #47 চার্ট রেন্ডারারকে খাওয়াতে পারবে — INTEGRATION-ANALYSIS.md দেখো):
+      {"wrongs_by_day":     [(date_str, count), ...]   তারিখের ক্রমে,
+       "cumulative_wrongs": [(date_str, running_total), ...],
+       "activity_by_day":   [(date_str, interactions), ...]}
+    শুধু তারিখওয়ালা এন্ট্রিই গোনা হয়; ডেটা না থাকলে খালি তালিকা।"""
+    wrong = ea_resolve_wrong(wrong)
+    diary = ea_resolve_diary(diary)
+    by_day = ea_wrongs_by_day(wrong)
+    days = sorted(by_day.keys())
+    wrongs_by_day = [(str(d), int(by_day[d])) for d in days]
+    cumulative = []
+    run = 0
+    for d in days:
+        run += int(by_day[d])
+        cumulative.append((str(d), run))
+    act = Counter()
+    for e in diary or []:
+        if not isinstance(e, dict):
+            continue
+        d = ea_parse_date(e.get("date"))
+        if d is None:
+            continue
+        try:
+            act[d] += int(e.get("interactions", 0) or 0)
+        except Exception:
+            continue
+    activity_by_day = [(str(d), int(act[d])) for d in sorted(act.keys())]
+    return {"wrongs_by_day": wrongs_by_day,
+            "cumulative_wrongs": cumulative,
+            "activity_by_day": activity_by_day}
+
+
+def ea_progress_curve_text(wrong=None, diary=None, today=None):
+    """শেষ ১৪ ক্যালেন্ডার দিনে দিনপ্রতি ভুলের text-কার্ভ (unicode block
+    বার) + সৎ ট্রেন্ড-সার: শেষ ৭ দিনের ভুল বনাম তার আগের ৭ দিনের ভুল।
+    তারিখওয়ালা ডেটা না থাকলে সেটা সোজাসুজি বলা হয়।"""
+    wrong = ea_resolve_wrong(wrong)
+    diary = ea_resolve_diary(diary)
+    by_day = ea_wrongs_by_day(wrong)
+    if not by_day:
+        return (f"{EA_NO_DATA} — ভুলের খাতায় তারিখওয়ালা কোনো এন্ট্রি "
+                "পাইনি, তাই বক্ররেখা আঁকা যাচ্ছে না। মক টেস্ট দিলে "
+                "প্রতিটা ভুল তারিখসহ জমে — তখন এখানে দিন ধরে গ্রাফ "
+                "দেখতে পাবে।")
+    end = ea_resolve_today(today)
+    start = end - timedelta(days=13)
+    window = [start + timedelta(days=i) for i in range(14)]
+    in_window = sum(int(by_day.get(d, 0)) for d in window)
+    if in_window == 0:
+        last_d = max(by_day.keys())
+        return ("📈 অগ্রগতি-বক্ররেখা\n"
+                f"শেষ ১৪ দিনে ({ea_bn(str(start))} থেকে "
+                f"{ea_bn(str(end))}) ভুলের খাতায় নতুন কোনো ভুল জমেনি। "
+                f"আগের রেকর্ডে মোট {ea_bn(sum(by_day.values()))}টি "
+                f"তারিখওয়ালা ভুল আছে, সবশেষ ভুলের তারিখ "
+                f"{ea_bn(str(last_d))}। নতুন মক টেস্ট দিলেই কার্ভটা আবার "
+                "নড়তে শুরু করবে।")
+
+    max_c = max(int(by_day.get(d, 0)) for d in window)
+    lines = ["📈 অগ্রগতি-বক্ররেখা — শেষ ১৪ দিনে দিনপ্রতি ভুল",
+             "(ভুলের খাতার তারিখ গুনে বানানো; বার যত লম্বা, সেদিন ভুল "
+             "তত বেশি।)"]
+    for d in window:
+        c = int(by_day.get(d, 0))
+        bar = ""
+        if c > 0 and max_c > 0:
+            bar = "█" * max(1, round(c * 20 / max_c))
+        lines.append(f"{ea_bn(d.strftime('%m-%d'))} │ {bar} {ea_bn(c)}টি")
+    last7 = sum(int(by_day.get(d, 0)) for d in window[7:])
+    prev7 = sum(int(by_day.get(d, 0)) for d in window[:7])
+    if last7 < prev7:
+        trend = "ভুল কমছে 📉"
+    elif last7 > prev7:
+        trend = "ভুল বাড়ছে 📈"
+    else:
+        trend = "ভুল প্রায় একই আছে"
+    lines.append("")
+    lines.append(f"ট্রেন্ড: শেষ ৭ দিনে {ea_bn(last7)}টি ভুল, তার আগের "
+                 f"৭ দিনে {ea_bn(prev7)}টি ভুল — {trend}।")
+    act_by_day = {d: n for d, n in
+                  [(ea_parse_date(ds), n)
+                   for ds, n in ea_progress_series(wrong=[], diary=diary)
+                   ["activity_by_day"]]}
+    act_total = sum(int(act_by_day.get(d, 0) or 0) for d in window)
+    if act_total > 0:
+        lines.append(f"এই ১৪ দিনে growth diary অনুযায়ী মোট কার্যকলাপ "
+                     f"(কথা/ইন্টার‌্যাকশন): {ea_bn(act_total)} বার।")
+    lines.append("মনে রেখো: ভুল কমা মানেই শেখা বাড়ছে — মক টেস্ট যত "
+                 "বেশি দেবে, এই ছবিটা তত পরিষ্কার হবে।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #765 প্রস্তুতি অভিক্ষেপ
+# =====================================================================
+
+def ea_projection_text(progress=None, lessons=None, campaign=None,
+                       today=None, first_day=None):
+    """F8 prediction_text()-এর ধাঁচে গতি-ভিত্তিক অভিক্ষেপ:
+      rate      = মোট total_steps / অতিবাহিত দিন
+      remaining = প্রতি বিষয়ে len(lessons) − min(total_steps, len)
+    অতিবাহিত দিন: first_day প্যারামিটার থেকে (ইন্টিগ্রেটর host memory-র
+    first_day বসিয়ে দেবে); না থাকলে progress-এর last_date-গুলোর পরিসর
+    (সবচেয়ে পুরনো থেকে সবচেয়ে নতুন + ১ দিন) fallback; তাও না থাকলে
+    বা ধাপ খুব কম হলে সংখ্যা বানানো হয় না — সেটা বলা হয়।
+
+    campaign (ঐচ্ছিক, injectable) = {"exam_date": "YYYY-MM-DD", ...}
+    থাকলে: বাকি দিন, দিনে দরকারি ধাপ, আর রায়ের লাইন —
+    এই গতিতে শেষ হবে / ঘাটতি আছে (দিনে আরও X ধাপ দরকার)।"""
+    head = "📈 প্রস্তুতি অভিক্ষেপ"
+    progress = ea_resolve_progress(progress)
+    lessons = ea_resolve_lessons(lessons)
+    if not progress:
+        return (f"{head}\n"
+                f"{EA_NO_DATA} — পড়ার রেকর্ড (study-progress) এখনো নেই, "
+                "তাই অভিক্ষেপ দেওয়ার মতো তথ্য পাইনি। কয়েকটা পড়ার "
+                "সেশন হলেই গতি হিসাব করে বলতে পারব — সংখ্যা বানিয়ে "
+                "বলব না।")
+    today_d = ea_resolve_today(today)
+    total_steps = 0
+    total_sessions = 0
+    for ent in progress.values():
+        if isinstance(ent, dict):
+            total_steps += int(ent.get("total_steps", 0) or 0)
+            total_sessions += int(ent.get("sessions", 0) or 0)
+
+    elapsed = None
+    used_fallback = False
+    fd = ea_parse_date(first_day)
+    if fd is not None:
+        elapsed = (today_d - fd).days
+    else:
+        dates = [ea_parse_date(ent.get("last_date"))
+                 for ent in progress.values() if isinstance(ent, dict)]
+        dates = [d for d in dates if d is not None]
+        if dates:
+            elapsed = (max(dates) - min(dates)).days + 1
+            used_fallback = True
+    if elapsed is None or elapsed < 1 or total_steps < 3:
+        el_txt = ea_bn(elapsed) if elapsed is not None else "—"
+        return (f"{head}\n"
+                f"অভিক্ষেপের জন্য তথ্য এখনো কম (মোট ধাপ "
+                f"{ea_bn(total_steps)}টা, সেশন {ea_bn(total_sessions)}টা, "
+                f"হিসাবের সময়কাল {el_txt} দিন)। আর কয়েকদিন নিয়মিত "
+                "পড়লেই গতি ধরে সংখ্যায় বলতে পারব — এখন অনুমান বানিয়ে "
+                "বলব না।")
+
+    rate = total_steps / elapsed
+    remaining = 0
+    known = []
+    for subj, ent in progress.items():
+        if subj in lessons and isinstance(ent, dict):
+            total = len(lessons.get(subj) or [])
+            covered = min(int(ent.get("total_steps", 0) or 0), total)
+            if total - covered > 0:
+                remaining += total - covered
+                known.append(subj)
+    lines = [head,
+             f"তোমার গতি: দিনে গড়ে প্রায় {ea_fmt_num(round(rate, 1))} "
+             f"ধাপ (মোট {ea_bn(total_steps)} ধাপ, "
+             f"{ea_bn(elapsed)} দিনে)।"]
+    if used_fallback:
+        lines.append("(প্রথম দিনের রেকর্ড পাইনি — পড়ার রেকর্ডের "
+                     "তারিখের পরিসর ধরে সময়কাল হিসাব করেছি।)")
+    if not known:
+        lines.append("যেসব বিষয়ে তুমি পড়ছ, সেগুলোর মোট পাঠের সংখ্যা "
+                     "আমার জানা পাঠক্রমে নেই — তাই 'বাকি কত ধাপ' হিসাব "
+                     "করা যাচ্ছে না। গতি শুধু এটুকুই বলতে পারি।")
+        return "\n".join(lines)
+    if remaining <= 0:
+        lines.append("জানা পাঠক্রমের সব ধাপই তুমি ছুঁয়ে ফেলেছ — বাকি "
+                     "নেই। এখন রিভিশন আর মক টেস্টেই জোর দাও।")
+        return "\n".join(lines)
+
+    days_needed = math.ceil(remaining / rate) if rate > 0 else 0
+    lines.append(f"জানা পাঠক্রমে বাকি আছে {ea_bn(remaining)}টা ধাপ "
+                 f"({', '.join(known)})। এই গতিতে শেষ হতে আনুমানিক "
+                 f"{ea_bn(days_needed)} দিন লাগতে পারে।")
+    lines.append("এটা শুধু অফলাইন পাঠক্রমের হিসাব — আসল সিলেবাস এর "
+                 "চেয়ে বড় হলে সময়ও বেশি লাগবে।")
+
+    exam_d = None
+    if isinstance(campaign, dict):
+        exam_d = ea_parse_date(campaign.get("exam_date"))
+        if exam_d is None and campaign:
+            lines.append("(ক্যাম্পেইনের পরীক্ষার তারিখটা পড়তে পারিনি "
+                         "— তাই পরীক্ষা-ভিত্তিক রায় দিলাম না।)")
+    if exam_d is None:
+        lines.append("পরীক্ষার তারিখ বসিয়ে ক্যাম্পেইন চালু করলে আমি "
+                     "বলতে পারব এই গতিতে পরীক্ষার আগেই শেষ হবে কিনা, "
+                     "আর ঘাটতি থাকলে দিনে আরও কত ধাপ লাগবে।")
+        return "\n".join(lines)
+
+    days_left = (exam_d - today_d).days
+    lines.append(f"পরীক্ষা: {ea_bn(str(exam_d))} — হাতে আছে "
+                 f"{ea_bn(max(days_left, 0))} দিন।")
+    if days_left <= 0:
+        lines.append("রায়: পরীক্ষার দিন এসে গেছে বা পেরিয়ে গেছে — "
+                     "এখন অভিক্ষেপের চেয়ে শেষ মুহূর্তের রিভিশনেই "
+                     "কাজ হবে।")
+    elif days_needed <= days_left:
+        lines.append(f"রায়: ✅ এই গতিতে পরীক্ষার আগেই শেষ হবে — "
+                     f"হাতে আরও প্রায় {ea_bn(days_left - days_needed)} "
+                     "দিন বাড়তি থাকবে রিভিশনের জন্য।")
+    else:
+        required = remaining / days_left
+        extra = required - rate
+        lines.append(f"রায়: ⚠️ ঘাটতি আছে — এই গতিতে পরীক্ষার আগে শেষ "
+                     f"হবে না। শেষ করতে দিনে প্রায় "
+                     f"{ea_fmt_num(round(required, 1))} ধাপ লাগবে, মানে "
+                     f"এখনকার গতি থেকে দিনে আরও "
+                     f"{ea_fmt_num(round(extra, 1))} ধাপ দরকার।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  ডিসপ্যাচ হেল্পার (ইন্টিগ্রেটর handle_message-এ বসাবে;
+#  বিস্তারিত INTEGRATION-ANALYSIS.md-তে)
+# =====================================================================
+
+EA_ANALYSIS_TRIGGERS = (
+    "ভুলের খরচ", "ভুল খরচ", "খরচ র‍্যাঙ্কিং",
+    "অগ্রগতির গ্রাফ", "অগ্রগতি বক্ররেখা", "প্রোগ্রেস কার্ভ",
+    "অগ্রগতির কার্ভ",
+    "অভিক্ষেপ", "শেষ হতে কত দিন", "পরীক্ষার আগে শেষ হবে",
+)
+
+
+def ea_analysis_handle(text, low=None):
+    """Trigger মিললে সংশ্লিষ্ট রিপোর্টের টেক্সট, না মিললে None।
+    দ্রষ্টব্য: #765 এখানে campaign=None দিয়ে ডাকা হয় — ক্যাম্পেইন
+    (elite-campaign.json, ep_ প্যাক) থাকলে ইন্টিগ্রেটর চাইলে এই
+    হ্যান্ডলারটা wrap করে campaign= পাস করতে পারে (INTEGRATION নোট)।"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    if ("ভুলের খরচ" in text or "ভুল খরচ" in text
+            or "খরচ র‍্যাঙ্কিং" in text):
+        return ea_wrong_cost_text()
+    if ("অগ্রগতির গ্রাফ" in text or "অগ্রগতি বক্ররেখা" in text
+            or "প্রোগ্রেস কার্ভ" in text or "অগ্রগতির কার্ভ" in text):
+        return ea_progress_curve_text()
+    if ("অভিক্ষেপ" in text or "শেষ হতে কত দিন" in text
+            or "পরীক্ষার আগে শেষ হবে" in text):
+        return ea_projection_text(campaign=None)
+    return None
+
+
+# =====================================================================
+#  Desktop Sokhi v1.9.0 — ELITE TRAINING PACK (staging, paste into sokhi.py)
+#  #755 ফাঁদ-চেনা অনুশীলন (trap-recognition drill)
+#  #756 বিকল্প-বাদ দেওয়ার প্রশিক্ষণ (option-elimination drill)
+#  #759 চাপ-সিমুলেশন (pressure simulation — host exam, tighter clock)
+#
+#  Conventions mirror the inlined v1.5 study pack + v1.7 mastery session:
+#  - Host globals (OFFLINE_BANK, load_json, save_json, DATA) are resolved
+#    at CALL time via globals().get(...), so the pack works pasted into
+#    sokhi.py (host wins) and standalone in tests (params / stubs win).
+#  - Every data function accepts injectable params (bank=, wrong=,
+#    data_dir=) so tests never touch the real data folder.
+#  - All top-level symbols are prefixed et_ / ET_.
+#  - Honest wording only: the "trap" is computed from real word overlap
+#    between options; nothing about a question is invented.
+# =====================================================================
+
+import re
+import json
+import time
+import collections
+from datetime import date
+from pathlib import Path
+
+_ET_BN_DIGITS_MAP = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+ET_OPT_LETTERS = ["ক", "খ", "গ", "ঘ"]
+
+# Session file (import-time snapshot; et_session path is re-resolved at
+# call time from the live DATA global — see _et_session_path()).
+ET_SESSION_FILE = Path(globals().get("DATA", Path("data"))) / "elite-training-session.json"
+
+_ET_STOP_WORDS = ("থামাও", "বাতিল", "বন্ধ করো")
+_ET_TRAP_TRIGGERS = ("ফাঁদ অনুশীলন", "ফাঁদ প্রশিক্ষণ")
+_ET_ELIM_TRIGGERS = ("বাদ দেওয়ার অনুশীলন", "এলিমিনেশন অনুশীলন")
+_ET_PRESSURE_TRIGGERS = ("চাপ অনুশীলন", "চাপের পরীক্ষা", "প্রেশার টেস্ট")
+
+
+def _bn(x):
+    """Local Bangla-digit helper (mirrors the study pack's _bn())."""
+    return str(x).translate(_ET_BN_DIGITS_MAP)
+
+
+_NO_DATA = "এখনো ডেটা নেই"
+
+
+# ------------------------------------------------------- host resolution
+
+def _et_data_dir(data_dir=None):
+    if data_dir is not None:
+        return Path(data_dir)
+    g = globals().get("DATA")
+    return Path(g) if g is not None else Path("data")
+
+
+def _et_session_path(data_dir=None):
+    return _et_data_dir(data_dir) / "elite-training-session.json"
+
+
+def _et_load_json(path, default):
+    fn = globals().get("load_json")
+    if callable(fn):
+        try:
+            out = fn(path, default)
+            return out if out is not None else default
+        except Exception:
+            return default
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _et_save_json(path, obj):
+    fn = globals().get("save_json")
+    if callable(fn):
+        try:
+            fn(path, obj)
+            return
+        except Exception:
+            pass
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(obj, ensure_ascii=False, indent=1),
+                     encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _et_delete_file(path):
+    fn = globals().get("_study_delete")
+    if callable(fn):
+        try:
+            fn(path)
+            return
+        except Exception:
+            pass
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _et_resolve_bank(bank=None):
+    if bank is not None:
+        return bank if isinstance(bank, dict) else {}
+    g = globals().get("OFFLINE_BANK")
+    return g if isinstance(g, dict) else {}
+
+
+def _et_resolve_wrong(wrong=None, data_dir=None):
+    if wrong is not None:
+        return wrong if isinstance(wrong, list) else []
+    wf = globals().get("_WRONG_BOOK_FILE")
+    if wf is not None:
+        data = _et_load_json(wf, [])
+        return data if isinstance(data, list) else []
+    data = _et_load_json(_et_data_dir(data_dir) / "study-wrong-book.json", [])
+    return data if isinstance(data, list) else []
+
+
+def et_detect_subject(text, bank=None):
+    """ব্যাংকের বিষয় / host SUBJECTS-এর কোনো নাম লেখায় থাকলে সেটা ফেরত
+    দেয়; না থাকলে None।"""
+    t = str(text or "")
+    candidates = []
+    b = _et_resolve_bank(bank)
+    candidates.extend(b.keys())
+    subs = globals().get("SUBJECTS")
+    if isinstance(subs, (list, tuple)):
+        candidates.extend(subs)
+    for name in candidates:
+        if name and str(name) in t:
+            return str(name)
+    return None
+
+
+# ------------------------------------------------------- session engine
+
+def et_load(data_dir=None):
+    st = _et_load_json(_et_session_path(data_dir), None)
+    if (isinstance(st, dict) and st.get("mode") in ("trap", "elim")
+            and isinstance(st.get("q"), dict)):
+        return st
+    return None
+
+
+def et_save(session, data_dir=None):
+    _et_save_json(_et_session_path(data_dir), session)
+
+
+def et_clear(data_dir=None):
+    _et_delete_file(_et_session_path(data_dir))
+
+
+def et_active(data_dir=None):
+    return et_load(data_dir) is not None
+
+
+# ------------------------------------------------------- answer parsing
+
+def et_parse_option(text, q):
+    """_parse_answer-এর নিজস্ব ছোট সংস্করণ: ক/খ/গ/ঘ, a-d, ১-৪/1-4,
+    বা অপশনের হুবহু লেখা → index; না পারলে None।"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+    low = re.sub(r"[।.,)ঃ:]+$", "", low).strip()
+    if low in ("ক", "a", "1", "১"):
+        return 0
+    if low in ("খ", "b", "2", "২"):
+        return 1
+    if low in ("গ", "c", "3", "৩"):
+        return 2
+    if low in ("ঘ", "d", "4", "৪"):
+        return 3
+    m = re.match(r"^([কখগঘabcd])\s*[).]", low)
+    if m:
+        return {"ক": 0, "খ": 1, "গ": 2, "ঘ": 3,
+                "a": 0, "b": 1, "c": 2, "d": 3}[m.group(1)]
+    m = re.match(r"^([১২৩৪1234])\s*[).]", low.translate(
+        str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")))
+    if m:
+        return int(m.group(1).translate(
+            str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789"))) - 1
+    for i, op in enumerate((q or {}).get("options", [])[:4]):
+        if t == str(op).strip() or low == str(op).strip().lower():
+            return i
+    return None
+
+
+# ------------------------------------------------------- question picking
+
+def _et_valid_q(q):
+    return (isinstance(q, dict) and q.get("q")
+            and isinstance(q.get("options"), list)
+            and len(q["options"]) == 4
+            and isinstance(q.get("answer"), int)
+            and 0 <= q["answer"] <= 3)
+
+
+def et_pick_question(subject=None, bank=None, wrong=None):
+    """(subject, question) বা None ফেরত দেয়।
+    পছন্দের ক্রম: ভুলের খাতায় যে টপিক আছে, ব্যাংকের সেই টপিকের প্রশ্ন;
+    না থাকলে পুরো পুল। পুলের ভিতরে তারিখ-ঘূর্ণন (host
+    _exam_make_questions-এর মতো) যাতে প্রতিদিন একই প্রশ্ন না আসে।"""
+    bank = _et_resolve_bank(bank)
+    wrong = _et_resolve_wrong(wrong)
+    wrong_topics = {str(w.get("topic") or "")
+                    for w in wrong if isinstance(w, dict)}
+    wrong_topics.discard("")
+
+    if subject:
+        subjects = [subject] if subject in bank else []
+    else:
+        subjects = sorted(bank.keys())
+    pool = []        # (subject, q) — wrong-book topic মিলে যাওয়া প্রশ্ন
+    full = []        # (subject, q) — সব বৈধ প্রশ্ন
+    for subj in subjects:
+        for q in bank.get(subj) or []:
+            if _et_valid_q(q):
+                full.append((subj, dict(q)))
+                if str(q.get("topic") or "") in wrong_topics:
+                    pool.append((subj, dict(q)))
+    chosen = pool or full
+    if not chosen:
+        return None
+    rot = date.today().toordinal() % len(chosen)
+    return chosen[rot]
+
+
+# ------------------------------------------------------- formatting
+
+def _et_fmt_options(q, eliminated=None):
+    eliminated = set(eliminated or [])
+    lines = []
+    for i, op in enumerate(q.get("options", [])[:4]):
+        if i in eliminated:
+            lines.append(f"{ET_OPT_LETTERS[i]}) {op}  ✂️ (বাদ দেওয়া হয়েছে)")
+        else:
+            lines.append(f"{ET_OPT_LETTERS[i]}) {op}")
+    return "\n".join(lines)
+
+
+def _et_fmt_question(session, prompt_line):
+    q = session["q"]
+    head = (f"বিষয়: {session.get('subject', '')} • "
+            f"টপিক: {q.get('topic', 'সাধারণ')}")
+    return (f"{head}\n{q['q']}\n"
+            f"{_et_fmt_options(q, session.get('eliminated'))}\n"
+            f"{prompt_line}")
+
+
+# =====================================================================
+#  #755 ফাঁদ-চেনা অনুশীলন
+# =====================================================================
+
+def _et_tokens(text):
+    return set(re.findall(r"[^\s,।;:!?()\"']+", str(text or "").lower()))
+
+
+def et_trap_index(q):
+    """ফাঁদ = ভুল অপশনগুলোর মধ্যে যেটার লেখা সঠিক অপশনের লেখার সঙ্গে
+    সবচেয়ে বেশি শব্দে মেলে (shared tokens / সঠিক লেখার token-সংখ্যা)।
+    সম্পূর্ণ deterministic; সমান হলে আগের index জেতে।"""
+    opts = (q or {}).get("options", [])
+    correct = (q or {}).get("answer")
+    if not isinstance(correct, int) or not (0 <= correct < len(opts)):
+        return None
+    ctoks = _et_tokens(opts[correct])
+    if not ctoks:
+        return None
+    best, best_score = None, -1.0
+    for i, op in enumerate(opts[:4]):
+        if i == correct:
+            continue
+        score = len(ctoks & _et_tokens(op)) / len(ctoks)
+        if score > best_score:
+            best, best_score = i, score
+    return best
+
+
+def et_trap_start(subject=None, bank=None, wrong=None, data_dir=None):
+    picked = et_pick_question(subject, bank=bank, wrong=wrong)
+    if not picked:
+        return (f"{_NO_DATA} — অফলাইন প্রশ্ন-ব্যাংকে ব্যবহারযোগ্য প্রশ্ন "
+                "পাইনি, তাই ফাঁদ অনুশীলন শুরু করা গেল না। ব্যাংকে প্রশ্ন "
+                "থাকলেই আবার চেষ্টা করো।")
+    subj, q = picked
+    trap = et_trap_index(q)
+    if trap is None:
+        return (f"{_NO_DATA} — এই প্রশ্নে ফাঁদ বের করা গেল না। "
+                "আরেকবার চেষ্টা করো।")
+    session = {"mode": "trap", "subject": subj, "q": q,
+               "stage": "trap_pick", "eliminated": [],
+               "trap_pick": None, "trap_idx": trap,
+               "started_ts": time.time()}
+    et_save(session, data_dir)
+    return ("🪤 ফাঁদ-চেনা অনুশীলন শুরু! পরীক্ষায় একটা অপশন ইচ্ছে করে "
+            "এমনভাবে সাজানো থাকে যাতে তাড়াহুড়োয় সেটাই সঠিক মনে হয় — "
+            "সেটাই ফাঁদ।\n\n"
+            + _et_fmt_question(
+                session,
+                "আগে বলো — কোন অপশনটা ফাঁদ? (ক/খ/গ/ঘ বা অপশনের লেখা "
+                "লিখলেই হবে)"))
+
+
+def _et_trap_step(text, session, data_dir=None):
+    q = session["q"]
+    correct = int(q["answer"])
+    if session.get("stage") == "trap_pick":
+        pick = et_parse_option(text, q)
+        if pick is None:
+            return ("বুঝতে পারিনি — ক/খ/গ/ঘ দিয়ে বলো কোন অপশনটা ফাঁদ "
+                    "মনে হচ্ছে। থামাতে বলো: 'থামাও'।")
+        session["trap_pick"] = pick
+        trap = int(session["trap_idx"])
+        correct_text = str(q["options"][correct])
+        trap_text = str(q["options"][trap])
+        if pick == trap:
+            fb = (f"✅ ঠিক ধরেছ! {ET_OPT_LETTERS[trap]}) {trap_text} — "
+                  "এটাই ছিল ফাঁদ।")
+        else:
+            fb = (f"তুমি বলেছিলে {ET_OPT_LETTERS[pick]}) "
+                  f"{q['options'][pick]} — কিন্তু আসল ফাঁদ ছিল "
+                  f"{ET_OPT_LETTERS[trap]}) {trap_text}।")
+        fb += (f"\nকেন এটা লোভনীয়: সঠিক উত্তর '{correct_text}'-এর সঙ্গে "
+               "এর লেখায় অনেক শব্দ মিলে যায়, তাই তাড়াহুড়োয় পড়লে "
+               "চোখে এটাই সঠিক মনে হয়। ধীরে পড়লেই ফাঁদটা ধরা পড়ে।")
+        session["stage"] = "answer"
+        et_save(session, data_dir)
+        return (fb + "\n\nএবার আসল প্রশ্নের উত্তর দাও:\n"
+                + _et_fmt_question(
+                    session, "উত্তরটা লেখো (ক/খ/গ/ঘ বা অপশনের লেখা)।"))
+    # stage == "answer"
+    pick = et_parse_option(text, q)
+    if pick is None:
+        return ("বুঝতে পারিনি — ক/খ/গ/ঘ দিয়ে উত্তর দাও, বা থামাতে "
+                "বলো: 'থামাও'।")
+    et_clear(data_dir)
+    if pick == correct:
+        return (f"✅ ঠিক হয়েছে! সঠিক উত্তর: {ET_OPT_LETTERS[correct]}) "
+                f"{q['options'][correct]}\n"
+                "ফাঁদ চিনে তারপর ঠিক উত্তর — এই দুই ধাপই আসল পরীক্ষায় "
+                "কাজে লাগবে। আবার খেলতে বলো: 'ফাঁদ অনুশীলন'।")
+    return (f"❌ ভুল হয়েছে। তুমি দিয়েছ: {ET_OPT_LETTERS[pick]}) "
+            f"{q['options'][pick]}\n"
+            f"সঠিক উত্তর: {ET_OPT_LETTERS[correct]}) "
+            f"{q['options'][correct]}\n"
+            "কিছু হবে না — ফাঁদ চেনার অনুশীলন মানেই ভুল করে শেখা। "
+            "আবার চাইলে বলো: 'ফাঁদ অনুশীলন'।")
+
+
+# =====================================================================
+#  #756 বিকল্প-বাদ দেওয়ার প্রশিক্ষণ
+# =====================================================================
+
+def et_elim_start(subject=None, bank=None, wrong=None, data_dir=None):
+    picked = et_pick_question(subject, bank=bank, wrong=wrong)
+    if not picked:
+        return (f"{_NO_DATA} — অফলাইন প্রশ্ন-ব্যাংকে ব্যবহারযোগ্য প্রশ্ন "
+                "পাইনি, তাই বাদ দেওয়ার অনুশীলন শুরু করা গেল না।")
+    subj, q = picked
+    session = {"mode": "elim", "subject": subj, "q": q,
+               "stage": "eliminate", "eliminated": [],
+               "trap_pick": None, "started_ts": time.time()}
+    et_save(session, data_dir)
+    return ("✂️ বাদ দেওয়ার অনুশীলন শুরু! যেসব অপশন নিশ্চিতভাবে ভুল, "
+            "সেগুলো আগে বাদ দিলে বাকিগুলো থেকে উত্তর বাছা সহজ হয়।\n\n"
+            + _et_fmt_question(
+                session,
+                "একটা করে ভুল অপশন বাদ দাও — লেখো: 'বাদ ক' / 'বাদ খ' "
+                "(সর্বোচ্চ ২টা বাদ দিতে পারবে)। তারপর উত্তর দাও "
+                "(ক/খ/গ/ঘ বা অপশনের লেখা)।"))
+
+
+def _et_parse_elim(text, q):
+    """'বাদ ক' / 'বাদ দাও ক' / 'বাদ <অপশনের লেখা>' → index বা None।
+    বাদ-নির্দেশ না হলে None।"""
+    t = (text or "").strip()
+    if not t.startswith("বাদ"):
+        return None
+    rest = t[len("বাদ"):].strip()
+    if rest.startswith("দাও"):
+        rest = rest[len("দাও"):].strip()
+    if not rest:
+        return None
+    return et_parse_option(rest, q)
+
+
+def _et_elim_step(text, session, data_dir=None):
+    q = session["q"]
+    correct = int(q["answer"])
+    eliminated = list(session.get("eliminated") or [])
+
+    if (text or "").strip().startswith("বাদ"):
+        idx = _et_parse_elim(text, q)
+        if idx is None:
+            return ("কোনটা বাদ দেবে বুঝতে পারিনি — লেখো: 'বাদ ক' / "
+                    "'বাদ খ' এভাবে। থামাতে বলো: 'থামাও'।")
+        if idx == correct:
+            et_clear(data_dir)
+            return (f"😅 সঠিকটাই বাদ দিয়ে ফেললে! সঠিক উত্তর ছিল: "
+                    f"{ET_OPT_LETTERS[correct]}) {q['options'][correct]}\n"
+                    "শিক্ষা: যে অপশনটা সম্পর্কে সবচেয়ে কম নিশ্চিত, "
+                    "সেটা বাদ দেওয়ার আগে আরেকবার ভাবো — শুধু "
+                    "নিশ্চিত-ভুল অপশনই বাদ দাও। আবার চাইলে বলো: "
+                    "'বাদ দেওয়ার অনুশীলন'।")
+        if idx in eliminated:
+            return (f"{ET_OPT_LETTERS[idx]}) অপশনটা আগেই বাদ দিয়েছ।\n"
+                    + _et_fmt_question(
+                        session, "আরেকটা বাদ দাও, বা উত্তর দাও।"))
+        eliminated.append(idx)
+        session["eliminated"] = eliminated
+        et_save(session, data_dir)
+        remaining = 4 - len(eliminated)
+        if len(eliminated) >= 2:
+            tail = ("২টা বাদ হয়ে গেছে — এর বেশি বাদ দেওয়া যাবে না। "
+                    "এবার বাকিগুলো থেকে উত্তর দাও।")
+        else:
+            tail = ("আরেকটা বাদ দিতে পারো, বা এখনই উত্তর দিতে পারো।")
+        return (f"✂️ বাদ দিলাম: {ET_OPT_LETTERS[idx]}) "
+                f"{q['options'][idx]}। এখন বাকি {_bn(remaining)}টা অপশন।\n"
+                + _et_fmt_question(session, tail))
+
+    pick = et_parse_option(text, q)
+    if pick is None:
+        return ("বুঝতে পারিনি — বাদ দিতে লেখো 'বাদ ক', উত্তর দিতে "
+                "লেখো ক/খ/গ/ঘ বা অপশনের লেখা। থামাতে বলো: 'থামাও'।")
+    n_elim = len(eliminated)
+    remaining = 4 - n_elim
+    et_clear(data_dir)
+    if pick == correct:
+        fb = (f"✅ ঠিক হয়েছে! সঠিক উত্তর: {ET_OPT_LETTERS[correct]}) "
+              f"{q['options'][correct]}")
+    else:
+        fb = (f"❌ ভুল হয়েছে। তুমি দিয়েছ: {ET_OPT_LETTERS[pick]}) "
+              f"{q['options'][pick]}\nসঠিক উত্তর: "
+              f"{ET_OPT_LETTERS[correct]}) {q['options'][correct]}")
+    if n_elim:
+        fb += (f"\nলক্ষ্য করো: তুমি {_bn(n_elim)}টা ভুল অপশন বাদ দিয়ে "
+               f"৪টা থেকে {_bn(remaining)}টায় নামিয়ে এনেছিলে — তাতে "
+               "অনুমান মিলে যাওয়ার সুযোগ অনেক বেড়ে গিয়েছিল। "
+               "বাদ-দেওয়ার কৌশলটাই এখানে কাজ করেছে।")
+    else:
+        fb += ("\nএবার তুমি বাদ না দিয়েই উত্তর দিলে — পরেরবার আগে "
+               "নিশ্চিত-ভুল অপশনগুলো বাদ দিয়ে দেখো, সহজ লাগবে।")
+    fb += "\nআবার চাইলে বলো: 'বাদ দেওয়ার অনুশীলন'।"
+    return fb
+
+
+# =====================================================================
+#  #759 চাপ-সিমুলেশন (সেশন নয় — host exam_start-এর জন্য অনুরোধ)
+# =====================================================================
+
+def et_pressure_request(text, low=None):
+    """'চাপ অনুশীলন' / 'চাপের পরীক্ষা' / 'প্রেশার টেস্ট' থাকলে
+    {"subject", "minutes", "count", "header"} ফেরত দেয়; নইলে None।
+    স্তর: 'হালকা' → ৮ মিনিট, ডিফল্ট/'আসল' → ৭ মিনিট, 'কঠিন' → ৫ মিনিট
+    (১০টি প্রশ্নের জন্য)। বিষয় লেখায় থাকলে সেটা, নইলে None —
+    integrator তখন mock flow-এর মতো default বিষয় বসাবে।"""
+    t = str(text or "")
+    low = str(low) if low is not None else t.lower()
+    if not (any(tr in t for tr in _ET_PRESSURE_TRIGGERS)
+            or "pressure test" in low):
+        return None
+    if "কঠিন" in t:
+        minutes, level = 5, "কঠিন"
+    elif "হালকা" in t:
+        minutes, level = 8, "হালকা"
+    else:
+        minutes, level = 7, "আসল"
+    header = (f"🔥 চাপ-সিমুলেশন শুরু হচ্ছে — স্তর: {level}! "
+              f"১০টি প্রশ্নের জন্য সময় মাত্র {_bn(minutes)} মিনিট "
+              "(সাধারণ মক টেস্টের চেয়ে কম)। আসল পরীক্ষার হলের চাপ "
+              "অনুভব করাই এই অনুশীলনের উদ্দেশ্য: সব প্রশ্নের উত্তর "
+              "জানা থাকলেও সময় ব্যবস্থাপনাই এখানে আসল পরীক্ষা। "
+              "ঘড়ির দিকে খেয়াল রেখে এগিয়ে যাও!\n")
+    return {"subject": et_detect_subject(t), "minutes": minutes,
+            "count": 10, "header": header}
+
+
+# =====================================================================
+#  Router — handle_message থেকে ডাকা হয় (INTEGRATION-TRAINING.md দেখো)
+# =====================================================================
+
+def et_training_step(text, session=None, data_dir=None):
+    """চলমান সেশনে এক ধাপ এগোয়। সেশন না থাকলে None।"""
+    session = session if session is not None else et_load(data_dir)
+    if not session:
+        return None
+    if session.get("mode") == "trap":
+        return _et_trap_step(text, session, data_dir)
+    if session.get("mode") == "elim":
+        return _et_elim_step(text, session, data_dir)
+    et_clear(data_dir)
+    return None
+
+
+def et_training_handle(text, low=None, bank=None, wrong=None,
+                       data_dir=None):
+    """সেশন চললে সব লেখা সেখানেই যায় (থামার শব্দ ছাড়া); নইলে
+    শুরু-trigger দেখে; কোনোটাই না মিললে None (fall-through)।"""
+    t = str(text or "")
+    if et_active(data_dir):
+        if any(w in t for w in _ET_STOP_WORDS):
+            et_clear(data_dir)
+            return ("ঠিক আছে, অনুশীলন থামিয়ে দিলাম। আবার শুরু করতে "
+                    "বলো: 'ফাঁদ অনুশীলন' বা 'বাদ দেওয়ার অনুশীলন'।")
+        out = et_training_step(t, data_dir=data_dir)
+        return out if out is not None else (
+            "বুঝতে পারিনি — অপশনের অক্ষর (ক/খ/গ/ঘ) দিয়ে উত্তর দাও, "
+            "বা থামাতে বলো: 'থামাও'।")
+    if any(tr in t for tr in _ET_TRAP_TRIGGERS):
+        subj = et_detect_subject(t, bank=bank)
+        return et_trap_start(subj, bank=bank, wrong=wrong,
+                             data_dir=data_dir)
+    if any(tr in t for tr in _ET_ELIM_TRIGGERS):
+        subj = et_detect_subject(t, bank=bank)
+        return et_elim_start(subj, bank=bank, wrong=wrong,
+                              data_dir=data_dir)
+    return None
+
+
+# -*- coding: utf-8 -*-
+"""
+elite_planning_pack.py — Desktop Sokhi v1.9.0: এলিট পরিকল্পনা প্যাক
+(items #766/#662, #767, #769, #770, #781, #782, #783, #784)
+
+এটি একটি STAGING প্যাক — কোনো sokhi.py ফাইলের অংশ নয়। ইন্টিগ্রেটর এটি
+sokhi.py-তে পেস্ট করবেন (INTEGRATION-PLANNING.md দেখুন)। সব সিম্বলের
+prefix ep_ / EP_ যাতে হোস্টের কোনো নামের সঙ্গে সংঘর্ষ না হয়।
+
+House rules honoured (v1.5 study pack-এর ধাঁচে):
+  * 100% free, offline-only — কোনো web / Gemini / API key নয়।
+  * NEVER fabricate data — কাট-অফ, তারিখ, সার্কুলারের তথ্য বানানো হয় না।
+    সার্কুলার-বিশ্লেষণে শুধু ব্যবহারকারীর পেস্ট করা লেখা থেকেই তথ্য তোলা
+    হয়; যা পাওয়া যায়নি তা পরিষ্কার "পাইনি" তালিকায় যায়।
+  * Host globals CALL time-এ globals().get(...) দিয়ে resolve হয়
+    (OFFLINE_LESSONS, load_json, save_json, DATA, get_memory) — pasted
+    অবস্থায় হোস্টের globals জেতে, টেস্টে stub বসানো যায়।
+  * সব public ফাংশনে data parameter inject করা যায় (টেস্টের জন্য)।
+  * Bangla digits via LOCAL _bn() helper; _NO_DATA = "এখনো ডেটা নেই"।
+
+Verified host data shapes:
+  study-progress.json = {subject: {"sessions","mock_tests","total_steps",
+                        "weak"[], "last_topic","last_date"}}
+  study-wrong-book.json = [{"q","options","correct","your_answer",
+                            "subject","topic","date"}]
+  OFFLINE_LESSONS = {subject: [{"topic","text",...}]}
+  wins.json = [{"id","text","date","ts"}]
+  growth-diary.json = [{"date","facts","likes","learned_notes","rules",
+                        "knowledge","interactions"}]
+  memory first_day: host get_memory()-এর "first_day" key (optional)।
+
+নিজের data files (first use-এ তৈরি হয়):
+  elite-campaign.json = {"post": str, "exam_date": "YYYY-MM-DD",
+                         "set_date": "YYYY-MM-DD",
+                         "events": [{"name","date"}],
+                         "milestones_shown": [keys]}
+  elite-story.json    = [{"date": "YYYY-MM-DD", "text": str}]
+"""
+
+import json
+import re
+from collections import Counter
+from datetime import date, timedelta
+from pathlib import Path
+
+# ------------------------------------------------------------------ digits
+
+_EP_BN_MAP = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+_EP_EN_MAP = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+
+def _bn(x):
+    """Local mirror of host _bn_num(): English digits -> Bangla digits."""
+    return str(x).translate(_EP_BN_MAP)
+
+
+_NO_DATA = "এখনো ডেটা নেই"
+
+EP_WEEKDAYS_BN = ["সোমবার", "মঙ্গলবার", "বুধবার", "বৃহস্পতিবার",
+                  "শুক্রবার", "শনিবার", "রবিবার"]
+
+EP_BN_MONTHS = {
+    "জানুয়ারি": 1, "জানুয়ারী": 1,
+    "ফেব্রুয়ারি": 2, "ফেব্রুয়ারী": 2,
+    "মার্চ": 3, "এপ্রিল": 4, "মে": 5, "জুন": 6, "জুলাই": 7,
+    "আগস্ট": 8, "আগষ্ট": 8, "সেপ্টেম্বর": 9, "অক্টোবর": 10,
+    "নভেম্বর": 11, "ডিসেম্বর": 12,
+}
+
+# ------------------------------------------------------------- file paths
+# DATA হোস্ট global; standalone/টেস্টে না থাকলে পাশের ফোল্ডারে fallback।
+
+try:
+    EP_CAMPAIGN_FILE = DATA / "elite-campaign.json"  # noqa: F821
+    EP_STORY_FILE = DATA / "elite-story.json"        # noqa: F821
+except NameError:
+    EP_CAMPAIGN_FILE = Path("elite-campaign.json")
+    EP_STORY_FILE = Path("elite-story.json")
+
+
+def _ep_data_path(filename, fallback):
+    d = globals().get("DATA")
+    if d is not None:
+        try:
+            return Path(d) / filename
+        except Exception:
+            pass
+    return Path(fallback)
+
+
+def _ep_campaign_path(path=None):
+    if path is not None:
+        return Path(path)
+    return _ep_data_path("elite-campaign.json", EP_CAMPAIGN_FILE)
+
+
+def _ep_story_path(path=None):
+    if path is not None:
+        return Path(path)
+    return _ep_data_path("elite-story.json", EP_STORY_FILE)
+
+
+# ------------------------------------------------------- global fallbacks
+# হোস্টের load_json/save_json থাকলে তাই, না থাকলে local JSON IO।
+
+
+def _ep_load(path, default):
+    fn = globals().get("load_json")
+    if callable(fn):
+        try:
+            return fn(path, default)
+        except Exception:
+            return default
+    try:
+        p = Path(path)
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+
+def _ep_save(path, obj):
+    fn = globals().get("save_json")
+    if callable(fn):
+        try:
+            fn(path, obj)
+            return True
+        except Exception:
+            pass
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(obj, ensure_ascii=False, indent=1),
+                     encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _ep_resolve_lessons(lessons=None):
+    if lessons is not None:
+        return lessons if isinstance(lessons, dict) else {}
+    g = globals().get("OFFLINE_LESSONS")
+    return g if isinstance(g, dict) else {}
+
+
+def _ep_resolve_progress(progress=None):
+    if progress is not None:
+        return progress if isinstance(progress, dict) else {}
+    path = globals().get("_STUDY_PROGRESS_FILE")
+    if path is None:
+        d = globals().get("DATA")
+        path = (Path(d) / "study-progress.json") if d is not None else None
+    data = _ep_load(path, {}) if path is not None else {}
+    return data if isinstance(data, dict) else {}
+
+
+def _ep_resolve_wrong(wrong=None):
+    if wrong is not None:
+        return wrong if isinstance(wrong, list) else []
+    path = globals().get("_WRONG_BOOK_FILE")
+    if path is None:
+        d = globals().get("DATA")
+        path = (Path(d) / "study-wrong-book.json") if d is not None else None
+    data = _ep_load(path, []) if path is not None else []
+    return data if isinstance(data, list) else []
+
+
+def _ep_resolve_wins(wins=None):
+    if wins is not None:
+        return wins if isinstance(wins, list) else []
+    d = globals().get("DATA")
+    if d is None:
+        return []
+    data = _ep_load(Path(d) / "wins.json", [])
+    return data if isinstance(data, list) else []
+
+
+def _ep_resolve_diary(diary=None):
+    if diary is not None:
+        return diary if isinstance(diary, list) else []
+    d = globals().get("DATA")
+    if d is None:
+        return []
+    data = _ep_load(Path(d) / "growth-diary.json", [])
+    return data if isinstance(data, list) else []
+
+
+def _ep_resolve_first_day(first_day=None):
+    if first_day:
+        return str(first_day)
+    fn = globals().get("get_memory")
+    if callable(fn):
+        try:
+            mem = fn()
+            if isinstance(mem, dict) and mem.get("first_day"):
+                return str(mem["first_day"])
+        except Exception:
+            pass
+    return ""
+
+
+def _ep_today(today=None):
+    if isinstance(today, date):
+        return today
+    return date.today()
+
+
+# ------------------------------------------------------------ date utils
+
+def ep_normalize_digits(text):
+    """বাংলা সংখ্যা (০-৯) -> English digits; বাকি লেখা অপরিবর্তিত।"""
+    return str(text or "").translate(_EP_EN_MAP)
+
+
+def ep_parse_date(text):
+    """লেখা থেকে প্রথম বৈধ তারিখ -> datetime.date, না পেলে None।
+    ফরম্যাট: YYYY-MM-DD, DD/MM/YYYY, আর '১২ মার্চ ২০২৭' ধরনের বাংলা
+    মাসের নাম (সংখ্যা বাংলা বা English যেকোনোটি)।"""
+    t = ep_normalize_digits(text)
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", t)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    month_alt = "|".join(sorted(EP_BN_MONTHS, key=len, reverse=True))
+    m = re.search(r"(\d{1,2})\s*(" + month_alt + r")\s*,?\s*(\d{4})",
+                  str(text or ""))
+    if not m:
+        m = re.search(r"(\d{1,2})\s*(" + month_alt + r")\s*,?\s*(\d{4})", t)
+    if m:
+        try:
+            return date(int(m.group(3)), EP_BN_MONTHS[m.group(2)],
+                        int(m.group(1)))
+        except (ValueError, KeyError):
+            pass
+    return None
+
+
+def ep_find_dates(text):
+    """লেখায় পাওয়া সব বৈধ তারিখ (ক্রম ঠিক রেখে, duplicate ছাড়া)।"""
+    t = ep_normalize_digits(text)
+    found = []
+
+    def _add(d):
+        if d is not None and d not in found:
+            found.append(d)
+
+    hits = []
+    for m in re.finditer(r"\d{4}-\d{1,2}-\d{1,2}", t):
+        hits.append((m.start(), ep_parse_date(m.group(0))))
+    for m in re.finditer(r"\d{1,2}/\d{1,2}/\d{4}", t):
+        hits.append((m.start(), ep_parse_date(m.group(0))))
+    month_alt = "|".join(sorted(EP_BN_MONTHS, key=len, reverse=True))
+    pat = r"\d{1,2}\s*(?:" + month_alt + r")\s*,?\s*\d{4}"
+    raw = str(text or "")
+    for src in (raw, t):
+        for m in re.finditer(pat, src):
+            hits.append((m.start(), ep_parse_date(m.group(0))))
+    for _, d in sorted(hits, key=lambda h: h[0]):
+        _add(d)
+    return found
+
+
+def _ep_fmt_date(d):
+    """date -> '১২ মার্চ ২০২৭ (2027-03-12)' ধরনের পাঠযোগ্য রূপ।"""
+    if not isinstance(d, date):
+        return str(d or "")
+    # প্রচলিত বানান: map-এ মাসের প্রথম key
+    names = [k for k, v in EP_BN_MONTHS.items() if v == d.month]
+    name = names[0] if names else str(d.month)
+    return f"{_bn(d.day)} {name} {_bn(d.year)}"
+
+
+def _ep_parse_iso(s):
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(str(s)[:10])
+    except ValueError:
+        return ep_parse_date(s)
+
+
+# ------------------------------------------------------- shared analysis
+
+def _ep_touched_topics(progress, lessons):
+    """(subject, topic) সেট — যেসব lesson-topic-এর প্রমাণ progress-এ আছে:
+    last_topic এবং weak[]-এর যেসব topic lesson তালিকায় আছে।
+    (v1.5 coverage_text-এর একই সীমিত-প্রমাণ নিয়ম।)"""
+    touched = set()
+    for subj, items in (lessons or {}).items():
+        topics = {str(it.get("topic")) for it in (items or [])
+                  if isinstance(it, dict) and it.get("topic")}
+        info = (progress or {}).get(subj) or {}
+        if not isinstance(info, dict):
+            continue
+        lt = info.get("last_topic")
+        if lt and str(lt) in topics:
+            touched.add((subj, str(lt)))
+        for w in info.get("weak") or []:
+            if str(w) in topics:
+                touched.add((subj, str(w)))
+    return touched
+
+
+def _ep_coverage(progress, lessons):
+    """(ছোঁয়া topic সংখ্যা, মোট topic সংখ্যা) — সব বিষয় মিলিয়ে।"""
+    total = sum(len(items or []) for items in (lessons or {}).values())
+    return len(_ep_touched_topics(progress, lessons)), total
+
+
+def _ep_weak_topics(progress, wrong, limit=5):
+    """দুর্বল topic তালিকা: progress-এর weak[] আগে, তারপর wrong-book-এ
+    সবচেয়ে বেশিবার ভুল হওয়া topic।"""
+    out = []
+    for subj in sorted((progress or {}).keys()):
+        info = progress.get(subj) or {}
+        if isinstance(info, dict):
+            for w in info.get("weak") or []:
+                if str(w) not in out:
+                    out.append(str(w))
+    wc = Counter(str(w.get("topic") or "সাধারণ") for w in (wrong or [])
+                 if isinstance(w, dict))
+    for topic, _cnt in wc.most_common():
+        if topic not in out:
+            out.append(topic)
+    return out[:limit]
+
+
+def _ep_gap_topics(progress, lessons, limit=5):
+    """এখনো ছোঁয়া হয়নি এমন lesson topic (বিষয়সহ)।"""
+    touched = _ep_touched_topics(progress, lessons)
+    out = []
+    for subj in sorted((lessons or {}).keys()):
+        for it in lessons.get(subj) or []:
+            if isinstance(it, dict) and it.get("topic"):
+                key = (subj, str(it["topic"]))
+                if key not in touched:
+                    out.append(f"{subj}: {it['topic']}")
+    return out[:limit]
+
+
+# =====================================================================
+#  #767 মাইলফলক (আগে — ক্যাম্পেইন এটা ব্যবহার করে)
+# =====================================================================
+
+EP_MILESTONE_DEFS = [
+    # (key, label, kind, threshold)
+    ("cov25", "সিলেবাস কভারেজ ২৫%", "coverage", 25),
+    ("cov50", "সিলেবাস কভারেজ ৫০%", "coverage", 50),
+    ("cov75", "সিলেবাস কভারেজ ৭৫%", "coverage", 75),
+    ("cov100", "সিলেবাস কভারেজ ১০০%", "coverage", 100),
+    ("mock1", "প্রথম মক টেস্ট দেওয়া", "mock", 1),
+    ("mock5", "মোট ৫টি মক টেস্ট", "mock", 5),
+    ("mock10", "মোট ১০টি মক টেস্ট", "mock", 10),
+    ("mock20", "মোট ২০টি মক টেস্ট", "mock", 20),
+    ("wrong50", "ভুলের খাতা ৫০-এর নিচে", "wrong_below", 50),
+    ("wrong20", "ভুলের খাতা ২০-এর নিচে", "wrong_below", 20),
+    ("wrong10", "ভুলের খাতা ১০-এর নিচে", "wrong_below", 10),
+    ("wrong5", "ভুলের খাতা ৫-এর নিচে", "wrong_below", 5),
+]
+
+
+def ep_milestones(progress=None, lessons=None, wrong=None):
+    """ডেটা থেকে হিসাব করা মাইলফলক: [{"key","label","achieved"}]।
+    কভারেজ = ছোঁয়া topic / মোট lesson topic; মক = সব বিষয়ের mock_tests
+    যোগফল; ভুলের খাতা ছোট হওয়া মাপা হয় তখনই, যখন অন্তত একটি মক টেস্ট
+    দেওয়া হয়েছে (নইলে খালি খাতা 'অর্জন' নয়)।"""
+    progress = _ep_resolve_progress(progress)
+    lessons = _ep_resolve_lessons(lessons)
+    wrong = _ep_resolve_wrong(wrong)
+    touched, total_topics = _ep_coverage(progress, lessons)
+    cov_pct = (touched * 100 // total_topics) if total_topics else 0
+    mocks = 0
+    for info in progress.values():
+        if isinstance(info, dict):
+            try:
+                mocks += int(info.get("mock_tests") or 0)
+            except (TypeError, ValueError):
+                pass
+    n_wrong = len(wrong)
+    out = []
+    for key, label, kind, thr in EP_MILESTONE_DEFS:
+        if kind == "coverage":
+            ok = total_topics > 0 and cov_pct >= thr
+        elif kind == "mock":
+            ok = mocks >= thr
+        else:  # wrong_below
+            ok = mocks > 0 and n_wrong < thr
+        out.append({"key": key, "label": label, "achieved": bool(ok)})
+    return out
+
+
+def ep_milestones_text(progress=None, lessons=None, wrong=None):
+    ms = ep_milestones(progress, lessons, wrong)
+    lines = ["🏁 মাইলফলক (তোমার নিজের ডেটা থেকে হিসাব করা):"]
+    for mst in ms:
+        mark = "✓" if mst["achieved"] else "•"
+        lines.append(f"{mark} {mst['label']}")
+    return "\n".join(lines)
+
+
+def ep_milestone_new(campaign, progress=None, lessons=None, wrong=None):
+    """নতুন অর্জিত milestone key-গুলো — যেগুলো campaign['milestones_shown']-
+    এ এখনো নেই। ইন্টিগ্রেটর চাইলে এগুলো campaign-এ persist করবেন।"""
+    shown = set()
+    if isinstance(campaign, dict):
+        shown = {str(k) for k in (campaign.get("milestones_shown") or [])}
+    return [m["key"] for m in ep_milestones(progress, lessons, wrong)
+            if m["achieved"] and m["key"] not in shown]
+
+
+# =====================================================================
+#  #766/#662 ক্যাম্পেইন পরিকল্পক
+# =====================================================================
+
+def ep_campaign_default():
+    return {"post": "", "exam_date": "", "set_date": "",
+            "events": [], "milestones_shown": []}
+
+
+def ep_campaign_load(path=None):
+    data = _ep_load(_ep_campaign_path(path), {})
+    camp = ep_campaign_default()
+    if isinstance(data, dict):
+        for k in camp:
+            if k in data:
+                camp[k] = data[k]
+    if not isinstance(camp.get("events"), list):
+        camp["events"] = []
+    if not isinstance(camp.get("milestones_shown"), list):
+        camp["milestones_shown"] = []
+    return camp
+
+
+def ep_campaign_save(campaign, path=None):
+    return _ep_save(_ep_campaign_path(path), campaign)
+
+
+def ep_campaign_exam_date(campaign):
+    if isinstance(campaign, dict):
+        return _ep_parse_iso(campaign.get("exam_date"))
+    return None
+
+
+def ep_campaign_phase(days_left):
+    """>45 ভিত্তি গড়া / 22–45 মজবুত করা / 8–21 রিভিশন / ≤7 শেষ সপ্তাহ।"""
+    if days_left is None:
+        return ""
+    if days_left > 45:
+        return "ভিত্তি গড়া"
+    if days_left >= 22:
+        return "মজবুত করা"
+    if days_left >= 8:
+        return "রিভিশন"
+    return "শেষ সপ্তাহ"
+
+
+def ep_campaign_set_from_text(text, today=None, campaign=None, path=None):
+    """সেট-কমান্ড parse করে campaign আপডেট + save করে।
+    মিললে confirmation text, না মিললে None।
+    প্যাটার্ন: 'ক্যাম্পেইন: <post> পরীক্ষা <date>' অথবা
+    'পরীক্ষার তারিখ <date>'। তারিখ YYYY-MM-DD / DD/MM/YYYY / বাংলা
+    সংখ্যা / বাংলা মাসের নাম — যেকোনোটি।"""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    today = _ep_today(today)
+    post = None
+    exam = None
+    m = re.match(r"\s*ক্যাম্পেইন\s*[:：]\s*(.+)$", raw)
+    if m:
+        rest = m.group(1).strip()
+        exam = ep_parse_date(rest)
+        pm = re.split(r"পরীক্ষা", rest, maxsplit=1)
+        if len(pm) == 2:
+            post = pm[0].strip(" :：-—") or None
+    elif "পরীক্ষার তারিখ" in raw:
+        exam = ep_parse_date(raw)
+    else:
+        return None
+    if exam is None:
+        return ("তারিখটা বুঝতে পারিনি। এভাবে লিখো — যেমন: "
+                "'ক্যাম্পেইন: ইউনিয়ন সমাজকর্মী পরীক্ষা 2027-03-12' "
+                "অথবা 'পরীক্ষার তারিখ 12/03/2027'।")
+    camp = campaign if isinstance(campaign, dict) else ep_campaign_load(path)
+    if post:
+        camp["post"] = post
+    camp["exam_date"] = exam.isoformat()
+    camp["set_date"] = today.isoformat()
+    if not isinstance(camp.get("events"), list):
+        camp["events"] = []
+    if not isinstance(camp.get("milestones_shown"), list):
+        camp["milestones_shown"] = []
+    ep_campaign_save(camp, path)
+    days = (exam - today).days
+    head = f"🎯 ক্যাম্পেইন সেট হয়েছে!"
+    if camp.get("post"):
+        head += f"\nপদ: {camp['post']}"
+    head += f"\nপরীক্ষার তারিখ: {_ep_fmt_date(exam)}"
+    if days >= 0:
+        head += f"\nবাকি: {_bn(days)} দিন — বর্তমান ধাপ: {ep_campaign_phase(days)}"
+    else:
+        head += "\n(এই তারিখটা আজ থেকে পেছনে — ঠিক আছে কিনা দেখে নিও।)"
+    return head
+
+
+def ep_campaign_text(progress=None, lessons=None, wrong=None, today=None,
+                     campaign=None):
+    """ক্যাম্পেইনের বর্তমান অবস্থা: দিন বাকি, ধাপ, ডেটাভিত্তিক ফোকাস,
+    আর মাইলফলক তালিকা। campaign না থাকলে সেট করার নির্দেশনা।"""
+    today = _ep_today(today)
+    camp = campaign if isinstance(campaign, dict) else ep_campaign_load()
+    exam = ep_campaign_exam_date(camp)
+    if exam is None:
+        return ("🎯 এখনো কোনো ক্যাম্পেইন সেট করোনি — পরীক্ষার তারিখ জানলে "
+                "এভাবে বলো: 'ক্যাম্পেইন: <পদের নাম> পরীক্ষা <তারিখ>' "
+                "(যেমন: ক্যাম্পেইন: ইউনিয়ন সমাজকর্মী পরীক্ষা 2027-03-12)। "
+                "তারিখ পেলেই দিন গুনে ধাপে ধাপে পরিকল্পনা সাজিয়ে দেব।")
+    progress = _ep_resolve_progress(progress)
+    lessons = _ep_resolve_lessons(lessons)
+    wrong = _ep_resolve_wrong(wrong)
+    days = (exam - today).days
+    phase = ep_campaign_phase(days)
+    lines = ["🎯 ক্যাম্পেইন পরিকল্পনা"]
+    if camp.get("post"):
+        lines.append(f"পদ: {camp['post']}")
+    lines.append(f"পরীক্ষা: {_ep_fmt_date(exam)}")
+    if days > 0:
+        lines.append(f"বাকি আছে: {_bn(days)} দিন")
+    elif days == 0:
+        lines.append("আজই পরীক্ষা! শুভকামনা রইল।")
+    else:
+        lines.append(f"পরীক্ষার তারিখ {_bn(-days)} দিন আগে পেরিয়ে গেছে — "
+                     "নতুন তারিখ থাকলে ক্যাম্পেইন আবার সেট করো।")
+    if days >= 0:
+        lines.append(f"বর্তমান ধাপ: {phase}")
+        weak = _ep_weak_topics(progress, wrong)
+        gaps = _ep_gap_topics(progress, lessons)
+        lines.append("")
+        lines.append(f"এই ধাপে ফোকাস ({phase}):")
+        if phase == "ভিত্তি গড়া":
+            if gaps:
+                lines.append("• আগে বাকি পাঠগুলো শেষ করো: " +
+                             "; ".join(gaps[:3]))
+            else:
+                lines.append("• সব পাঠ একবার করে ছোঁয়া হয়েছে — "
+                             "এবার ধারাবাহিকভাবে এগিয়ে যাও।")
+            lines.append("• প্রতিদিন অল্প অল্প করে নতুন টপিক পড়ো।")
+        elif phase == "মজবুত করা":
+            if weak:
+                lines.append("• দুর্বল টপিক মজবুত করো: " + ", ".join(weak))
+            if gaps:
+                lines.append("• বাকি পাঠ শেষ করো: " + "; ".join(gaps[:2]))
+            lines.append("• নিয়মিত মক টেস্ট দিয়ে দুর্বলতা যাচাই করো।")
+        elif phase == "রিভিশন":
+            if weak:
+                lines.append("• ভুলের খাতা রিভিশন করো: " + ", ".join(weak))
+            lines.append("• নতুন পড়া কমিয়ে রিভিশন আর মক টেস্টে জোর দাও।")
+        else:  # শেষ সপ্তাহ
+            lines.append("• 'পরীক্ষা সপ্তাহ' লিখলেই দিনভিত্তিক প্রোটোকল "
+                         "সাজিয়ে দেব।")
+            if weak:
+                lines.append("• শেষবারের মতো চোখ বুলাও: " + ", ".join(weak))
+        if not weak and not gaps and phase != "শেষ সপ্তাহ":
+            lines.append(f"• ({_NO_DATA} — পড়ার রেকর্ড এলেই ফোকাস আরও "
+                         "নির্দিষ্ট করে বলতে পারব।)")
+    new_keys = ep_milestone_new(camp, progress, lessons, wrong)
+    if new_keys:
+        labels = {m["key"]: m["label"]
+                  for m in ep_milestones(progress, lessons, wrong)}
+        lines.append("")
+        lines.append("🎉 নতুন মাইলফলক অর্জন: " +
+                     ", ".join(labels.get(k, k) for k in new_keys))
+    lines.append("")
+    lines.append(ep_milestones_text(progress, lessons, wrong))
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #769 সম্পদ-বণ্টন (সাপ্তাহিক সময়-ভাগ)
+# =====================================================================
+
+def ep_allocation(progress=None, wrong=None, lessons=None):
+    """বিষয়ভিত্তিক সাপ্তাহিক সময়-ভাগ %: [{"subject","pct","remaining"}]।
+    ভিত্তি = বাকি পাঠের অংশ; boost = ভুলের খাতায় ঐ বিষয়ের ভুলের অংশ।
+    শতকরার যোগফল ঠিক ১০০ (rounding-এর ঘাটতি সবচেয়ে বড় ভাগে যোগ হয়)।"""
+    progress = _ep_resolve_progress(progress)
+    wrong = _ep_resolve_wrong(wrong)
+    lessons = _ep_resolve_lessons(lessons)
+    subjects = sorted(set(lessons.keys()) | set(progress.keys()))
+    if not subjects:
+        return []
+    touched = _ep_touched_topics(progress, lessons)
+    wrong_by_subj = Counter(str(w.get("subject") or "অজানা বিষয়")
+                            for w in wrong if isinstance(w, dict))
+    total_wrong = sum(wrong_by_subj.values())
+    remaining = {}
+    for subj in subjects:
+        total = len(lessons.get(subj) or [])
+        done = sum(1 for (s, _t) in touched if s == subj)
+        remaining[subj] = max(0, total - done)
+    total_remaining = sum(remaining.values())
+    weights = {}
+    for subj in subjects:
+        base = (remaining[subj] / total_remaining) if total_remaining else 0.0
+        boost = (wrong_by_subj.get(subj, 0) / total_wrong) \
+            if total_wrong else 0.0
+        weights[subj] = base + boost
+    total_w = sum(weights.values())
+    if total_w <= 0:
+        weights = {s: 1.0 for s in subjects}
+        total_w = float(len(subjects))
+    raw = {s: weights[s] / total_w * 100.0 for s in subjects}
+    pct = {s: int(round(v)) for s, v in raw.items()}
+    diff = 100 - sum(pct.values())
+    if diff != 0:
+        largest = max(subjects, key=lambda s: raw[s])
+        pct[largest] += diff
+    return [{"subject": s, "pct": pct[s], "remaining": remaining[s]}
+            for s in sorted(subjects, key=lambda s: -pct[s])]
+
+
+def ep_allocation_text(progress=None, wrong=None, lessons=None):
+    alloc = ep_allocation(progress, wrong, lessons)
+    if not alloc:
+        return (f"{_NO_DATA} — কোনো বিষয়ের পাঠ বা পড়ার রেকর্ড পাইনি, "
+                "তাই সময়-ভাগ সাজাতে পারছি না।")
+    lines = ["🧭 সাপ্তাহিক সম্পদ-বণ্টন (সময়-ভাগ)",
+             "(তোমার নিজের তথ্য থেকে সাজানো ভাগ — বাকি পাঠ আর ভুলের "
+             "খাতার ওজন অনুযায়ী।)"]
+    for a in alloc:
+        lines.append(f"• {a['subject']}: {_bn(a['pct'])}% — "
+                     f"বই/পাঠ বাকি: {_bn(a['remaining'])}টি")
+    lines.append("মোট: ১০০% — সপ্তাহের মোট পড়ার সময়কে এভাবে ভাগ করলেই "
+                 "হিসাবটা মিলবে।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #770 পরীক্ষা-সপ্তাহ প্রোটোকল
+# =====================================================================
+
+EP_EXAM_DAY_CHECKLIST = [
+    "প্রবেশপত্র (অ্যাডমিট কার্ড) আর দরকারি কাগজপত্র আগের রাতেই ব্যাগে রাখো",
+    "কলম, পেন্সিল, ঘড়ি — যা যা লাগে গুছিয়ে রাখো",
+    "পরীক্ষার কেন্দ্রে পৌঁছানোর পথ ও সময় আগেই হিসাব করে রাখো — হাতে বাড়তি সময় নিয়ে বের হও",
+    "আগের রাতে তাড়াতাড়ি ঘুমাও; পরীক্ষার দিন হালকা খাবার খেয়ে বের হও",
+    "মোবাইল ফোন কেন্দ্রের নিয়ম অনুযায়ী রাখো",
+]
+
+
+def ep_exam_week_text(campaign=None, wrong=None, progress=None, today=None,
+                      force=False):
+    """পরীক্ষা ৭ দিনের মধ্যে হলে (বা force=True হলে) দিনভিত্তিক পরিকল্পনা:
+    প্রথম দিনগুলোতে ভুলের খাতার শীর্ষ টপিক রিভিশন, আগের দিন হালকা রিভিশন
+    + বিশ্রাম, পরীক্ষার দিনের সাধারণ চেকলিস্ট। তারিখ না থাকলে সেট করতে বলে।"""
+    today = _ep_today(today)
+    camp = campaign if isinstance(campaign, dict) else ep_campaign_load()
+    exam = ep_campaign_exam_date(camp)
+    if exam is None:
+        return ("📅 পরীক্ষা-সপ্তাহ প্রোটোকল সাজাতে আগে পরীক্ষার তারিখ লাগবে। "
+                "এভাবে সেট করো: 'ক্যাম্পেইন: <পদের নাম> পরীক্ষা <তারিখ>' "
+                "অথবা 'পরীক্ষার তারিখ 12/03/2027'।")
+    days = (exam - today).days
+    if days < 0:
+        return ("📅 ক্যাম্পেইনের পরীক্ষার তারিখ পেরিয়ে গেছে "
+                f"({_ep_fmt_date(exam)})। নতুন তারিখ থাকলে ক্যাম্পেইন "
+                "আবার সেট করো।")
+    if days > 7 and not force:
+        return (f"📅 পরীক্ষা এখনো {_bn(days)} দিন বাকি — পরীক্ষা-সপ্তাহ "
+                "প্রোটোকল শুরু হবে শেষ ৭ দিনে। এখনকার ধাপ: "
+                f"{ep_campaign_phase(days)}। 'ক্যাম্পেইন' লিখলে পুরো "
+                "পরিকল্পনা দেখতে পাবে।")
+    wrong = _ep_resolve_wrong(wrong)
+    progress = _ep_resolve_progress(progress)
+    topics = _ep_weak_topics(progress, wrong, limit=10)
+    lines = ["📅 পরীক্ষা-সপ্তাহ প্রোটোকল",
+             f"পরীক্ষা: {_ep_fmt_date(exam)} — বাকি {_bn(days)} দিন"]
+    if camp.get("post"):
+        lines.append(f"পদ: {camp['post']}")
+    topic_i = 0
+    for i in range(days):
+        d = today + timedelta(days=i)
+        label = f"• {_ep_fmt_date(d)} ({EP_WEEKDAYS_BN[d.weekday()]}): "
+        if d == exam - timedelta(days=1) and days >= 1:
+            lines.append(label + "হালকা রিভিশন — শুধু নোট আর ভুলের খাতায় "
+                                 "চোখ বুলাও; তাড়াতাড়ি ঘুমাও, বিশ্রাম নাও।")
+        elif topics:
+            take = topics[topic_i:topic_i + 2]
+            topic_i += len(take)
+            if take:
+                lines.append(label + "রিভিশন: " + ", ".join(take))
+            else:
+                lines.append(label + "সার্বিক রিভিশন — ভুলের খাতা আর "
+                                     "নিজের নোট আবার দেখো।")
+        else:
+            lines.append(label + "সার্বিক রিভিশন — নিজের নোট আর পড়া "
+                                 "অংশগুলো আবার দেখো।")
+    lines.append(f"• {_ep_fmt_date(exam)} ({EP_WEEKDAYS_BN[exam.weekday()]}): "
+                 "পরীক্ষার দিন 🎯")
+    lines.append("")
+    lines.append("পরীক্ষার দিনের চেকলিস্ট (সাধারণ):")
+    for item in EP_EXAM_DAY_CHECKLIST:
+        lines.append(f"• {item}")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #783 তারিখ-সংঘাত সতর্কতা + ইভেন্ট যোগ/তালিকা
+# =====================================================================
+
+def ep_conflicts(campaign):
+    """campaign-এর dated items (পরীক্ষা + events) থেকে সংঘাতের তালিকা:
+    একই তারিখে একাধিক item, আর পরীক্ষার আগের ২ দিনের মধ্যে event।"""
+    camp = campaign if isinstance(campaign, dict) else ep_campaign_load()
+    exam = ep_campaign_exam_date(camp)
+    items = []
+    if exam is not None:
+        items.append(("পরীক্ষা" + (f" ({camp['post']})"
+                                   if camp.get("post") else ""), exam))
+    for ev in camp.get("events") or []:
+        if isinstance(ev, dict):
+            d = _ep_parse_iso(ev.get("date")) or ep_parse_date(ev.get("date"))
+            if d is not None:
+                items.append((str(ev.get("name") or "ইভেন্ট"), d))
+    warnings = []
+    by_date = {}
+    for name, d in items:
+        by_date.setdefault(d, []).append(name)
+    for d in sorted(by_date):
+        if len(by_date[d]) > 1:
+            warnings.append(f"⚠️ {_ep_fmt_date(d)} — একই দিনে একাধিক: " +
+                            ", ".join(by_date[d]))
+    if exam is not None:
+        for ev in camp.get("events") or []:
+            if not isinstance(ev, dict):
+                continue
+            d = _ep_parse_iso(ev.get("date")) or ep_parse_date(ev.get("date"))
+            if d is None:
+                continue
+            gap = (exam - d).days
+            if 0 < gap <= 2:
+                warnings.append(
+                    f"⚠️ '{ev.get('name')}' পরীক্ষার ঠিক আগে "
+                    f"({_ep_fmt_date(d)} — পরীক্ষার {_bn(gap)} দিন আগে)। "
+                    "ঐ সময়টা রিভিশনে রাখা ভালো।")
+    return warnings
+
+
+def ep_conflicts_text(campaign=None):
+    camp = campaign if isinstance(campaign, dict) else ep_campaign_load()
+    exam = ep_campaign_exam_date(camp)
+    events = [ev for ev in (camp.get("events") or [])
+              if isinstance(ev, dict)]
+    if exam is None and not events:
+        return (f"{_NO_DATA} — ক্যাম্পেইনে কোনো তারিখ বা ইভেন্ট নেই। "
+                "পরীক্ষার তারিখ সেট করো ('ক্যাম্পেইন: ... পরীক্ষা "
+                "<তারিখ>'), আর ইভেন্ট যোগ করো: 'ইভেন্ট যোগ: <নাম> <তারিখ>'।")
+    lines = ["🗓️ তারিখের তালিকা:"]
+    if exam is not None:
+        lines.append(f"• পরীক্ষা: {_ep_fmt_date(exam)}")
+    for ev in events:
+        d = _ep_parse_iso(ev.get("date")) or ep_parse_date(ev.get("date"))
+        lines.append(f"• {ev.get('name')}: "
+                     f"{_ep_fmt_date(d) if d else ev.get('date')}")
+    warns = ep_conflicts(camp)
+    lines.append("")
+    if warns:
+        lines.append("তারিখ-সংঘাত সতর্কতা:")
+        lines.extend(warns)
+    else:
+        lines.append("✓ কোনো তারিখ-সংঘাত পাইনি।")
+    return "\n".join(lines)
+
+
+def ep_event_add_from_text(text, campaign=None, path=None, today=None):
+    """'ইভেন্ট যোগ: <নাম> <তারিখ>' — campaign['events']-এ যোগ করে save।
+    মিললে confirmation, তারিখ না মিললে নির্দেশনা, প্যাটার্ন না মিললে None।"""
+    raw = str(text or "").strip()
+    m = re.match(r"\s*ইভেন্ট যোগ\s*[:：]?\s*(.+)$", raw)
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    d = ep_parse_date(rest)
+    if d is None:
+        return ("ইভেন্টের তারিখটা বুঝতে পারিনি। এভাবে লিখো: "
+                "'ইভেন্ট যোগ: মেডিকেল চেকআপ 10/03/2027'")
+    name = rest
+    for pat in (r"\d{4}-\d{1,2}-\d{1,2}", r"\d{1,2}/\d{1,2}/\d{4}"):
+        name = re.sub(pat, "", ep_normalize_digits(name))
+    month_alt = "|".join(sorted(EP_BN_MONTHS, key=len, reverse=True))
+    name = re.sub(r"\d{1,2}\s*(?:" + month_alt + r")\s*,?\s*\d{4}", "", name)
+    name = name.strip(" :：-—") or "ইভেন্ট"
+    camp = campaign if isinstance(campaign, dict) else ep_campaign_load(path)
+    if not isinstance(camp.get("events"), list):
+        camp["events"] = []
+    camp["events"].append({"name": name, "date": d.isoformat()})
+    ep_campaign_save(camp, path)
+    out = f"🗓️ ইভেন্ট যোগ হয়েছে: {name} — {_ep_fmt_date(d)}"
+    warns = ep_conflicts(camp)
+    if warns:
+        out += "\n" + "\n".join(warns)
+    return out
+
+
+def ep_event_list_text(campaign=None):
+    return ep_conflicts_text(campaign)
+
+
+# =====================================================================
+#  #781 নিজের গল্পের ফ্রেম
+# =====================================================================
+
+EP_STORY_FRAME = [
+    ("শিরোনাম", "তোমার যাত্রার একটা ছোট শিরোনাম দাও — যেমন: "
+                 "'একটা চাকরির অপেক্ষায়'।"),
+    ("১. শুরু", "কোথা থেকে শুরু করেছিলে? তখন তোমার অবস্থা, স্বপ্ন আর "
+                "ভয়গুলো কেমন ছিল?"),
+    ("২. কঠিন সময়", "সবচেয়ে কঠিন সময় কোনটা গেছে? কী তোমাকে থামিয়ে "
+                      "দিতে চেয়েছিল?"),
+    ("৩. ঘুরে দাঁড়ানো", "কীভাবে আবার উঠে দাঁড়ালে? কার বা কিসের সাহায্য "
+                          "পেয়েছিলে?"),
+    ("৪. এখন", "এখন তুমি কোথায় আছ? পড়ায় কতদূর এগিয়েছ, কী শিখেছ?"),
+    ("৫. লক্ষ্য", "সামনের লক্ষ্য কী? পৌঁছালে নিজেকে কী বলবে?"),
+]
+
+
+def ep_story_load(path=None):
+    data = _ep_load(_ep_story_path(path), [])
+    return data if isinstance(data, list) else []
+
+
+def ep_story_save(body, path=None, today=None):
+    """গল্পের draft elite-story.json-এ append করে। সফল হলে True।"""
+    body = str(body or "").strip()
+    if not body:
+        return False
+    items = ep_story_load(path)
+    items.append({"date": _ep_today(today).isoformat(), "text": body})
+    return _ep_save(_ep_story_path(path), items[-200:])
+
+
+def ep_story_text(diary=None, wins=None, progress=None, first_day=None):
+    """যাত্রার তথ্য শুধু ডেটা থেকে (শুরুর তারিখ, সেশন/ধাপ, জয়, diary
+    দিন) + লেখার ফ্রেম (শিরোনাম + ৫টি অংশের prompt)।"""
+    diary = _ep_resolve_diary(diary)
+    wins = _ep_resolve_wins(wins)
+    progress = _ep_resolve_progress(progress)
+    first_day = _ep_resolve_first_day(first_day)
+    sessions = 0
+    steps = 0
+    for info in progress.values():
+        if isinstance(info, dict):
+            try:
+                sessions += int(info.get("sessions") or 0)
+                steps += int(info.get("total_steps") or 0)
+            except (TypeError, ValueError):
+                pass
+    lines = ["📖 নিজের গল্পের ফ্রেম"]
+    facts = []
+    if first_day:
+        fd = _ep_parse_iso(first_day)
+        facts.append(f"শুরুর তারিখ: "
+                     f"{_ep_fmt_date(fd) if fd else first_day}")
+    if sessions or steps:
+        facts.append(f"মোট পড়ার সেশন: {_bn(sessions)}টি, "
+                     f"মোট ধাপ: {_bn(steps)}টি")
+    if wins:
+        facts.append(f"জয়ের সংখ্যা: {_bn(len(wins))}টি")
+    if diary:
+        facts.append(f"ডায়েরি লিখেছ: {_bn(len(diary))} দিন")
+    if facts:
+        lines.append("")
+        lines.append("তোমার যাত্রার তথ্য (ডেটা থেকে):")
+        for f in facts:
+            lines.append(f"• {f}")
+        recent = [w for w in wins if isinstance(w, dict)
+                  and w.get("text")][-3:]
+        if recent:
+            lines.append("সর্বশেষ জয়গুলো:")
+            for w in recent:
+                lines.append(f"• {w['text']}")
+    else:
+        lines.append(f"({_NO_DATA} — পড়া/জয়ের রেকর্ড এলেই এখানে তোমার "
+                     "যাত্রার তথ্য জমবে।)")
+    lines.append("")
+    lines.append("✍️ লেখার ফ্রেম — এই ৫টি অংশে নিজের গল্পটা সাজাও:")
+    for title, prompt in EP_STORY_FRAME:
+        lines.append(f"{title}: {prompt}")
+    lines.append("")
+    lines.append("লিখে ফেললে এভাবে পাঠাও: 'গল্প লিখলাম: <তোমার লেখা>' — "
+                 "আমি সংরক্ষণ করে রাখব। 'আমার গল্প দেখাও' বললে শেষ লেখাটা "
+                 "দেখতে পাবে।")
+    return "\n".join(lines)
+
+
+def ep_story_show_text(diary=None, wins=None, progress=None, first_day=None,
+                       path=None):
+    """ফ্রেম + তথ্য + সর্বশেষ সংরক্ষিত draft।"""
+    out = ep_story_text(diary, wins, progress, first_day)
+    drafts = ep_story_load(path)
+    if drafts:
+        last = drafts[-1]
+        out += (f"\n\n📝 তোমার সর্বশেষ লেখা "
+                f"({_ep_fmt_date(_ep_parse_iso(last.get('date')))}):\n"
+                f"{last.get('text', '')}")
+    else:
+        out += "\n\n(এখনো কোনো গল্প সংরক্ষণ করোনি।)"
+    return out
+
+
+# =====================================================================
+#  #782 সার্কুলার গভীর-বিশ্লেষণ (শুধু পেস্ট করা লেখা থেকে)
+# =====================================================================
+
+def ep_circular_parse(text):
+    """ব্যবহারকারীর পেস্ট করা সার্কুলার লেখা থেকে যা আছে শুধু তাই তোলে।
+    কিছুই বানানো হয় না — না পেলে None/খালি। ফেরত dict:
+    dates[], deadline, deadline_guessed, age, education[], posts[],
+    fee, total_posts।"""
+    raw = str(text or "")
+    norm = ep_normalize_digits(raw)
+    dates = ep_find_dates(raw)
+    result = {"dates": [d.isoformat() for d in dates],
+              "deadline": None, "deadline_guessed": False,
+              "age": None, "education": [], "posts": [],
+              "fee": None, "total_posts": None}
+    # --- deadline: 'শেষ তারিখ'/'আবেদনের শেষ'-এর কাছের তারিখ, নইলে শেষ তারিখ
+    deadline = None
+    for kw in ("শেষ তারিখ", "আবেদনের শেষ", "আবেদন শেষ", "শেষ সময়"):
+        idx = norm.find(kw)
+        if idx >= 0:
+            near = ep_parse_date(norm[idx:idx + 80])
+            if near is not None:
+                deadline = near
+                break
+    if deadline is None and dates:
+        deadline = dates[-1]
+        result["deadline_guessed"] = True
+    if deadline is not None:
+        result["deadline"] = deadline.isoformat()
+    # --- age: 'বয়স'-এর আশেপাশের সংখ্যা
+    m = re.search(r"বয়স[^0-9]{0,40}?(\d{1,2})\s*(?:থেকে|-)\s*(\d{1,2})",
+                  norm)
+    if m:
+        result["age"] = f"{m.group(1)} থেকে {m.group(2)} বছর"
+    else:
+        m = re.search(r"বয়স[^0-9]{0,40}?(\d{1,2})", norm)
+        if m:
+            result["age"] = f"{m.group(1)} বছর"
+    # --- fee: 'ফি'-এর আশেপাশের সংখ্যা
+    m = re.search(r"ফি[^0-9]{0,40}?(\d+)", norm)
+    if m:
+        result["fee"] = m.group(1)
+    # --- total posts: 'শূন্য পদ'/'পদ সংখ্যা'-এর আশেপাশের সংখ্যা
+    for kw in ("শূন্য পদ", "পদ সংখ্যা", "পদসংখ্যা"):
+        idx = norm.find(kw)
+        if idx >= 0:
+            seg = norm[max(0, idx - 30):idx + 60]
+            nums = re.findall(r"\d+", seg)
+            if nums:
+                result["total_posts"] = nums[-1]
+                break
+    # --- line-based: শিক্ষাগত যোগ্যতা (+ পরের লাইন), পদের নাম
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        if "শিক্ষাগত যোগ্যতা" in ln:
+            entry = ln
+            if i + 1 < len(lines):
+                entry += " " + lines[i + 1]
+            result["education"].append(entry)
+        if "পদের নাম" in ln or ln.startswith("পদ:") or "পদ :" in ln:
+            name = re.sub(r"^.*?পদের নাম\s*[:：]?\s*", "", ln).strip()
+            name = re.sub(r"^পদ\s*[:：]\s*", "", name).strip()
+            if name:
+                result["posts"].append(name)
+    return result
+
+
+def ep_circular_text(text, today=None):
+    """'যা পেলাম' checklist + 'যা পাইনি — নিজে খুঁজে নিও' + deadline
+    পর্যন্ত দিন। পাওয়া তথ্য শুধু পেস্ট করা লেখা থেকেই।"""
+    today = _ep_today(today)
+    p = ep_circular_parse(text)
+    found = []
+    missing = []
+    if p["deadline"]:
+        d = _ep_parse_iso(p["deadline"])
+        label = f"আবেদনের শেষ তারিখ: {_ep_fmt_date(d)}"
+        if p["deadline_guessed"]:
+            label += (" (অনুমান — লেখায় 'শেষ তারিখ' স্পষ্ট লিখা পাইনি; "
+                      "পাওয়া তারিখগুলোর শেষটা ধরেছি, যাচাই করে নিও)")
+        found.append(label)
+        if d is not None:
+            left = (d - today).days
+            if left >= 0:
+                found.append(f"শেষ তারিখ পর্যন্ত বাকি: {_bn(left)} দিন")
+            else:
+                found.append(f"⚠️ এই তারিখ {_bn(-left)} দিন আগে পেরিয়ে "
+                             "গেছে — বিজ্ঞপ্তিটা এখনো চালু আছে কিনা যাচাই করো।")
+    else:
+        missing.append("আবেদনের শেষ তারিখ")
+    if p["age"]:
+        found.append(f"বয়স: {_bn(p['age'])}")
+    else:
+        missing.append("বয়সসীমা")
+    if p["fee"]:
+        found.append(f"আবেদন ফি: {_bn(p['fee'])} (লেখায় 'ফি'-এর পাশে "
+                     "পাওয়া সংখ্যা)")
+    else:
+        missing.append("আবেদন ফি")
+    if p["total_posts"]:
+        found.append(f"শূন্য পদ: {_bn(p['total_posts'])}টি "
+                     "(লেখায় পাওয়া সংখ্যা)")
+    else:
+        missing.append("শূন্য পদের সংখ্যা")
+    for post in p["posts"]:
+        found.append(f"পদের নাম: {post}")
+    if not p["posts"]:
+        missing.append("পদের নাম")
+    for edu in p["education"]:
+        found.append(f"শিক্ষাগত যোগ্যতা: {edu}")
+    if not p["education"]:
+        missing.append("শিক্ষাগত যোগ্যতা")
+    lines = ["🔎 সার্কুলার বিশ্লেষণ — শুধু তোমার পাঠানো লেখা থেকে যা পেলাম"]
+    if found:
+        lines.append("")
+        lines.append("যা পেলাম:")
+        for f in found:
+            lines.append(f"✓ {f}")
+    else:
+        lines.append("লেখাটা থেকে কোনো তারিখ, বয়স, ফি বা পদের তথ্য "
+                     "বের করতে পারিনি।")
+    if missing:
+        lines.append("")
+        lines.append("যা পাইনি — নিজে খুঁজে নিও:")
+        for mitem in missing:
+            lines.append(f"• {mitem}")
+    lines.append("")
+    lines.append("মনে রেখো: আমি লেখার বাইরে কিছু যোগ করিনি — অফিসিয়াল "
+                 "বিজ্ঞপ্তির সঙ্গে মিলিয়ে নিও।")
+    return "\n".join(lines)
+
+
+def ep_is_circular(text):
+    t = str(text or "")
+    if "সার্কুলার বিশ্লেষণ" in t:
+        return True
+    return len(t) > 300 and "বিজ্ঞপ্তি" in t and "আবেদন" in t
+
+
+# =====================================================================
+#  #784 উৎস-যাচাই মিনি-পাঠ (static lesson)
+# =====================================================================
+
+def ep_verify_lesson_text():
+    return (
+        "🧐 উৎস-যাচাই মিনি-পাঠ — কোনো খবর/দাবি বিশ্বাস করার আগে ৫ ধাপ\n"
+        "\n"
+        "১. উৎস কে? — খবরটা কে বলছে? পরিচিত সরকারি দপ্তর/প্রতিষ্ঠান, "
+        "নাকি অচেনা পেজ/আইডি? অচেনা উৎস মানেই সন্দেহ দিয়ে শুরু।\n"
+        "২. তারিখ দেখো — পুরনো খবর নতুন করে ছড়ানো খুব সাধারণ ফাঁদ। "
+        "মূল পোস্ট/বিজ্ঞপ্তির তারিখ যাচাই করো।\n"
+        "৩. দ্বিতীয় উৎস — একই খবর আরেকটি নির্ভরযোগ্য জায়গায় আছে "
+        "কিনা খোঁজো। একটাই জায়গায় থাকলে থামো।\n"
+        "৪. অফিসিয়াল সাইট/নোটিশ — চাকরির খবর হলে সংশ্লিষ্ট দপ্তরের "
+        "অফিসিয়াল ওয়েবসাইটের নোটিশ বোর্ডে বিজ্ঞপ্তিটা আছে কিনা মিলাও।\n"
+        "৫. সন্দেহ হলে শেয়ার নয় — যাচাই না করে কোনো খবর ফরওয়ার্ড "
+        "করবে না; ভুল খবর ছড়ানোও একটা ক্ষতি।\n"
+        "\n"
+        "উদাহরণ (নমুনা): ধরো, একটি ফেসবুক পেজে লেখা এল — 'অমুক দপ্তরে "
+        "৫০০ লোক নেবে, আজই শেষ তারিখ!' — কোথায় কোন ধাপ লাগবে?\n"
+        "• ধাপ ১: পেজটা অফিসিয়াল কিনা দেখো (অচেনা হলে সন্দেহ)।\n"
+        "• ধাপ ২: পোস্টের তারিখ — পুরনো বিজ্ঞপ্তি ঘুরছে কিনা।\n"
+        "• ধাপ ৩: খবরটি অন্য নির্ভরযোগ্য মাধ্যমে আছে কিনা।\n"
+        "• ধাপ ৪: দপ্তরের অফিসিয়াল সাইটে বিজ্ঞপ্তিটি খুঁজে 'শেষ তারিখ' "
+        "মিলাও — পেজের দাবি নয়, নোটিশের তারিখই আসল।\n"
+        "• ধাপ ৫: মিল না পেলে — শেয়ার/আবেদন কোনোটাই নয়, আগে যাচাই।\n"
+        "(এটি একটি পাঠ — উদাহরণের দাবিটি কাল্পনিক নমুনা, কোনো আসল "
+        "বিজ্ঞপ্তি নয়।)"
+    )
+
+
+# =====================================================================
+#  Router — ep_planning_handle(text, low) -> str | None
+# =====================================================================
+
+def ep_planning_handle(text, low=None):
+    """Planning pack-এর সব trigger route করে; না মিললে None (fall-through)।"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    # --- #781 গল্প: draft save আগে (view কমান্ডের সঙ্গে গুলিয়ে না যায়)
+    for prefix in ("গল্প লিখলাম:", "গল্প লিখলামঃ", "আমার গল্প:",
+                   "আমার গল্পঃ"):
+        if text.startswith(prefix):
+            body = text[len(prefix):].strip()
+            if not body:
+                return ("লেখাটা খালি পেয়েছি — 'গল্প লিখলাম:'-এর পরে "
+                        "তোমার লেখাটা দাও।")
+            if ep_story_save(body):
+                return ("📖 তোমার গল্পটা সংরক্ষণ করে রাখলাম। "
+                        "'আমার গল্প দেখাও' বললে আবার দেখতে পাবে।")
+            return "গল্পটা সংরক্ষণ করতে সমস্যা হয়েছে — আবার চেষ্টা করো।"
+    if "আমার গল্প দেখাও" in text or "আমার গল্প" in text:
+        return ep_story_show_text()
+    if "গল্পের ফ্রেম" in text or "নিজের গল্প" in text:
+        return ep_story_text()
+    # --- #782 সার্কুলার (লম্বা পেস্ট আগে ধরতে হয়)
+    if ep_is_circular(text):
+        body = text.replace("সার্কুলার বিশ্লেষণ", "", 1).strip(" :：")
+        return ep_circular_text(body if body else text)
+    # --- #784 উৎস-যাচাই পাঠ
+    if "উৎস যাচাই" in text or "উৎস-যাচাই" in text or \
+            "তথ্য যাচাই" in text:
+        return ep_verify_lesson_text()
+    # --- #766 ক্যাম্পেইন সেট (view-এর আগে)
+    if text.startswith("ক্যাম্পেইন:") or text.startswith("ক্যাম্পেইনঃ") \
+            or "পরীক্ষার তারিখ" in text:
+        out = ep_campaign_set_from_text(text)
+        if out is not None:
+            return out
+    # --- #783 ইভেন্ট যোগ / তালিকা
+    if text.startswith("ইভেন্ট যোগ"):
+        out = ep_event_add_from_text(text)
+        if out is not None:
+            return out
+    if "ইভেন্ট তালিকা" in text or "আমার ইভেন্ট" in text:
+        return ep_event_list_text()
+    if "তারিখ সংঘাত" in text or "তারিখ-সংঘাত" in text:
+        return ep_conflicts_text()
+    # --- #770 পরীক্ষা-সপ্তাহ প্রোটোকল
+    if "পরীক্ষা-সপ্তাহ" in text or "পরীক্ষার সপ্তাহ" in text or \
+            "পরীক্ষা সপ্তাহ" in text:
+        return ep_exam_week_text()
+    # --- #769 সম্পদ-বণ্টন
+    if "সম্পদ বণ্টন" in text or "সম্পদ-বণ্টন" in text or \
+            "সময় বণ্টন" in text or "সময়-বণ্টন" in text:
+        return ep_allocation_text()
+    # --- #767 মাইলফলক
+    if "মাইলফলক" in text:
+        return ep_milestones_text()
+    # --- #766 ক্যাম্পেইন view (সবশেষে — সেট কমান্ড আগে ধরা হয়েছে)
+    if "ক্যাম্পেইন" in text:
+        return ep_campaign_text()
+    return None
+
+
+# -*- coding: utf-8 -*-
+"""
+elite_engine_pack.py — Desktop Sokhi v1.9.0: ELITE ENGINE-READY প্যাক
+=====================================================================
+Items: #754, #757, #760, #761, #762, #768, #771, #776, #778, #779, #780
+(বিল্ড-অর্ডারে "১০টি" বলা হলেও তালিকায় আসলে ১১টি আইটেম গোনা যায়;
+এই প্যাকে ১১টিরই প্যানেল আছে, কোনোটাই বাদ দেওয়া হয়নি।)
+
+এই প্যাকের কাজ ENGINE বানানো: command surface, panel, data-intake
+guidance, আর যেখানে বলা হয়েছে সেখানে storage। আসল বিশ্লেষণের জন্য
+যে বাইরের তথ্য লাগবে (কোনো বোর্ডের বিগত প্রশ্নপত্র, কাট-অফ নম্বর,
+বোর্ডের আচরণের তথ্য) সেটা মালিক পরে দেবেন — ততদিন প্রতিটি প্যানেলে
+সৎ empty state থাকে এবং এই লাইনটি থাকেই:
+
+    "আসল তথ্য দিলে এখানে বিশ্লেষণ আসবে।"
+
+বাঁধাই করা নিয়ম (binding):
+  * কোনো পরিসংখ্যান, কাট-অফ, প্রশ্নের ডেটা বা বোর্ডের আচরণ
+    বানিয়ে বলা হয় না — কখনো না।
+  * যেসব সংখ্যা দেখানো হয় সেগুলো শুধু ব্যবহারকারীর নিজের ফাইল/
+    ব্যাংক গুনে পাওয়া (study-progress.json, study-wrong-book.json,
+    OFFLINE_BANK) এবং সেগুলো "নিজস্ব তথ্য" বলে লেবেল করা থাকে।
+  * #760-র আভাসগুলো প্রতিটিই "আভাস মাত্র" লেবেলসহ আসে — এগুলো
+    নিজের ভুলের খাতার প্যাটার্ন-অনুমান, নিশ্চিত কারণ নয়।
+  * সাধারণ পরামর্শ যেখানে আছে সেখানে "সাধারণ পরামর্শ" /
+    "সাধারণ পর্যবেক্ষণ-পরামর্শ" লেবেল দেওয়া আছে।
+
+Conventions (v1.5 study pack-এর মতো):
+  * সব symbol-এর prefix ee_ / EE_ — host namespace-এ সংঘর্ষ নেই।
+  * Host globals (load_json, save_json, DATA, OFFLINE_BANK,
+    _STUDY_PROGRESS_FILE, _WRONG_BOOK_FILE) call time-এ
+    globals().get(...) দিয়ে resolve করা হয় — paste করলে host-এর
+    গুলোই জেতে, test-এ stub/inject করা যায়।
+  * প্রতিটি text function-এ injectable parameter আছে (bank=,
+    wrong=, progress=, data_dir=) — None হলে host থেকে resolve।
+  * 100% ফ্রি, offline-only: কোনো network / API key লাগে না।
+
+Verified data shapes (app/sokhi.py):
+  study-progress.json:
+    {subject: {sessions, mock_tests, total_steps, weak[],
+               last_topic, last_date}}
+  study-wrong-book.json:
+    [{q, options, correct(TEXT), your_answer(TEXT), subject,
+      topic, date}]
+  OFFLINE_BANK:
+    {subject: [{q, options, answer(int), topic}]}
+
+নতুন data files (DATA ফোল্ডারে, প্রথম save-এ তৈরি হয়):
+  elite-planb.json      — #768: {"text": str, "updated": iso str}
+  elite-protocols.json  — EE_PROTO_FILE; keys: EE_PROTO_KEY_* দেখো
+                          (#771 / #778 / #780-এর frame এক ফাইলে)।
+"""
+
+import json
+import re
+from collections import Counter
+from datetime import date, datetime
+from pathlib import Path
+
+# ------------------------------------------------------------------ constants
+EE_BN_DIGITS_MAP = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+EE_NO_DATA = "এখনো ডেটা নেই"
+
+# সৎ empty-state লাইন — প্রতিটি engine panel-এ অবশ্যই থাকবে।
+EE_ENGINE_LINE = "আসল তথ্য দিলে এখানে বিশ্লেষণ আসবে।"
+
+EE_PLANB_FILENAME = "elite-planb.json"
+EE_PROTO_FILENAME = "elite-protocols.json"
+# protocols ফাইলের নাম (DATA / EE_PROTO_FILE পথে resolve হয়)।
+EE_PROTO_FILE = EE_PROTO_FILENAME
+EE_PROTO_KEY_RESULT_DAY = "771_result_day"
+EE_PROTO_KEY_MENTALITY = "778_mentality"
+EE_PROTO_KEY_WAITING = "780_waiting"
+
+# item: (নম্বর, শিরোনাম) — status overview এই তালিকা থেকেই বানানো হয়।
+EE_ITEMS = [
+    ("754", "প্রশ্নকর্তার উদ্দেশ্য-বিশ্লেষণ"),
+    ("757", "প্রশ্নের ভাষা-বিশ্লেষণ"),
+    ("760", "দুর্বলতার মূল-কারণ বিশ্লেষণ"),
+    ("761", "নম্বর-ফাঁক বিশ্লেষণ"),
+    ("762", "অধ্যায়-মূল্য (ROI) বিশ্লেষণ"),
+    ("768", "সংকট-পরিকল্পনা (প্ল্যান বি)"),
+    ("771", "ফল-দিবস প্রোটোকল"),
+    ("776", "বোর্ডের ভাষা পড়া"),
+    ("778", "বিজয়ী-মানসিকতা শৃঙ্খলা"),
+    ("779", "চাপে শীতলতা প্রশিক্ষণ"),
+    ("780", "দীর্ঘ-অপেক্ষা ব্যবস্থাপনা"),
+]
+
+
+def ee_bn(x):
+    """Local mirror of host _bn_num(): English digits -> Bangla digits."""
+    return str(x).translate(EE_BN_DIGITS_MAP)
+
+
+# ------------------------------------------------------- global fallbacks
+# Helpers deliberately look names up in globals() at CALL time, so
+# (a) the pack works when pasted into sokhi.py (host globals win), and
+# (b) tests can stub module globals or pass data directly.
+
+
+def ee_load_via_host(path, default):
+    fn = globals().get("load_json")
+    if callable(fn) and path is not None:
+        try:
+            return fn(path, default)
+        except Exception:
+            pass
+    # Standalone fallback (tests without host stubs): plain JSON read.
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def ee_save_via_host(path, obj):
+    fn = globals().get("save_json")
+    if callable(fn) and path is not None:
+        try:
+            fn(path, obj)
+            return True
+        except Exception:
+            pass
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(obj, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def ee_resolve_bank(bank=None):
+    if bank is not None:
+        return bank if isinstance(bank, dict) else {}
+    g = globals().get("OFFLINE_BANK")
+    return g if isinstance(g, dict) else {}
+
+
+def ee_resolve_progress(progress=None):
+    if progress is not None:
+        return progress if isinstance(progress, dict) else {}
+    path = globals().get("_STUDY_PROGRESS_FILE")
+    data = ee_load_via_host(path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def ee_resolve_wrong(wrong=None):
+    if wrong is not None:
+        return wrong if isinstance(wrong, list) else []
+    path = globals().get("_WRONG_BOOK_FILE")
+    data = ee_load_via_host(path, [])
+    return data if isinstance(data, list) else []
+
+
+def ee_resolve_data_dir(data_dir=None):
+    if data_dir is not None:
+        return Path(data_dir)
+    g = globals().get("DATA")
+    if g is not None:
+        return Path(g)
+    return Path("data")
+
+
+def ee_planb_path(data_dir=None):
+    return ee_resolve_data_dir(data_dir) / EE_PLANB_FILENAME
+
+
+def ee_proto_path(data_dir=None):
+    return ee_resolve_data_dir(data_dir) / EE_PROTO_FILE
+
+
+def ee_now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def ee_wrong_by_topic(wrong):
+    c = Counter()
+    for w in wrong or []:
+        if isinstance(w, dict):
+            c[str(w.get("topic") or "সাধারণ")] += 1
+    return c
+
+
+def ee_wrong_by_date(wrong):
+    c = Counter()
+    for w in wrong or []:
+        if isinstance(w, dict) and w.get("date"):
+            c[str(w.get("date"))] += 1
+    return c
+
+
+def ee_wrong_by_question(wrong):
+    c = Counter()
+    for w in wrong or []:
+        if isinstance(w, dict) and str(w.get("q") or "").strip():
+            c[str(w.get("q")).strip()] += 1
+    return c
+
+
+def ee_header(no, title, emoji="🧩"):
+    return f"{emoji} #{ee_bn(no)} {title}"
+
+
+def ee_engine_footer():
+    return f"ইঞ্জিন অবস্থা: {EE_ENGINE_LINE}"
+
+
+# =====================================================================
+#  #754 প্রশ্নকর্তার উদ্দেশ্য-বিশ্লেষণ — ENGINE (বিগত প্রশ্নপত্র লাগবে)
+# =====================================================================
+
+def ee_panel_754(bank=None, wrong=None, progress=None, data_dir=None):
+    """কোন বোর্ড/পদ প্রশ্নকর্তা কী চায় — সেটা জানতে ঐ বোর্ডের বিগত
+    প্রশ্নপত্র লাগবে, যা এখনো দেওয়া হয়নি। এই প্যানেল শুধু বলে:
+    কী দিতে হবে, তথ্য এলে কী কী হিসাব হবে, আর নিজের OFFLINE_BANK-এ
+    এখন কী context আছে (শুধু গোনা সংখ্যা, বাইরের কিছু নয়)।"""
+    bank = ee_resolve_bank(bank)
+    lines = [
+        ee_header("754", "প্রশ্নকর্তার উদ্দেশ্য-বিশ্লেষণ", "🎯"),
+        "",
+        "কী তথ্য লাগবে (তুমি দিলে বিশ্লেষণ শুরু হবে):",
+        "• কোন বোর্ড/পদের বিগত প্রশ্নের তালিকা বা ছবি — কোন বোর্ড, "
+        "কোন পদ, কোন সালের প্রশ্ন, সেটা লিখে দিলে ভালো হয়।",
+        "• প্রশ্নগুলো লেখা (টেক্সট) আকারে দিলে হিসাব সবচেয়ে নির্ভুল "
+        "হবে; ছবি দিলেও চলবে, তখন পড়ে নিতে হবে।",
+        "",
+        "তথ্য এলে যা যা হিসাব হবে:",
+        "• টপিক ফ্রিকোয়েন্সি — কোন টপিক থেকে কতবার প্রশ্ন এসেছে",
+        "• পুনরাবৃত্ত প্রশ্ন — হুবহু বা প্রায়-হুবহু ফিরে আসা প্রশ্নের তালিকা",
+        "• কোন টপিকে প্রশ্নকর্তা বারবার ফিরে যান — তার ধরন",
+        "",
+    ]
+    total_q = sum(len(v or []) for v in bank.values())
+    if bank and total_q:
+        lines.append("নিজস্ব তথ্য — এখন অফলাইন প্রশ্ন-ব্যাংকে যা আছে "
+                     "(এটা নিজের ব্যাংকের হিসাব, বোর্ডের তথ্য নয়):")
+        for subj in sorted(bank.keys()):
+            lines.append(f"• {subj}: {ee_bn(len(bank[subj] or []))}টি প্রশ্ন")
+        lines.append(f"মোট: {ee_bn(total_q)}টি প্রশ্ন")
+    else:
+        lines.append(f"নিজস্ব তথ্য: {EE_NO_DATA} — অফলাইন প্রশ্ন-ব্যাংকেও "
+                     "এখনো কোনো প্রশ্ন পাইনি।")
+    lines.append("")
+    lines.append(ee_engine_footer())
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #757 প্রশ্নের ভাষা-বিশ্লেষণ — ENGINE (বিগত প্রশ্নের করপাস লাগবে)
+# =====================================================================
+
+def ee_panel_757(bank=None, wrong=None, progress=None, data_dir=None):
+    """প্রশ্নের ভাষার ফাঁদ শেখানোর ইঞ্জিন। আসল করপাস এলে ঐ করপাসের
+    ভাষা ধরেই শেখানো হবে; তার আগে শুধু সাধারণ পরামর্শের preview —
+    লেবেলসহ, কোনো বোর্ডের নামে চালানো হয়নি।"""
+    lines = [
+        ee_header("757", "প্রশ্নের ভাষা-বিশ্লেষণ", "🔤"),
+        "",
+        "কী তথ্য লাগবে:",
+        "• বিগত প্রশ্নের করপাস — কোনো বোর্ড/পদের পুরনো প্রশ্নের "
+        "তালিকা বা ছবি। করপাস এলে সেখানকার আসল বাক্য ধরেই ভাষার "
+        "ধরন শেখানো হবে।",
+        "",
+        "তথ্য এলে যা শেখানো হবে:",
+        "• নেতিবাচক শব্দের ফাঁদ চেনা ও দাগ দেওয়ার অভ্যাস",
+        "• পরম শব্দ (সবসময়/কখনোই) দেখলে সতর্ক হওয়ার ধরন",
+        "• লম্বা বাক্যের প্রশ্নে আসল জিজ্ঞাসা আলাদা করা",
+        "",
+        "সাধারণ পরামর্শ (preview — এটা কোনো বোর্ডের ডেটা নয়):",
+        "• শব্দের ফাঁদ: 'সঠিক নয়', 'ব্যতীত' ধরনের নেতিবাচক শব্দ "
+        "থাকলে প্রশ্নটা উল্টো অর্থে পড়তে হয় — তাড়াহুড়োয় এই "
+        "শব্দটা মিস গেলেই জানা উত্তরও ভুল হয়।",
+        "• 'কোনটি ভুল', 'প্রযোজ্য নয়', 'ছাড়া' — এই ধরনের শব্দ "
+        "দেখলেই আগে দাগ দিয়ে নাও, তারপর উত্তর ভাবো।",
+        "• বিকল্পে 'সবগুলোই সঠিক' থাকলে প্রতিটি বিকল্প আলাদা করে "
+        "যাচাই না করে সেটা বেছে নিও না।",
+        "",
+        ee_engine_footer(),
+    ]
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #760 দুর্বলতার মূল-কারণ — আংশিক বাস্তব (নিজের ভুলের খাতা থেকে)
+# =====================================================================
+
+def ee_rootcause_text(wrong=None, progress=None):
+    """নিজের study-wrong-book.json থেকেই প্যাটার্ন-আভাস বের করে।
+    প্রতিটি আভাসই "আভাস মাত্র" — নিশ্চিত কারণ দাবি করা হয় না, আর
+    পাশে সমর্থনকারী গোনা সংখ্যা দেখানো হয়:
+      (a) একই টপিকে ভুল >=৩  -> ধারণার ঘাটতির আভাস
+      (b) ১-করে ভুল >=৫ টপিকে ছড়ানো -> অসাবধানতা/তাড়াহুড়ার আভাস
+      (c) একই তারিখে ভুল >=৫ -> সেই দিনের চাপ/সময়ের আভাস
+      (d) একই প্রশ্নে ভুল >=২ -> ঐ প্রশ্নটা আবার পড়া দরকার
+    progress প্যারামিটার signature-এর জন্য রাখা (ভবিষ্যতে সেশন-
+    context যোগের জায়গা); বর্তমান আভাসগুলো শুধু wrong-book থেকেই।"""
+    wrong = ee_resolve_wrong(wrong)
+    lines = [
+        ee_header("760", "দুর্বলতার মূল-কারণ বিশ্লেষণ", "🩺"),
+        "(শুধু তোমার নিজের ভুলের খাতা গুনে বলছি — এগুলো নিশ্চিত "
+        "কারণ নয়, আভাস মাত্র।)",
+    ]
+    if not wrong:
+        lines.append("")
+        lines.append(f"{EE_NO_DATA} — ভুলের খাতা এখনো খালি। মক টেস্টে "
+                     "ভুল জমলেই এখানে প্যাটার্ন-আভাস দেখা যাবে।")
+        lines.append("")
+        lines.append(ee_engine_footer())
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append(f"নিজস্ব তথ্য: মোট ভুল জমেছে {ee_bn(len(wrong))}টি।")
+    found = []
+
+    topic_counts = ee_wrong_by_topic(wrong)
+    for topic, cnt in topic_counts.most_common():
+        if cnt >= 3:
+            found.append(
+                f"• আভাস মাত্র — ধারণার ঘাটতির আভাস: '{topic}' টপিকে "
+                f"{ee_bn(cnt)}বার ভুল হয়েছে (একই টপিকে ৩ বার বা বেশি)। "
+                "একই জায়গায় বারবার আটকালে সাধারণত ধারণাটাই পরিষ্কার "
+                "হয়নি — ঐ টপিক গোড়া থেকে আবার পড়া দরকার হতে পারে।")
+
+    if len(topic_counts) >= 5 and max(topic_counts.values()) == 1:
+        found.append(
+            f"• আভাস মাত্র — ছড়ানো ভুল = অসাবধানতা/তাড়াহুড়ার আভাস: "
+            f"{ee_bn(len(topic_counts))}টি আলাদা টপিকে ১টি করে ভুল, "
+            "কোনো টপিকেই দ্বিতীয় ভুল নেই। ধারণা ঠিক থাকলেও তাড়াহুড়ো "
+            "বা মনোযোগ সরে গেলে এমন ছড়ানো ভুল হয়।")
+
+    date_counts = ee_wrong_by_date(wrong)
+    for dstr, cnt in date_counts.most_common():
+        if cnt >= 5:
+            found.append(
+                f"• আভাস মাত্র — সেই দিনের চাপ/সময়ের আভাস: {dstr} "
+                f"তারিখে একদিনেই {ee_bn(cnt)}টি ভুল জমেছে। ঐ দিন "
+                "হয়তো সময়ের চাপ, ক্লান্তি বা তাড়াহুড়ো ছিল।")
+
+    q_counts = ee_wrong_by_question(wrong)
+    for qtext, cnt in q_counts.most_common():
+        if cnt >= 2:
+            short = qtext if len(qtext) <= 60 else qtext[:60] + "…"
+            found.append(
+                f"• আভাস মাত্র — এই প্রশ্নটা বিশেষভাবে আবার পড়া দরকার: "
+                f"\"{short}\" — একই প্রশ্নে {ee_bn(cnt)}বার ভুল হয়েছে।")
+
+    lines.append("")
+    if found:
+        lines.append("পাওয়া আভাসগুলো:")
+        lines.extend(found)
+    else:
+        lines.append("এখনো স্পষ্ট কোনো প্যাটার্নের আভাস পাইনি — আরও "
+                     "কিছু ভুল জমলে আভাস পরিষ্কার হবে।")
+    lines.append("")
+    lines.append(ee_engine_footer())
+    return "\n".join(lines)
+
+
+def ee_panel_760(bank=None, wrong=None, progress=None, data_dir=None):
+    return ee_rootcause_text(wrong=wrong, progress=progress)
+
+
+# =====================================================================
+#  #761 নম্বর-ফাঁক বিশ্লেষণ — ENGINE (কাট-অফের তথ্য লাগবে)
+# =====================================================================
+
+def ee_panel_761(bank=None, wrong=None, progress=None, data_dir=None):
+    """লক্ষ্য/কাট-অফ থেকে নিজের নম্বরের ফাঁক হিসাবের ইঞ্জিন।
+    কাট-অফের কোনো সংখ্যা বানানো হয় না; নিজের যে সংখ্যা ফাইলে
+    আছে শুধু সেগুলোই "নিজস্ব তথ্য" লেবেলে দেখানো হয়।"""
+    progress = ee_resolve_progress(progress)
+    wrong = ee_resolve_wrong(wrong)
+    total_mock = 0
+    for info in progress.values():
+        if isinstance(info, dict):
+            try:
+                total_mock += int(info.get("mock_tests") or 0)
+            except Exception:
+                pass
+    lines = [
+        ee_header("761", "নম্বর-ফাঁক বিশ্লেষণ", "📏"),
+        "",
+        "নিজস্ব তথ্য (তোমার নিজের রেকর্ড থেকে গোনা):",
+        f"• মোট মক টেস্ট সংখ্যা: {ee_bn(total_mock)}টি",
+        f"• ভুলের মোট সংখ্যা: {ee_bn(len(wrong))}টি",
+    ]
+    if not progress and not wrong:
+        lines.append(f"• ({EE_NO_DATA} — পড়ার রেকর্ড বা ভুলের খাতায় "
+                     "এখনো কিছু জমেনি।)")
+    lines += [
+        "",
+        "কাট-অফ অংশ:",
+        "• কাট-অফের তথ্য দিলে ফাঁক হিসাব হবে — কোন পদ/বোর্ডের "
+        "কাট-অফ, কোন সালের, আর তোমার লক্ষ্য নম্বর কত, এই তিনটা "
+        "দিলেই নিজের বর্তমান অবস্থান থেকে ফাঁকটা হিসাব করা যাবে।",
+        "• ততদিন কোনো কাট-অফ সংখ্যা আমি বানিয়ে বলব না।",
+        "",
+        ee_engine_footer(),
+    ]
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #762 অধ্যায়-মূল্য (ROI) — ENGINE (টপিকের ওজন লাগবে)
+# =====================================================================
+
+def ee_panel_762(bank=None, wrong=None, progress=None, data_dir=None):
+    """কোন অধ্যায় পড়লে কত নম্বর ওঠে (ROI) — তার জন্য বিগত
+    প্রশ্নপত্রের টপিকভিত্তিক ওজন লাগবে। অন্তর্বর্তী ব্যক্তিগত
+    সংকেত হিসেবে শুধু নিজের ভুল-by-topic হিসাব দেখানো হয়,
+    স্পষ্ট লেবেলসহ: এটা বোর্ডের ওজন নয়।"""
+    wrong = ee_resolve_wrong(wrong)
+    lines = [
+        ee_header("762", "অধ্যায়-মূল্য (ROI) বিশ্লেষণ", "⚖️"),
+        "",
+        "কী তথ্য লাগবে:",
+        "• বিগত প্রশ্নপত্রের টপিকভিত্তিক ওজন — কোন টপিক থেকে "
+        "কতগুলো প্রশ্ন এসেছে, সেই তালিকা বা ছবি। ওজন এলে পড়ার "
+        "সময়ের সঙ্গে মিলিয়ে অধ্যায়-মূল্য (ROI) সাজানো যাবে।",
+        "",
+    ]
+    if wrong:
+        lines.append("অন্তর্বর্তী ব্যক্তিগত সংকেত — নিজের ভুল টপিক "
+                     "অনুযায়ী (শীর্ষ ১০):")
+        for topic, cnt in ee_wrong_by_topic(wrong).most_common(10):
+            lines.append(f"• {topic} — {ee_bn(cnt)}বার ভুল")
+        lines.append("(লেবেল: এটা নিজের ভুলের হিসাব, বোর্ডের ওজন নয় "
+                     "— শুধু নিজের দুর্বল জায়গা বোঝার জন্য।)")
+    else:
+        lines.append(f"নিজস্ব তথ্য: {EE_NO_DATA} — ভুলের খাতা খালি, "
+                     "তাই ব্যক্তিগত সংকেতও এখনো নেই।")
+    lines.append("")
+    lines.append(ee_engine_footer())
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #768 সংকট-পরিকল্পনা (প্ল্যান বি) — REAL storage engine
+#  File: DATA / elite-planb.json  ->  {"text", "updated"}
+# =====================================================================
+
+def ee_planb_load(data_dir=None):
+    data = ee_load_via_host(ee_planb_path(data_dir), {})
+    return data if isinstance(data, dict) else {}
+
+
+def ee_planb_save(plan_text, data_dir=None):
+    """প্ল্যান বি সেভ/আপডেট করে confirmation text ফেরত দেয়।"""
+    plan_text = str(plan_text or "").strip()
+    if not plan_text:
+        return ee_panel_768(data_dir=data_dir)
+    rec = {"text": plan_text, "updated": ee_now_iso()}
+    ee_save_via_host(ee_planb_path(data_dir), rec)
+    return ("✅ প্ল্যান বি সেভ হয়েছে।\n"
+            f"• লেখা: {plan_text}\n"
+            f"• আপডেট: {ee_bn(rec['updated'])}\n"
+            "বদলাতে চাইলে আবার 'প্ল্যান বি: <নতুন লেখা>' বললেই হবে।")
+
+
+def ee_panel_768(bank=None, wrong=None, progress=None, data_dir=None):
+    rec = ee_planb_load(data_dir)
+    lines = [
+        ee_header("768", "সংকট-পরিকল্পনা (প্ল্যান বি)", "🛟"),
+        "",
+    ]
+    if rec.get("text"):
+        lines.append("তোমার সেভ করা প্ল্যান বি:")
+        lines.append(f"• {rec.get('text')}")
+        if rec.get("updated"):
+            lines.append(f"• শেষ আপডেট: {ee_bn(rec.get('updated'))}")
+    else:
+        lines.append(f"{EE_NO_DATA} — এখনো কোনো প্ল্যান বি সেভ করা নেই।")
+    lines += [
+        "",
+        "প্ল্যান বি-তে যা যা থাকা ভালো (পূরণ করার কাঠামো):",
+        "• বিকল্প পরীক্ষা/পদ: এই পরীক্ষা না হলে কোন পরীক্ষা/পদে যাবে — ___",
+        "• অসুস্থ হলে করণীয়: পরীক্ষার আগে/দিনে অসুস্থ হলে কী করবে — ___",
+        "• জরুরি যোগাযোগ: বিপদে কার সঙ্গে যোগাযোগ করবে, নম্বর কোথায় — ___",
+        "• টাকা/কাগজপত্রের বিকল্প ব্যবস্থা: — ___",
+        "",
+        "সেভ করতে বলো: 'প্ল্যান বি: <তোমার লেখা>' — যেমন:",
+        "'প্ল্যান বি: মূল পরীক্ষা মিস হলে পরের সার্কুলারের পদে আবেদন, "
+        "অসুস্থ হলে আগের দিনই ডাক্তার দেখানো'",
+        "",
+        ee_engine_footer(),
+    ]
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  Protocols storage — DATA / elite-protocols.json (EE_PROTO_FILE)
+#  একটাই ফাইল, keys: #771 result-day, #778 mentality, #780 waiting
+# =====================================================================
+
+def ee_proto_load(data_dir=None):
+    data = ee_load_via_host(ee_proto_path(data_dir), {})
+    return data if isinstance(data, dict) else {}
+
+
+def ee_proto_get(key, data_dir=None):
+    rec = ee_proto_load(data_dir).get(key)
+    return rec if isinstance(rec, dict) else {}
+
+
+def ee_proto_save(key, value_text, data_dir=None):
+    data = ee_proto_load(data_dir)
+    data[key] = {"text": str(value_text or "").strip(),
+                 "updated": ee_now_iso()}
+    ee_save_via_host(ee_proto_path(data_dir), data)
+    return data[key]
+
+
+def ee_proto_save_reply(label, key, value_text, data_dir=None):
+    rec = ee_proto_save(key, value_text, data_dir=data_dir)
+    return (f"✅ {label} সেভ হয়েছে।\n"
+            f"• লেখা: {rec['text']}\n"
+            f"• আপডেট: {ee_bn(rec['updated'])}")
+
+
+def ee_proto_saved_lines(key, data_dir=None):
+    rec = ee_proto_get(key, data_dir)
+    if rec.get("text"):
+        return [f"সেভ করা লেখা: {rec.get('text')}",
+                f"(শেষ আপডেট: {ee_bn(rec.get('updated'))})"]
+    return [f"সেভ করা লেখা: {EE_NO_DATA}"]
+
+
+# =====================================================================
+#  #771 ফল-দিবস প্রোটোকল — ENGINE (ফলাফলের তথ্য এলে সক্রিয়)
+# =====================================================================
+
+def ee_panel_771(bank=None, wrong=None, progress=None, data_dir=None):
+    lines = [
+        ee_header("771", "ফল-দিবস প্রোটোকল", "📋"),
+        "",
+        "ফলাফলের দিনের কাঠামো (যা যা লাগবে তার তালিকা-খালি ঘর):",
+        "☐ ফলাফল দেখার ওয়েবসাইট/নোটিশ বোর্ড: ___",
+        "☐ রোল / রেজিস্ট্রেশন নম্বর রাখার জায়গা: ___",
+        "☐ লাগবে এমন কাগজ (প্রবেশপত্র, আইডি ইত্যাদি): ___",
+        "☐ ফলাফল পেলে প্রথমে যাকে জানাবে: ___",
+        "☐ ফলাফল প্রত্যাশামতো না হলে পরের ধাপ (প্ল্যান বি দেখো): ___",
+        "",
+    ]
+    lines += ee_proto_saved_lines(EE_PROTO_KEY_RESULT_DAY, data_dir)
+    lines += [
+        "নিজেরটা লিখে রাখতে বলো: 'ফলদিবস প্রোটোকল: <তোমার লেখা>'",
+        "",
+        "ফলাফলের তারিখ/তথ্য দিলে সক্রিয় হবে — তারিখ এলেই এই "
+        "প্রোটোকল ধরে ধাপে ধাপে এগোনো যাবে।",
+        ee_engine_footer(),
+    ]
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #776 বোর্ডের ভাষা পড়া — ENGINE (ভাইভা অভিজ্ঞতা/বোর্ডের তথ্য লাগবে)
+# =====================================================================
+
+def ee_panel_776(bank=None, wrong=None, progress=None, data_dir=None):
+    lines = [
+        ee_header("776", "বোর্ডের ভাষা পড়া", "🗣️"),
+        "",
+        "কী তথ্য লাগবে:",
+        "• ভাইভা অভিজ্ঞতা/বোর্ডের তথ্য — কোন বোর্ডে, কী ধরনের প্রশ্ন "
+        "হয়েছিল, নিজের বা পরিচিতের আসল অভিজ্ঞতার বর্ণনা। সেই "
+        "অভিজ্ঞতা জমলেই বোর্ডভিত্তিক প্রস্তুতি সাজানো যাবে; কোনো "
+        "বোর্ড আসলে কী করে তা আমি বানিয়ে বলব না।",
+        "",
+        "সাধারণ পর্যবেক্ষণ-পরামর্শ (সাধারণ — কোনো নির্দিষ্ট বোর্ডের "
+        "তথ্য নয়):",
+        "• প্রশ্ন পুরোটা শুনে শেষ হতে দাও, মাঝখানে থামিয়ে উত্তর "
+        "শুরু করো না — এটা প্রায় সব জায়গাতেই ভালো অভ্যাস।",
+        "• না জানলে সরাসরি, ভদ্রভাবে বলা সাধারণত নিরাপদ — আন্দাজে "
+        "লম্বা উত্তর বানানো ঝুঁকিপূর্ণ হতে পারে।",
+        "• বোর্ডের প্রশ্নের সুর (কঠোর/বন্ধুসুলভ) দেখে নিজের গতি "
+        "মেলাও — এটা পর্যবেক্ষণের সাধারণ কৌশল।",
+        "",
+        ee_engine_footer(),
+    ]
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #778 বিজয়ী-মানসিকতা শৃঙ্খলা — ENGINE (routine frame, protocols file)
+# =====================================================================
+
+def ee_panel_778(bank=None, wrong=None, progress=None, data_dir=None):
+    lines = [
+        ee_header("778", "বিজয়ী-মানসিকতা শৃঙ্খলা", "🏆"),
+        "",
+        "প্রতিদিনের মানসিকতা-রুটিনের কাঠামো (ঘরগুলো তুমি পূরণ করবে):",
+        "• সকাল: ___ (জেগে প্রথম ১০ মিনিটে কী ভাববে/করবে)",
+        "• পড়ার আগে: ___ (পড়া শুরুর আগের ছোট্ট আচার)",
+        "• রাতে: ___ (ঘুমানোর আগে দিনের হিসাব/আগামী দিনের ভাবনা)",
+        "",
+    ]
+    lines += ee_proto_saved_lines(EE_PROTO_KEY_MENTALITY, data_dir)
+    lines += [
+        "নিজের রুটিন সেভ করতে বলো: 'মানসিকতা রুটিন: <তোমার লেখা>' "
+        "— পরে 'মানসিকতা' বললেই সেভ করাটা দেখা যাবে।",
+        "",
+        ee_engine_footer(),
+    ]
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #779 চাপে শীতলতা প্রশিক্ষণ — ENGINE (আছে এমনটার দিকে নির্দেশ)
+# =====================================================================
+
+def ee_panel_779(bank=None, wrong=None, progress=None, data_dir=None):
+    lines = [
+        ee_header("779", "চাপে শীতলতা প্রশিক্ষণ", "🧊"),
+        "",
+        "ইতিমধ্যে যা আছে (শুধু নির্দেশ — এই প্যাক সেটার ওপর "
+        "নির্ভর করে না):",
+        f"• #{ee_bn(759)} চাপ-অনুকরণ (pressure sim) — ট্রেনিং প্যাকে "
+        "সময়ের চাপে অনুশীলনের ব্যবস্থা আছে; 'চাপ' অনুশীলন চাইলে "
+        "সেটা ব্যবহার করো।",
+        "",
+        "ব্যক্তিগত প্রশিক্ষণের জন্য যা লাগবে:",
+        "• নিজের চাপের রেকর্ড জমলে ব্যক্তিগত প্রশিক্ষণ হবে — কোন "
+        "পরিস্থিতিতে চাপ বাড়ে, মক টেস্টে সময়ের চাপে কোথায় ভুল "
+        "বাড়ে, সেই রেকর্ড জমলেই সেটা ধরে অনুশীলন সাজানো যাবে।",
+        "• ততদিন সাধারণ নিয়ম: পরীক্ষার হলে আটকে গেলে প্রশ্নটা "
+        "ছেড়ে এগিয়ে যাওয়া, শেষে সময় থাকলে ফিরে আসা।",
+        "",
+        ee_engine_footer(),
+    ]
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #780 দীর্ঘ-অপেক্ষা ব্যবস্থাপনা — ENGINE (waiting frame, protocols)
+# =====================================================================
+
+def ee_panel_780(bank=None, wrong=None, progress=None, data_dir=None):
+    lines = [
+        ee_header("780", "দীর্ঘ-অপেক্ষা ব্যবস্থাপনা", "⏳"),
+        "",
+        "ফলাফলের অপেক্ষায় প্রতিদিনের ছক কাঠামো (খালি ছক — তুমি "
+        "পূরণ করবে):",
+        "• প্রতিদিনের হালকা পড়া/রিভিশন: ___",
+        "• পরের পরীক্ষার প্রস্তুতির অংশ: ___",
+        "• বিশ্রাম/পরিবারের সময়: ___",
+        "• সপ্তাহে একদিন নিজের অগ্রগতি দেখা: ___",
+        "• মন খারাপ হলে করণীয়: ___",
+        "",
+    ]
+    lines += ee_proto_saved_lines(EE_PROTO_KEY_WAITING, data_dir)
+    lines += [
+        "নিজের ছক সেভ করতে বলো: 'অপেক্ষা ছক: <তোমার লেখা>'",
+        "",
+        ee_engine_footer(),
+    ]
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  Overview — ইঞ্জিন অবস্থা
+# =====================================================================
+
+def ee_engine_status_text(bank=None, wrong=None, progress=None,
+                          data_dir=None):
+    """সব engine item-এর এক-লাইনের অবস্থা: কী লাগবে / কী তৈরি।
+    কোনো সংখ্যা বানানো হয় না — অবস্থা শুধু নিজের ফাইলে কী আছে
+    তার ওপর ভিত্তি করে।"""
+    wrong_r = ee_resolve_wrong(wrong)
+    planb = ee_planb_load(data_dir)
+    proto = ee_proto_load(data_dir)
+    status = {
+        "754": "কী লাগবে: কোনো বোর্ড/পদের বিগত প্রশ্নপত্র; ইঞ্জিন তৈরি",
+        "757": "কী লাগবে: বিগত প্রশ্নের করপাস; সাধারণ preview তৈরি",
+        "760": ("কী তৈরি: নিজের ভুলের খাতা থেকে আভাস-বিশ্লেষণ চালু"
+                if wrong_r else
+                "কী লাগবে: ভুলের খাতায় ভুল জমা; আভাস-ইঞ্জিন তৈরি"),
+        "761": "কী লাগবে: কাট-অফের তথ্য ও লক্ষ্য নম্বর; নিজস্ব সংখ্যা তৈরি",
+        "762": "কী লাগবে: টপিকভিত্তিক ওজন; নিজের ভুলের হিসাব তৈরি",
+        "768": ("কী তৈরি: প্ল্যান বি সেভ আছে"
+                if planb.get("text") else
+                "কী তৈরি: storage ও কাঠামো তৈরি, প্ল্যান লেখা বাকি"),
+        "771": ("কী তৈরি: প্রোটোকল সেভ আছে"
+                if (proto.get(EE_PROTO_KEY_RESULT_DAY) or {}).get("text")
+                else "কী লাগবে: ফলাফলের তারিখ/তথ্য; কাঠামো তৈরি"),
+        "776": "কী লাগবে: ভাইভা অভিজ্ঞতা/বোর্ডের তথ্য; সাধারণ preview তৈরি",
+        "778": ("কী তৈরি: মানসিকতা রুটিন সেভ আছে"
+                if (proto.get(EE_PROTO_KEY_MENTALITY) or {}).get("text")
+                else "কী তৈরি: রুটিনের কাঠামো তৈরি, পূরণ বাকি"),
+        "779": "কী লাগবে: নিজের চাপের রেকর্ড; #759 pressure sim-এর নির্দেশ তৈরি",
+        "780": ("কী তৈরি: অপেক্ষার ছক সেভ আছে"
+                if (proto.get(EE_PROTO_KEY_WAITING) or {}).get("text")
+                else "কী তৈরি: অপেক্ষার ছকের কাঠামো তৈরি, পূরণ বাকি"),
+    }
+    lines = ["🔧 ইঞ্জিন অবস্থা — এলিট ইঞ্জিন প্যাক",
+             "(কোনটা তৈরি, কোনটার জন্য কী তথ্য লাগবে — এক লাইনে)"]
+    for no, title in EE_ITEMS:
+        lines.append(f"• #{ee_bn(no)} {title} — {status[no]}")
+    lines.append("")
+    lines.append(ee_engine_footer())
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  Routing — ee_engine_handle(text, low)
+# =====================================================================
+# Routing choices (documented in INTEGRATION-ENGINE.md too):
+#  * Save-commands (colon form) are checked BEFORE show-panels, so
+#    "প্ল্যান বি: ..." never falls into the show panel.
+#  * #776 "বোর্ডের ভাষা" is checked BEFORE #757 "ভাষা বিশ্লেষণ",
+#    so the board phrase can never be stolen by the language panel.
+#  * #760 guard: bare "মূল কারণ" alone does NOT route (it would
+#    steal unrelated chat like "এই ঘটনার মূল কারণ কী"). It routes
+#    only with a study-context word (ভুল/পড়া/দুর্বলতা) in the same
+#    message, OR the exact phrase "মূল কারণ বিশ্লেষণ". The English-
+#    style phrase "রুট কজ" routes on its own — it is a technical
+#    term that does not occur in unrelated chat.
+#  * Study pack's "ভুল বিশ্লেষণ" is NOT a trigger here (distinct
+#    phrase, belongs to study_pack_handle) — no stealing.
+#  * "ROI" is matched as a whole word on `low`, so words containing
+#    "roi" (e.g. "android") never trigger #762.
+#  * #779 deliberately does NOT trigger on bare "চাপ" (pressure sim
+#    in the training pack owns that) — only on "শীতলতা".
+
+_EE_PLANB_SAVE_RE = re.compile(r"প্ল্যান\s*বি\s*[:：]\s*(.+)$", re.S)
+_EE_MENTALITY_SAVE_RE = re.compile(r"মানসিকতা\s*রুটিন\s*[:：]\s*(.+)$", re.S)
+_EE_RESULT_SAVE_RE = re.compile(
+    r"(?:ফলদিবস\s*প্রোটোকল|ফল-দিবস\s*প্রোটোকল|ফলের\s*দিনের\s*প্রোটোকল)"
+    r"\s*[:：]\s*(.+)$", re.S)
+_EE_WAITING_SAVE_RE = re.compile(r"অপেক্ষা\s*ছক\s*[:：]\s*(.+)$", re.S)
+_EE_ROOTCAUSE_CONTEXT = ("ভুল", "পড়া", "দুর্বলতা")
+
+
+def ee_engine_handle(text, low=None, bank=None, wrong=None, progress=None,
+                     data_dir=None):
+    """Trigger মিললে সংশ্লিষ্ট panel/save-reply, না মিললে None।
+    low: host-এর lowercase রূপ (না দিলে text থেকেই বানানো হয়)।"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    low = str(low if low is not None else text).lower()
+
+    # --- save commands first (colon form)
+    m = _EE_PLANB_SAVE_RE.search(text)
+    if m and m.group(1).strip():
+        return ee_planb_save(m.group(1), data_dir=data_dir)
+    m = _EE_MENTALITY_SAVE_RE.search(text)
+    if m and m.group(1).strip():
+        return ee_proto_save_reply("মানসিকতা রুটিন",
+                                   EE_PROTO_KEY_MENTALITY,
+                                   m.group(1), data_dir=data_dir)
+    m = _EE_RESULT_SAVE_RE.search(text)
+    if m and m.group(1).strip():
+        return ee_proto_save_reply("ফলদিবস প্রোটোকল",
+                                   EE_PROTO_KEY_RESULT_DAY,
+                                   m.group(1), data_dir=data_dir)
+    m = _EE_WAITING_SAVE_RE.search(text)
+    if m and m.group(1).strip():
+        return ee_proto_save_reply("অপেক্ষা ছক",
+                                   EE_PROTO_KEY_WAITING,
+                                   m.group(1), data_dir=data_dir)
+
+    # --- overview
+    if "ইঞ্জিন অবস্থা" in text:
+        return ee_engine_status_text(bank=bank, wrong=wrong,
+                                     progress=progress, data_dir=data_dir)
+
+    # --- #768 plan B show ("প্ল্যান বি দেখাও" / bare "প্ল্যান বি")
+    if "প্ল্যান বি" in text:
+        return ee_panel_768(data_dir=data_dir)
+
+    # --- #776 before #757 (board phrase must not be stolen)
+    if "বোর্ডের ভাষা" in text:
+        return ee_panel_776()
+
+    # --- #754
+    if "প্রশ্নকর্তা" in text:
+        return ee_panel_754(bank=bank)
+
+    # --- #757
+    if "ভাষা বিশ্লেষণ" in text or "প্রশ্নের ভাষা" in text:
+        return ee_panel_757()
+
+    # --- #760 root cause (guarded, see routing notes above)
+    if ("মূল কারণ বিশ্লেষণ" in text or "রুট কজ" in text
+            or ("মূল কারণ" in text
+                and any(w in text for w in _EE_ROOTCAUSE_CONTEXT))
+            or "দুর্বলতার মূল" in text):
+        return ee_rootcause_text(wrong=wrong, progress=progress)
+
+    # --- #761
+    if ("নম্বর ফাঁক" in text or "নম্বর-ফাঁক" in text
+            or "কাট অফ" in text or "কাট-অফ" in text
+            or "কাটঅফ" in text):
+        return ee_panel_761(wrong=wrong, progress=progress)
+
+    # --- #762
+    if ("অধ্যায়ের মূল্য" in text or "অধ্যায়-মূল্য" in text
+            or "অধ্যায় মূল্য" in text or re.search(r"\broi\b", low)):
+        return ee_panel_762(wrong=wrong)
+
+    # --- #771 result day
+    if ("ফলের দিন" in text or "ফল-দিবস" in text or "ফল দিবস" in text
+            or "ফলদিবস" in text):
+        return ee_panel_771(data_dir=data_dir)
+
+    # --- #778 mentality (show; save handled above)
+    if "মানসিকতা" in text:
+        return ee_panel_778(data_dir=data_dir)
+
+    # --- #779 calm under pressure (never bare "চাপ")
+    if "শীতলতা" in text:
+        return ee_panel_779()
+
+    # --- #780 waiting management
+    if ("অপেক্ষা ব্যবস্থাপনা" in text or "দীর্ঘ অপেক্ষা" in text
+            or "অপেক্ষা ছক" in text):
+        return ee_panel_780(data_dir=data_dir)
+
+    return None
+
+
+# -*- coding: utf-8 -*-
+"""
+study_sweep_pack.py — Desktop Sokhi v1.9.0: Study FOUNDATION Sweep Pack
+=========================================================================
+Self-contained snippet for integration into sokhi.py. Coordinator:
+paste this whole file at top level in sokhi.py AFTER the v1.5 study
+pack (i.e. after `study_pack_handle`) and wire the dispatch block
+described in INTEGRATION-SWEEP.md. Do NOT edit sokhi.py from here.
+
+Features (সবই শুধু নিজের আসল ডেটা থেকে — কিছু বানানো হয় না):
+  #667 es_revision_due_text()   ভুলে-যাওয়ার বক্র — পুনরাবৃত্তি সূচি
+  #703 es_pocket_summary_text() পকেট সার (এক-পাতা সার)
+  #716 es_confusion_pairs_text() বিভ্রান্তিকর জোড়া সতর্কতা
+  #729 es_dual_start() /
+       es_sweep_handle()        দ্বৈত মূল্যায়ন (দুই-ধাপ সেশন)
+  #753 es_courage_text()        হলের দরজায় সাহস-বার্তা
+  es_handle(text, low)          ঐচ্ছিক ডিসপ্যাচ হেল্পার
+
+House rules honoured (v1.5 study pack conventions mirrored):
+  * 100% free, offline-only — reads ONLY OFFLINE_BANK, OFFLINE_LESSONS,
+    study-progress.json, study-wrong-book.json, wins.json. No web/Gemini.
+  * Host globals are looked up via globals().get(...) AT CALL TIME, so
+    the pack works pasted into sokhi.py (host globals win) and tests
+    can stub module attributes or inject data via parameters.
+  * Every public function accepts injected data (bank=, lessons=,
+    progress=, wrong=, wins=, ...) — production passes nothing.
+  * Bangla digits via a LOCAL es_bn() helper (mirror of host _bn_num);
+    _bn / _NO_DATA aliases kept for v1.5-pack style compatibility.
+  * All pack symbols are prefixed es_ / ES_.
+
+Verified data shapes:
+  OFFLINE_BANK    = {subject: [{q, options[4], answer int, topic}]}
+  OFFLINE_LESSONS = {subject: [{topic, text, check_q,
+                                check_answers[], alt}]}
+  study-progress.json  = {subject: {sessions, mock_tests, total_steps,
+                                    weak[], last_topic, last_date}}
+  study-wrong-book.json = [{q, options, correct (TEXT),
+                            your_answer (TEXT), subject, topic, date}]
+  wins.json = [{id, text, date, ts}]
+
+New file introduced by #729 (the ONLY write in this pack):
+  DATA / "elite-sweep-session.json" — dual-evaluation session /
+  last dual result. See INTEGRATION-SWEEP.md.
+"""
+
+import json
+import re
+from collections import Counter
+from datetime import date, timedelta
+from pathlib import Path
+
+# ------------------------------------------------------------------ digits
+
+ES_BN_DIGITS_MAP = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+ES_EN_DIGITS_MAP = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+
+def es_bn(x):
+    """Local mirror of host _bn_num(): English digits -> Bangla digits."""
+    return str(x).translate(ES_BN_DIGITS_MAP)
+
+
+def es_en_digits(s):
+    """বাংলা সংখ্যা -> ইংরেজি সংখ্যা (পার্স করার জন্য)।"""
+    return str(s or "").translate(ES_EN_DIGITS_MAP)
+
+
+# v1.5-pack style aliases (the study pack used these exact names).
+_bn = es_bn
+ES_NO_DATA = "এখনো ডেটা নেই"
+_NO_DATA = ES_NO_DATA
+
+ES_OPT_LETTERS = ["ক", "খ", "গ", "ঘ"]
+
+# #667: ভুলের সংখ্যা -> পরের রিভিশনের ব্যবধান (দিন)
+ES_REVISION_LADDER = [1, 3, 7, 15]
+
+ES_SESSION_FILENAME = "elite-sweep-session.json"
+
+# ------------------------------------------------------- global fallbacks
+# These helpers deliberately look names up in globals() at CALL time, so
+# (a) the pack works when pasted into sokhi.py (host globals win), and
+# (b) tests can stub study_sweep_pack.OFFLINE_BANK etc. or pass data
+# directly.
+
+
+def es_data_dir():
+    """Host DATA (pathlib.Path) via globals; fallback Path('data')."""
+    g = globals().get("DATA")
+    if g is not None:
+        try:
+            return Path(g)
+        except Exception:
+            pass
+    return Path("data")
+
+
+def es_load_json(path, default):
+    """Host load_json(path, default) থাকলে সেটা, নইলে local json read."""
+    fn = globals().get("load_json")
+    if callable(fn):
+        try:
+            return fn(path, default)
+        except Exception:
+            return default
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def es_save_json(path, obj):
+    """Host save_json(path, obj) থাকলে সেটা, নইলে local json write."""
+    fn = globals().get("save_json")
+    if callable(fn):
+        try:
+            fn(path, obj)
+            return True
+        except Exception:
+            pass
+    try:
+        p = Path(path)
+        if p.parent and str(p.parent) not in ("", "."):
+            p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(obj, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def es_resolve_bank(bank=None):
+    if bank is not None:
+        return bank if isinstance(bank, dict) else {}
+    g = globals().get("OFFLINE_BANK")
+    return g if isinstance(g, dict) else {}
+
+
+def es_resolve_lessons(lessons=None):
+    if lessons is not None:
+        return lessons if isinstance(lessons, dict) else {}
+    g = globals().get("OFFLINE_LESSONS")
+    return g if isinstance(g, dict) else {}
+
+
+def es_resolve_progress(progress=None):
+    if progress is not None:
+        return progress if isinstance(progress, dict) else {}
+    path = globals().get("_STUDY_PROGRESS_FILE")
+    if path is None:
+        path = es_data_dir() / "study-progress.json"
+    data = es_load_json(path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def es_resolve_wrong(wrong=None):
+    if wrong is not None:
+        return wrong if isinstance(wrong, list) else []
+    path = globals().get("_WRONG_BOOK_FILE")
+    if path is None:
+        path = es_data_dir() / "study-wrong-book.json"
+    data = es_load_json(path, [])
+    return data if isinstance(data, list) else []
+
+
+def es_resolve_wins(wins=None):
+    if wins is not None:
+        return wins if isinstance(wins, list) else []
+    data = es_load_json(es_data_dir() / "wins.json", [])
+    return data if isinstance(data, list) else []
+
+
+def es_resolve_first_day(first_day=None):
+    """first_day প্যারামিটার > host get_memory()['first_day'] > None."""
+    if first_day:
+        return str(first_day)
+    fn = globals().get("get_memory")
+    if callable(fn):
+        try:
+            mem = fn()
+            if isinstance(mem, dict) and mem.get("first_day"):
+                return str(mem.get("first_day"))
+        except Exception:
+            pass
+    return None
+
+
+# ------------------------------------------------------------- date utils
+
+
+def es_parse_date(value):
+    """'YYYY-MM-DD' str / date / datetime -> date, না পারলে None।"""
+    if value is None:
+        return None
+    if isinstance(value, date):
+        try:
+            return value.date()  # datetime হলে শুধু তারিখ অংশ
+        except Exception:
+            return value
+    s = es_en_digits(str(value).strip())[:10]
+    try:
+        y, m, d = (int(x) for x in s.split("-"))
+        return date(y, m, d)
+    except Exception:
+        return None
+
+
+def es_fmt_date(d):
+    """date -> বাংলা সংখ্যায় 'YYYY-MM-DD'।"""
+    return es_bn(str(d)) if d else "—"
+
+
+def es_coerce_today(today=None):
+    if today is None:
+        return date.today()
+    parsed = es_parse_date(today)
+    return parsed if parsed is not None else date.today()
+
+
+# =====================================================================
+#  #667 ভুলে-যাওয়ার বক্র — পুনরাবৃত্তি সূচি
+# =====================================================================
+
+
+def es_revision_interval(wrong_count):
+    """ভুলের সংখ্যা n -> রিভিশন ব্যবধান (দিন): ladder [1, 3, 7, 15],
+    index = min(n-1, 3)। n=1→১ দিন, n=2→৩ দিন, n=3→৭ দিন, n>=4→১৫ দিন।"""
+    try:
+        n = int(wrong_count)
+    except Exception:
+        n = 1
+    if n < 1:
+        n = 1
+    return ES_REVISION_LADDER[min(n - 1, len(ES_REVISION_LADDER) - 1)]
+
+
+def es_revision_schedule(wrong=None):
+    """Wrong-book থেকে টপিকভিত্তিক সূচি:
+    [{subject, topic, count, last_date (date), interval, due (date)}]।
+    তারিখ পড়া যায় না এমন এন্ট্রি বাদ (সূচি বানানো যায় না)।"""
+    wrong = es_resolve_wrong(wrong)
+    agg = {}
+    for w in wrong or []:
+        if not isinstance(w, dict):
+            continue
+        d = es_parse_date(w.get("date"))
+        if d is None:
+            continue
+        key = (str(w.get("subject") or "অজানা বিষয়"),
+               str(w.get("topic") or "সাধারণ"))
+        ent = agg.get(key)
+        if ent is None:
+            ent = {"subject": key[0], "topic": key[1], "count": 0,
+                   "last_date": d}
+            agg[key] = ent
+        ent["count"] += 1
+        if d > ent["last_date"]:
+            ent["last_date"] = d
+    out = []
+    for ent in agg.values():
+        interval = es_revision_interval(ent["count"])
+        ent = dict(ent)
+        ent["interval"] = interval
+        ent["due"] = ent["last_date"] + timedelta(days=interval)
+        out.append(ent)
+    return out
+
+
+def es_revision_due_text(wrong=None, today=None):
+    """ভুলে-যাওয়ার বক্র অনুযায়ী টপিকভিত্তিক রিভিশন সূচি:
+    মেয়াদ-পেরোনো আগে (দেরি বেশি যার, সে আগে), তারপর আজকের, তারপর
+    আগামী ৩ দিনের। সবই ভুলের খাতার আসল তারিখ/গণনা থেকে।"""
+    wrong = es_resolve_wrong(wrong)
+    today_d = es_coerce_today(today)
+    schedule = es_revision_schedule(wrong=wrong)
+    if not schedule:
+        return (f"{ES_NO_DATA} — ভুলের খাতা খালি, তাই পুনরাবৃত্তি সূচি "
+                "বানানোর কিছু নেই। মক টেস্টে ভুল জমলেই প্রতিটা টপিকের "
+                "রিভিশনের তারিখ এখানে সাজিয়ে দেব।")
+
+    overdue, due_today, upcoming, later = [], [], [], []
+    for ent in schedule:
+        delta = (ent["due"] - today_d).days
+        if delta < 0:
+            overdue.append((ent, -delta))
+        elif delta == 0:
+            due_today.append(ent)
+        elif delta <= 3:
+            upcoming.append(ent)
+        else:
+            later.append(ent)
+    overdue.sort(key=lambda x: (-x[1], -x[0]["count"], x[0]["topic"]))
+    due_today.sort(key=lambda e: (-e["count"], e["topic"]))
+    upcoming.sort(key=lambda e: (e["due"], -e["count"], e["topic"]))
+
+    lines = ["🧠 ভুলে-যাওয়ার বক্র — পুনরাবৃত্তি সূচি",
+             "নিয়ম: ১ বার ভুল → পরের দিন, ২ বার → ৩ দিন পর, "
+             "৩ বার → ৭ দিন পর, ৪ বার বা বেশি → ১৫ দিন পর আবার ঝালাই।"]
+
+    def _row(ent):
+        return (f"• {ent['subject']} / {ent['topic']} — "
+                f"{es_bn(ent['count'])}বার ভুল, শেষ ভুল "
+                f"{es_fmt_date(ent['last_date'])}, "
+                f"রিভিশন {es_fmt_date(ent['due'])}")
+
+    if overdue:
+        lines.append("")
+        lines.append("🔴 মেয়াদ পেরিয়েছে (আগে এগুলো ধরো):")
+        for ent, late in overdue:
+            lines.append(_row(ent) + f" — {es_bn(late)} দিন দেরি")
+    if due_today:
+        lines.append("")
+        lines.append("🟡 আজই রিভিশন দেওয়ার কথা:")
+        for ent in due_today:
+            lines.append(_row(ent))
+    if upcoming:
+        lines.append("")
+        lines.append("🟢 আগামী ৩ দিনে আসছে:")
+        for ent in upcoming:
+            lines.append(_row(ent))
+    if later:
+        lines.append("")
+        lines.append(f"আরও {es_bn(len(later))}টি টপিকের রিভিশন "
+                     "৩ দিনের পরে আসছে — সময় হলে আবার দেখে নিও।")
+    if not overdue and not due_today and not upcoming:
+        lines.append("")
+        lines.append("আপাতত মেয়াদ-পেরোনো বা কাছাকাছি কোনো রিভিশন নেই — "
+                     "ভালো চলছে!")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #703 পকেট সার (শেষ মুহূর্তের এক-পাতা সার)
+# =====================================================================
+
+
+def es_pocket_summary_text(progress=None, wrong=None, lessons=None):
+    """এক-পাতা সার: দুর্বল টপিক (শীর্ষ ৫), বিষয়ভিত্তিক শেষ টপিক+সেশন,
+    এখনো ছোঁয়া-হয়নি পাঠের টপিক, আর ডেটা থেকেই বানানো আজকের ৩ করণীয়।
+    প্রতিটা অংশে আলাদা empty state — ডেটা না থাকলে কিছু বানানো হয় না।"""
+    progress = es_resolve_progress(progress)
+    wrong = es_resolve_wrong(wrong)
+    lessons = es_resolve_lessons(lessons)
+
+    lines = ["📌 পকেট সার — পরীক্ষার আগের সকালে চোখ বুলানোর জন্য"]
+
+    # --- দুর্বল টপিক (শীর্ষ ৫, ভুলের গণনা ধরে)
+    pair_counts = Counter()
+    for w in wrong or []:
+        if isinstance(w, dict):
+            pair_counts[(str(w.get("subject") or "অজানা বিষয়"),
+                         str(w.get("topic") or "সাধারণ"))] += 1
+    lines.append("")
+    lines.append("দুর্বল টপিক (বেশি ভুল যেখানে):")
+    if pair_counts:
+        for (subj, topic), cnt in pair_counts.most_common(5):
+            lines.append(f"• {subj} / {topic} — {es_bn(cnt)}বার ভুল")
+    else:
+        lines.append(f"• {ES_NO_DATA} — ভুলের খাতায় এখনো কিছু জমেনি।")
+
+    # --- বিষয়ভিত্তিক অবস্থা
+    lines.append("")
+    lines.append("বিষয়ভিত্তিক অবস্থা:")
+    if progress:
+        for subj in sorted(progress.keys()):
+            ent = progress.get(subj) or {}
+            if not isinstance(ent, dict):
+                ent = {}
+            sessions = int(ent.get("sessions", 0) or 0)
+            mocks = int(ent.get("mock_tests", 0) or 0)
+            last_topic = str(ent.get("last_topic") or "").strip() or "—"
+            lines.append(f"• {subj}: শেষ টপিক {last_topic}, "
+                         f"সেশন {es_bn(sessions)}টি, "
+                         f"মক টেস্ট {es_bn(mocks)}টি")
+    else:
+        lines.append(f"• {ES_NO_DATA} — পড়ার রেকর্ড এখনো তৈরি হয়নি।")
+
+    # --- বাকি বড় টপিক: পাঠের টপিক যা progress weak/last-এ নেই,
+    #     ভুলের খাতাতেও নেই (মানে কোনো রেকর্ডেই ছোঁয়া হয়নি)
+    wrong_topics = {}
+    for w in wrong or []:
+        if isinstance(w, dict):
+            wrong_topics.setdefault(
+                str(w.get("subject") or ""), set()).add(
+                    str(w.get("topic") or ""))
+    uncovered = []
+    for subj in sorted(lessons.keys()):
+        ent = progress.get(subj) or {}
+        if not isinstance(ent, dict):
+            ent = {}
+        touched = set(str(x) for x in (ent.get("weak", []) or []))
+        lt = str(ent.get("last_topic") or "").strip()
+        if lt:
+            touched.add(lt)
+        touched |= wrong_topics.get(subj, set())
+        for step in lessons.get(subj) or []:
+            if isinstance(step, dict):
+                t = str(step.get("topic") or "").strip()
+                if t and t not in touched:
+                    uncovered.append((subj, t))
+    lines.append("")
+    lines.append("এখনো ছোঁয়া হয়নি এমন পাঠের টপিক:")
+    if uncovered:
+        for subj, t in uncovered[:10]:
+            lines.append(f"• {subj} / {t}")
+        if len(uncovered) > 10:
+            lines.append(f"• …আরও {es_bn(len(uncovered) - 10)}টি")
+    else:
+        lines.append("• ছোঁয়া-হয়নি এমন টপিকের রেকর্ড নেই — "
+                     "হয় সব ছোঁয়া হয়েছে, নয়তো পাঠের তালিকা খালি।")
+
+    # --- আজকের জন্য ৩টি করণীয় (শুধু ডেটা থেকে)
+    todos = []
+    if pair_counts:
+        (subj, topic), cnt = pair_counts.most_common(1)[0]
+        todos.append(f"সবচেয়ে বেশি ভুলের টপিকটা আগে ঝালাও: "
+                     f"{subj} / {topic} ({es_bn(cnt)}বার ভুল)।")
+    if uncovered:
+        subj, t = uncovered[0]
+        todos.append(f"ছোঁয়া-হয়নি এমন একটা নতুন টপিক ধরো: {subj} / {t}।")
+    total_mocks = 0
+    least = None  # (sessions+mocks, subject)
+    for subj, ent in (progress or {}).items():
+        if not isinstance(ent, dict):
+            continue
+        act = int(ent.get("sessions", 0) or 0) + \
+            int(ent.get("mock_tests", 0) or 0)
+        total_mocks += int(ent.get("mock_tests", 0) or 0)
+        if least is None or act < least[0]:
+            least = (act, subj)
+    if total_mocks == 0 and progress:
+        todos.append("আজ অন্তত একটা মক টেস্ট দাও — ভুলের খাতায় যা জমবে, "
+                     "কালকের পড়া সেখান থেকেই সাজাব।")
+    elif least is not None:
+        todos.append(f"সবচেয়ে কম পড়া বিষয়টা একবার দেখো: {least[1]} "
+                     f"(মোট সেশন+টেস্ট {es_bn(least[0])}টি)।")
+    lines.append("")
+    lines.append("আজকের জন্য:")
+    if todos:
+        marks = ["১", "২", "৩"]
+        for i, todo in enumerate(todos[:3]):
+            lines.append(f"{marks[i]}. {todo}")
+    else:
+        lines.append("• পড়া শুরু করলেই এখানে আজকের করণীয় সাজিয়ে দেব।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #716 বিভ্রান্তিকর জোড়া সতর্কতা
+# =====================================================================
+
+
+def es_confusion_pairs_text(wrong=None):
+    """একই বিষয়ের দুটি আলাদা টপিক একই তারিখে (একই বসায়) ভুল হলে
+    সেগুলোকে 'একসাথে গুলিয়ে ফেলার ঝোঁক' জোড়া হিসেবে দেখায়; পাশাপাশি
+    ৩+ বার ভুল হওয়া টপিকগুলোকে 'বারবার ভুলের টপিক' হিসেবে চিহ্নিত করে।"""
+    wrong = es_resolve_wrong(wrong)
+    valid = [w for w in (wrong or []) if isinstance(w, dict)]
+    if not valid:
+        return (f"{ES_NO_DATA} — ভুলের খাতা খালি। মক টেস্টে ভুল জমলেই "
+                "কোন টপিকগুলো একসাথে গুলিয়ে ফেলছ, এখানে ধরা পড়বে।")
+
+    # (date, subject) -> topics set;  pair -> {count, dates}
+    by_sitting = {}
+    topic_counts = Counter()
+    for w in valid:
+        subj = str(w.get("subject") or "অজানা বিষয়")
+        topic = str(w.get("topic") or "সাধারণ")
+        topic_counts[(subj, topic)] += 1
+        d = str(w.get("date") or "").strip()
+        if d:
+            by_sitting.setdefault((d, subj), set()).add(topic)
+
+    pair_info = {}
+    for (d, subj), topics in by_sitting.items():
+        ordered = sorted(topics)
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                key = (subj, ordered[i], ordered[j])
+                info = pair_info.setdefault(key, {"count": 0, "dates": []})
+                info["count"] += 1
+                if d not in info["dates"]:
+                    info["dates"].append(d)
+
+    repeats = [(k, c) for k, c in topic_counts.most_common() if c >= 3]
+
+    if not pair_info and not repeats:
+        return ("🔀 বিভ্রান্তিকর জোড়া সতর্কতা\n"
+                f"ভুলের খাতায় মোট {es_bn(len(valid))}টি ভুল আছে, কিন্তু "
+                "একই দিনে একই বিষয়ের দুটো টপিক একসাথে ভুল হওয়ার মতো "
+                "জোড়া, কিংবা ৩ বার বা বেশি ভুল হওয়া কোনো টপিক — "
+                "এখনো কোনোটাই ধরা পড়েনি। আরও মক টেস্ট দিলে ছবিটা "
+                "পরিষ্কার হবে।")
+
+    lines = ["🔀 বিভ্রান্তিকর জোড়া সতর্কতা"]
+    if pair_info:
+        lines.append("")
+        lines.append("একসাথে গুলিয়ে ফেলার ঝোঁক আছে যেসব জোড়ায় "
+                     "(একই দিনে, একই বিষয়ে দুটো টপিকেই ভুল):")
+        ranked = sorted(pair_info.items(),
+                        key=lambda kv: (-kv[1]["count"], kv[0]))
+        for (subj, t1, t2), info in ranked:
+            dates = ", ".join(es_bn(d) for d in sorted(info["dates"]))
+            lines.append(f"• {subj}: {t1} × {t2} — "
+                         f"{es_bn(info['count'])}বার একসাথে ভুল "
+                         f"(তারিখ: {dates})")
+        lines.append("পরামর্শ: এই জোড়া দুটো পাশাপাশি রেখে পার্থক্যটা "
+                     "একবার পড়ে নাও — গুলিয়ে ফেলা কমে যাবে।")
+    if repeats:
+        lines.append("")
+        lines.append("বারবার ভুলের টপিক (৩ বার বা বেশি):")
+        for (subj, topic), cnt in repeats:
+            lines.append(f"• {subj} / {topic} — {es_bn(cnt)}বার ভুল")
+    lines.append("")
+    lines.append(f"হিসাবটা ভুলের খাতার মোট {es_bn(len(valid))}টি "
+                 "এন্ট্রি গুনে করা।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #729 দ্বৈত মূল্যায়ন (দুই-ধাপ) — সেশন মেশিন
+#  ফাইল: DATA / "elite-sweep-session.json"
+#  সক্রিয় সেশন: {"stage": "await_reveal"|"await_grade", "subject",
+#                 "questions": [{q, options, answer, topic}],
+#                 "date", "phase1": None|int}
+#  শেষ হলে ফাইলে শুধু শেষ ফল: {"subject", "phase1", "date"}
+# =====================================================================
+
+
+def es_session_file():
+    return es_data_dir() / ES_SESSION_FILENAME
+
+
+def es_load_session():
+    data = es_load_json(es_session_file(), None)
+    return data if isinstance(data, dict) else None
+
+
+def es_save_session(st):
+    try:
+        d = es_data_dir()
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return es_save_json(es_session_file(), st)
+
+
+def es_clear_session():
+    try:
+        es_session_file().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def es_dual_active():
+    st = es_load_session()
+    return bool(st and st.get("stage") in ("await_reveal", "await_grade")
+                and st.get("questions"))
+
+
+def es_dual_last():
+    """শেষ সম্পন্ন দ্বৈত মূল্যায়নের ফল {subject, phase1, date} বা None।"""
+    st = es_load_session()
+    if st and not st.get("stage") and "phase1" in st:
+        return st
+    return None
+
+
+def es_subject_in_text(text, bank=None, lessons=None):
+    bank = es_resolve_bank(bank)
+    lessons = es_resolve_lessons(lessons)
+    raw = str(text or "")
+    for subj in list(bank.keys()) + [s for s in lessons.keys()
+                                     if s not in bank]:
+        if subj and subj in raw:
+            return subj
+    fn = globals().get("_detect_subject")
+    if callable(fn):
+        try:
+            return fn(raw)
+        except Exception:
+            return None
+    return None
+
+
+def es_dual_pick_questions(subject, bank=None, today=None):
+    """বিষয়ের ব্যাংক-প্রশ্ন থেকে সর্বোচ্চ ৫টি; তারিখ ধরে rotate করা,
+    যাতে প্রতিদিন ভিন্ন সেট আসে। ৪-অপশন + int answer-ওয়ালা প্রশ্নই নেয়।"""
+    bank = es_resolve_bank(bank)
+    qs = [q for q in (bank.get(subject) or [])
+          if isinstance(q, dict)
+          and isinstance(q.get("options"), list)
+          and len(q.get("options") or []) == 4
+          and isinstance(q.get("answer"), int)
+          and str(q.get("q") or "").strip()]
+    if len(qs) < 3:
+        return []
+    today_d = es_coerce_today(today)
+    offset = today_d.toordinal() % len(qs)
+    rotated = qs[offset:] + qs[:offset]
+    return [{"q": str(q.get("q") or ""), "options": list(q["options"]),
+             "answer": int(q["answer"]),
+             "topic": str(q.get("topic") or "সাধারণ")}
+            for q in rotated[:5]]
+
+
+def es_dual_format_questions(st):
+    lines = []
+    for i, q in enumerate(st.get("questions") or [], 1):
+        lines.append("")
+        lines.append(f"প্রশ্ন {es_bn(i)}: {q['q']}")
+        for j, op in enumerate(q.get("options") or []):
+            if j < len(ES_OPT_LETTERS):
+                lines.append(f"{ES_OPT_LETTERS[j]}) {op}")
+    return "\n".join(lines)
+
+
+def es_dual_start(subject, bank=None, today=None):
+    """Phase 1 শুরু: সময় ছাড়া ৫টি প্রশ্ন, উত্তর লুকানো।
+    ব্যাংকে ৩টির কম ব্যবহারযোগ্য প্রশ্ন থাকলে সৎ বার্তা (সেশন খোলে না)।"""
+    subject = str(subject or "").strip()
+    if not subject:
+        return ("কোন বিষয়ের দ্বৈত মূল্যায়ন দেবে? বিষয়ের নামসহ বলো — "
+                "যেমন: 'দ্বৈত মূল্যায়ন গণিত'।")
+    bank = es_resolve_bank(bank)
+    raw_n = len([q for q in (bank.get(subject) or [])
+                 if isinstance(q, dict)])
+    qs = es_dual_pick_questions(subject, bank=bank, today=today)
+    if not qs:
+        if raw_n == 0:
+            return (f"{ES_NO_DATA} — '{subject}' বিষয়ের কোনো প্রশ্ন "
+                    "অফলাইন ব্যাংকে পাইনি, তাই দ্বৈত মূল্যায়ন শুরু করা "
+                    "যাচ্ছে না।")
+        return (f"'{subject}' বিষয়ে ব্যবহারযোগ্য প্রশ্ন মাত্র "
+                f"{es_bn(raw_n)}টি আছে — দ্বৈত মূল্যায়নের জন্য কমপক্ষে "
+                "৩টি লাগে। আরো প্রশ্ন জমলে আবার চেষ্টা করো।")
+    today_d = es_coerce_today(today)
+    st = {"stage": "await_reveal", "subject": subject, "questions": qs,
+          "date": str(today_d), "phase1": None}
+    es_save_session(st)
+    lines = [f"⚖️ দ্বৈত মূল্যায়ন — {subject} (ধাপ ১: সময় ছাড়া)",
+             f"মোট {es_bn(len(qs))}টি প্রশ্ন। ঘড়ির দিকে তাকিও না — "
+             "ধীরে ভেবে নিজে নিজে উত্তরগুলো মনে মনে ঠিক করো। "
+             "উত্তর এখন দেখাব না।"]
+    lines.append(es_dual_format_questions(st))
+    lines.append("")
+    lines.append("হয়ে গেলে লিখো: 'উত্তর দেখাও' — তখন উত্তর মিলিয়ে "
+                 "নিজেই নম্বর দেবে। থামাতে লিখো: 'থামাও'।")
+    return "\n".join(lines)
+
+
+def es_dual_reveal(st):
+    """উত্তর প্রকাশ + নিজে-গ্রেড করার অনুরোধ; stage -> await_grade।"""
+    lines = [f"⚖️ দ্বৈত মূল্যায়ন — {st.get('subject', '')} : উত্তর"]
+    for i, q in enumerate(st.get("questions") or [], 1):
+        ans = int(q.get("answer", 0) or 0)
+        opts = q.get("options") or []
+        letter = ES_OPT_LETTERS[ans] if 0 <= ans < len(ES_OPT_LETTERS) \
+            else es_bn(ans + 1)
+        atext = opts[ans] if 0 <= ans < len(opts) else ""
+        lines.append(f"প্রশ্ন {es_bn(i)}: সঠিক উত্তর {letter}) {atext}")
+    total = len(st.get("questions") or [])
+    lines.append("")
+    lines.append(f"এবার সত্যি করে নিজে হিসাব করো — {es_bn(total)}টির "
+                 "মধ্যে কয়টা ঠিক হলো লিখো (যেমন ৩)।")
+    st["stage"] = "await_grade"
+    es_save_session(st)
+    return "\n".join(lines)
+
+
+def es_parse_grade(text, total):
+    """লেখা থেকে গ্রেড সংখ্যা (বাংলা/ইংরেজি সংখ্যা) বের করে;
+    0..total-এর মধ্যে না হলে None।"""
+    m = re.search(r"\d+", es_en_digits(str(text or "")))
+    if not m:
+        return None
+    try:
+        n = int(m.group(0))
+    except Exception:
+        return None
+    if 0 <= n <= int(total):
+        return n
+    return None
+
+
+def es_dual_grade(text, st):
+    """Phase 1 স্কোর রেকর্ড করে, ফাইলে শেষ ফল রাখে, Phase 2 নির্দেশ দেয়।"""
+    total = len(st.get("questions") or [])
+    score = es_parse_grade(text, total)
+    if score is None:
+        return (f"স্কোরটা সংখ্যায় লিখো — ০ থেকে {es_bn(total)}-এর মধ্যে "
+                "কয়টা ঠিক হলো (যেমন ৩)।")
+    result = {"subject": st.get("subject", ""), "phase1": score,
+              "date": str(date.today())}
+    es_save_session(result)
+    lines = [f"✅ ধাপ ১ শেষ! সময় ছাড়া পেয়েছ {es_bn(score)}/"
+             f"{es_bn(total)} — নোট করে রাখলাম।",
+             "",
+             "এবার ধাপ ২: সময় ধরে একই বিষয়ের মক টেস্ট দাও — "
+             "'মক টেস্ট' লিখলেই শুরু হবে।",
+             f"তুলনা: ধাপ ১-এ (চাপ ছাড়া) তোমার স্কোর "
+             f"{es_bn(score)}/{es_bn(total)}। ধাপ ২-তে সময়ের চাপে কত "
+             "পাও, মিলিয়ে দেখলেই বুঝবে — জ্ঞান কম, নাকি সময়ের চাপেই "
+             "নম্বর কমে।"]
+    return "\n".join(lines)
+
+
+def es_sweep_handle(text, low=None):
+    """#729 সেশন রাউটার (mastery pattern-এর মতো): সক্রিয় দ্বৈত
+    মূল্যায়ন সেশন থাকলেই শুধু কাজ করে; সেশন-ইনপুট না হলে None,
+    যাতে অন্য হ্যান্ডলার চলতে পারে।"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    st = es_load_session()
+    if not (st and st.get("stage") in ("await_reveal", "await_grade")
+            and st.get("questions")):
+        return None
+    if "থামাও" in text or "দ্বৈত মূল্যায়ন বন্ধ" in text:
+        es_clear_session()
+        return ("দ্বৈত মূল্যায়ন থামিয়ে দিলাম। আবার চাইলে বলো: "
+                "'দ্বৈত মূল্যায়ন <বিষয়>'।")
+    if st.get("stage") == "await_reveal":
+        if "উত্তর দেখাও" in text:
+            return es_dual_reveal(st)
+        return None
+    # stage == await_grade
+    if re.search(r"\d", es_en_digits(text)):
+        return es_dual_grade(text, st)
+    return None
+
+
+# =====================================================================
+#  #753 হলের দরজায় সাহস-বার্তা
+# =====================================================================
+
+
+def es_courage_text(wins=None, progress=None, first_day=None, today=None):
+    """~১ মিনিটে পড়া যায় এমন শান্ত সাহস-বার্তা — শুধু আসল রেকর্ড
+    থেকে: মোট সেশন/মক, প্রস্তুতির দিন, সর্বশেষ জয়, সবচেয়ে বেশি
+    পড়া বিষয়। ডেটা না থাকলে সৎ লাইনসহ সাধারণ শান্ত ফ্রেম।"""
+    wins = es_resolve_wins(wins)
+    progress = es_resolve_progress(progress)
+    first_day = es_resolve_first_day(first_day)
+    today_d = es_coerce_today(today)
+
+    total_sessions = 0
+    total_mocks = 0
+    best_subject = None
+    best_activity = 0
+    for subj, ent in (progress or {}).items():
+        if not isinstance(ent, dict):
+            continue
+        s = int(ent.get("sessions", 0) or 0)
+        m = int(ent.get("mock_tests", 0) or 0)
+        total_sessions += s
+        total_mocks += m
+        if s + m > best_activity:
+            best_activity = s + m
+            best_subject = str(subj)
+
+    days = None
+    fd = es_parse_date(first_day)
+    if fd is not None:
+        days = (today_d - fd).days + 1
+        if days < 1:
+            days = 1
+
+    latest_win = None
+    for w in reversed(wins or []):
+        if isinstance(w, dict) and str(w.get("text") or "").strip():
+            latest_win = str(w.get("text")).strip()
+            break
+
+    has_data = bool(total_sessions or total_mocks or latest_win
+                    or best_subject)
+    lines = ["🌿 হলের দরজায় দাঁড়িয়ে — এক মিনিট শুনে যাও।",
+             "",
+             "প্রথমে শ্বাস নাও। লম্বা করে শ্বাস নাও, ধীরে ছাড়ো। "
+             "আরেকবার। মাথাটা ঠান্ডা রাখো — তাড়াহুড়োর কিছু নেই।"]
+    if has_data:
+        lines.append("")
+        lines.append("এবার মনে করো, তুমি যা পড়েছ:")
+        facts = []
+        if days:
+            facts.append(f"তুমি প্রস্তুতি নিচ্ছ {es_bn(days)} দিন ধরে")
+        if total_sessions or total_mocks:
+            facts.append(f"মোট {es_bn(total_sessions)}টি পড়ার সেশন আর "
+                         f"{es_bn(total_mocks)}টি মক টেস্ট দিয়েছ")
+        if best_subject:
+            facts.append(f"সবচেয়ে বেশি পড়েছ {best_subject}")
+        if latest_win:
+            facts.append(f"তোমার সর্বশেষ জয়: “{latest_win}”")
+        for f in facts:
+            lines.append(f"• {f}।")
+        lines.append("এই পরিশ্রমটা সত্যি — কেউ তোমার কাছ থেকে এটা "
+                     "কেড়ে নিতে পারবে না।")
+    else:
+        lines.append("")
+        lines.append("এখনো রেকর্ড কম, তবু তুমি আজ এখানে এসেছ — "
+                     "এটাই সবচেয়ে বড় প্রমাণ যে তুমি হাল ছাড়োনি। "
+                     "যতটুকু পড়েছ, ঠান্ডা মাথায় ততটুকুই ভালো করে লিখো।")
+    lines.append("")
+    lines.append("আজ শুধু নিজের সেরা চেষ্টাটা দাও। জানা প্রশ্নটা আগে, "
+                 "কঠিনটা পরে। একটা প্রশ্নে আটকে থাকবে না। "
+                 "তুমি পারবে — ধীরে, শান্তভাবে, একটা একটা করে। "
+                 "আমি আছি তোমার সঙ্গে।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  ডিসপ্যাচ হেল্পার (ইন্টিগ্রেটর INTEGRATION-SWEEP.md অনুযায়ী বসাবে)
+# =====================================================================
+
+ES_TRIGGERS = (
+    "রিভিশন কবে", "পুনরাবৃত্তি সূচি", "ভুলে যাওয়ার",
+    "পকেট সার",
+    "বিভ্রান্তিকর জোড়া", "গুলিয়ে ফেলি",
+    "দ্বৈত মূল্যায়ন",
+    "সাহস বার্তা", "হলে যাওয়ার আগে", "পরীক্ষার আগে বলো",
+)
+
+
+def es_handle(text, low=None):
+    """Trigger মিললে সংশ্লিষ্ট টেক্সট, না মিললে None।
+    সক্রিয় দ্বৈত-মূল্যায়ন সেশন থাকলে সেশন-রাউট সবার আগে (session
+    precedence) — তবে সেশন-ইনপুট না হলে বাকি trigger-ও চলতে পারে।"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    # #729 session routing — সবার আগে
+    if es_dual_active():
+        _s = es_sweep_handle(text, low)
+        if _s:
+            return _s
+    if "দ্বৈত মূল্যায়ন" in text:
+        subj = es_subject_in_text(text)
+        if not subj:
+            return ("কোন বিষয়ের দ্বৈত মূল্যায়ন দেবে? বিষয়ের নামসহ "
+                    "বলো — যেমন: 'দ্বৈত মূল্যায়ন গণিত'।")
+        return es_dual_start(subj)
+    if ("রিভিশন কবে" in text or "পুনরাবৃত্তি সূচি" in text
+            or "ভুলে যাওয়ার" in text or "রিভিশন সূচি" in text):
+        return es_revision_due_text()
+    if "পকেট সার" in text:
+        return es_pocket_summary_text()
+    if ("বিভ্রান্তিকর জোড়া" in text or "বিভ্রান্তিকর" in text
+            or "গুলিয়ে ফেলি" in text or "গুলিয়ে ফেলছি" in text):
+        return es_confusion_pairs_text()
+    if ("সাহস বার্তা" in text or "হলে যাওয়ার আগে" in text
+            or "হলের দরজায়" in text or "পরীক্ষার আগে বলো" in text):
+        return es_courage_text()
+    return None
+
+
+# -*- coding: utf-8 -*-
+"""
 jobprep_pack.py — Desktop Sokhi: চাকরি-প্রস্তুতি জ্ঞান প্যাক (Wave-4, v1.6 features)
 
 ১০০% ফ্রি ও অফলাইন: কোনো নেটওয়ার্ক, API key বা বাইরের ফাইল লাগে না।
@@ -8495,6 +12382,12 @@ def handle_message(text):
         _tch = teacher_handle(text, low)
         if _tch:
             return _tch
+        # --- v1.9.0 #759 চাপ-সিমুলেশন: tighter clock on the host exam
+        _pr = et_pressure_request(text, low)
+        if _pr:
+            return _pr["header"] + exam_start(
+                _pr["subject"] or _detect_subject(text, low) or "গণিত",
+                _pr["count"], _pr["minutes"])
         if "মক টেস্ট" in text or "mock test" in low:
             return exam_start(_detect_subject(text, low) or "গণিত", 10, 10)
         if "পরীক্ষার অবস্থা" in text:
@@ -8516,6 +12409,14 @@ def handle_message(text):
         _sp = study_pack_handle(text, low)
         if _sp:
             return _sp
+
+        # --- v1.9.0 elite planning pack (#766/#767/#769/#770/#781/#782/#783/#784)
+        _ep = ep_planning_handle(text, low)
+        if _ep:
+            return _ep
+        _ee = ee_engine_handle(text, low)
+        if _ee:
+            return _ee
         if ("সাপ্তাহিক রিপোর্ট" in text or "বোর্ড সভা" in text
                 or "সাপ্তাহিক বোর্ড" in text):
             return board_text()
@@ -8525,6 +12426,33 @@ def handle_message(text):
             _ma = mastery_answer(text)
             if _ma:
                 return _ma
+        # --- v1.9.0 elite analysis pack (#763/#764/#765) ---
+        _ea_campaign = None
+        try:
+            _ec = load_json(DATA / "elite-campaign.json", {})
+            if isinstance(_ec, dict) and _ec.get("exam_date"):
+                _ea_campaign = _ec
+        except Exception:
+            _ea_campaign = None
+        if ("অভিক্ষেপ" in text or "শেষ হতে কত দিন" in text
+                or "পরীক্ষার আগে শেষ হবে" in text):
+            return ea_projection_text(
+                campaign=_ea_campaign,
+                first_day=mem.get("first_day", "") or None)
+        _ea = ea_analysis_handle(text, low)
+        if _ea:
+            return _ea
+        # --- v1.9.0 elite training pack (#755/#756) — session route:
+        # after mastery, before jobprep; disabled during a live exam.
+        if not exam_active():
+            _et = et_training_handle(text, low)
+            if _et:
+                return _et
+        # --- v1.9.0 study sweep pack (#667/#703/#716/#729/#753) ---
+        if not exam_active():
+            _es = es_handle(text, low)
+            if _es:
+                return _es
         # --- v1.6.0 jobprep knowledge packs (#787/#788/#789/#796/#836/#943/#944/#945/#946/#949/#922/#923)
         _jp = jobprep_handle(text)
         if _jp:
@@ -11640,7 +15568,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 
 def main():
@@ -11693,6 +15621,8 @@ def main():
         log_change("আপগ্রেড: v1.3.0 — parked ৬টি: উত্তরের ভাষা পছন্দ, pin (বার্তা + কথোপকথন), সব কথোপকথন backup/restore, wake word 'Sokhi', রাতের auto-dim, বহু-ডিভাইস sync (ফাইল-ভিত্তিক)")
         register_capability("v18-deferred3", "ছবি/চার্ট উত্তর (inline SVG), Gemini মডেল বাছাই, কণ্ঠ বাছাই (Edge + ব্রাউজার) ও কণ্ঠ পরীক্ষা")
         log_change("আপগ্রেড: v1.8.0 — deferred ৩টি: #47 আসল ডেটা থেকে inline SVG চার্ট/ধারণা-মানচিত্র, #49 Gemini মডেল বাছাই (auto/custom + fallback নোটিশ), #50 কণ্ঠ বাছাই (Edge নাবনিতা/প্রদীপ + ব্রাউজারের গলা) ও কণ্ঠ পরীক্ষা বোতাম")
+        register_capability("v19-elite", "ELITE প্যাক: ভুলের খরচ/অগ্রগতির গ্রাফ/অভিক্ষেপ বিশ্লেষণ, ফাঁদ ও বাদ-দেওয়ার অনুশীলন, চাপ-সিমুলেশন, ক্যাম্পেইন পরিকল্পক ও মাইলফলক, ইঞ্জিন-রেডি প্যানেল, রিভিশন সূচি/পকেট সার/দ্বৈত মূল্যায়ন/সাহস বার্তা")
+        log_change("আপগ্রেড: v1.9.0 — ELITE ব্যাচ: #763/#764/#765 বিশ্লেষণ, #755/#756/#759 প্রশিক্ষণ ও চাপ-সিমুলেশন, #766/#662/#767/#769/#770/#781/#782/#783/#784 পরিকল্পনা, ইঞ্জিন-রেডি #754/#757/#760/#761/#762/#768/#771/#776/#778/#779/#780, সুইপ #667/#703/#716/#729/#753")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
