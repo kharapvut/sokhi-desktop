@@ -151,8 +151,9 @@ def get_config():
     cfg.setdefault("tts_voice", "bn-BD-NabanitaNeural")
     cfg.setdefault("call_name", "")
     cfg.setdefault("tts_preset", "মিষ্টি")
-    cfg.setdefault("tts_rate", "-8%")
-    cfg.setdefault("tts_pitch", "+3%")
+    cfg.setdefault("tts_rate", "-3%")
+    cfg.setdefault("tts_pitch", "+4%")
+    cfg.setdefault("voice_rate", 1.0)
     cfg.setdefault("bridge_enabled", False)
     cfg.setdefault("computer_use_enabled", False)
     cfg.setdefault("away_mode", True)
@@ -299,6 +300,42 @@ def care_suffix(reply, hour=None, count=None):
     except Exception:
         pass
     return reply
+
+
+# ------------------------------------------------- voice speed helpers
+# Single source of truth for TTS speed (v1.1.0, সমস্যা ২/৩ + F9).
+# Final Edge rate formula (implemented in voice_identity(), TTS section):
+#   final rate% = preset% + (voice_rate - 1) * 100 + mood_adjust%
+#   then clamped to [-12%, +25%]
+# so the TOTAL slowdown (preset + slider + emotional mood slowdown
+# together) can never go below -12%, however the pieces stack.
+
+def _parse_pct(value, default=0.0):
+    """Parse a signed percent string like '-3%' / '+4%' (or a number) -> float."""
+    try:
+        if value is None:
+            return float(default)
+        if isinstance(value, (int, float)):
+            return float(value)
+        s = str(value).strip().replace("%", "")
+        return float(s) if s not in ("", "+", "-") else float(default)
+    except Exception:
+        return float(default)
+
+
+def _fmt_pct(value):
+    """Format a numeric percent the way edge-tts expects: '-3%', '+4%', '0%'."""
+    v = int(round(float(value)))
+    return f"+{v}%" if v > 0 else f"{v}%"
+
+
+def _clamp_voice_rate(value, default=1.0):
+    """Settings speed slider: float clamped to [0.8, 1.2]; junk -> default."""
+    try:
+        v = float(value)
+    except Exception:
+        return float(default)
+    return max(0.8, min(1.2, v))
 
 
 def self_upgrade():
@@ -460,6 +497,11 @@ def web_search(query, limit=5):
 
 _last_gemini_error = {"info": ""}
 
+# Latency measurement (v1.1, problem 4): the most recent ask_gemini() call.
+# Keys: ms (total wall time of the call), model (the model that succeeded,
+# or None), attempts (how many models were tried), quality (bool), ok (bool).
+LAST_LATENCY = {}
+
 
 def _log_gemini_error(model, err):
     info = f"model={model} error={err}"
@@ -471,14 +513,33 @@ def _log_gemini_error(model, err):
         pass
 
 
-def ask_gemini(user_text, mem):
-    """Smart brain — Gemini FREE tier only. Tries the configured model,
-    then backup free models, so one model's limit/overload does not drop
-    Sokhi back to her offline brain. The real error is logged (never the
-    key itself) so failures can be diagnosed instead of guessed."""
+def ask_gemini(user_text, mem, quality=False):
+    """Smart brain — Gemini FREE tier only. Tries free models so one
+    model's limit/overload does not drop Sokhi back to her offline brain.
+    The real error is logged (never the key itself) so failures can be
+    diagnosed instead of guessed.
+
+    Latency (v1.1, problem 4): by default the FASTEST free model goes
+    first and each attempt times out after 12s (max 3 attempts, so a
+    stuck/limited model can no longer stack up ~120s of waiting).
+    quality=True keeps the OLD order (configured model first, then the
+    original backups) and the full 1024-token budget — use it for
+    quality-sensitive calls (teacher steps, exam-question generation).
+    Every call records its total ms + winning model in LAST_LATENCY."""
+    _t0 = time.perf_counter()
+
+    def _record(model, attempts, ok):
+        LAST_LATENCY.clear()
+        LAST_LATENCY.update({
+            "ms": int((time.perf_counter() - _t0) * 1000),
+            "model": model, "attempts": attempts,
+            "quality": bool(quality), "ok": bool(ok),
+        })
+
     cfg = get_config()
     key = (cfg.get("gemini_api_key") or "").strip()
     if not key:
+        _record(None, 0, False)
         return None
     facts = "; ".join(mem.get("facts", [])[-10:])
     likes = ", ".join(mem.get("likes", [])[-10:])
@@ -497,14 +558,26 @@ def ask_gemini(user_text, mem):
     body = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": gemini_contents(user_text),
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1024},
+        # 700 tokens is plenty for everyday chat and returns sooner;
+        # quality calls keep the full 1024 for long teacher-style answers.
+        "generationConfig": {"temperature": 0.4,
+                             "maxOutputTokens": 1024 if quality else 700},
     }
+    configured = cfg.get("gemini_model", "gemini-3.8-flash")
+    if quality:
+        order = (configured, "gemini-3.5-flash", "gemini-2.5-flash",
+                 "gemini-3.5-flash-lite")
+    else:
+        order = ("gemini-3.5-flash-lite", configured, "gemini-3.5-flash")
     models = []
-    for m in (cfg.get("gemini_model", "gemini-3.8-flash"),
-              "gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite"):
+    for m in order:
         if m and m not in models:
             models.append(m)
+    if not quality:
+        models = models[:3]
+    attempts = 0
     for model in models:
+        attempts += 1
         url = ("https://generativelanguage.googleapis.com/v1beta/models/"
                f"{model}:generateContent")
         req = urllib.request.Request(
@@ -512,9 +585,11 @@ def ask_gemini(user_text, mem):
             headers={"Content-Type": "application/json", "x-goog-api-key": key},
             method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=12) as r:
                 data = json.loads(r.read().decode("utf-8"))
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            _record(model, attempts, True)
+            return text_out
         except Exception as e:
             detail = str(e)
             try:
@@ -524,6 +599,7 @@ def ask_gemini(user_text, mem):
                 pass
             _log_gemini_error(model, detail)
             continue
+    _record(None, attempts, False)
     return None
 
 
@@ -600,13 +676,17 @@ def _study_delete(path):
 
 
 def _gemini_or_none(prompt):
-    """ask_gemini-কে নিরাপদে ডাকে; key না থাকলে/ব্যর্থ হলে None।"""
+    """ask_gemini-কে নিরাপদে ডাকে; key না থাকলে/ব্যর্থ হলে None।
+    v1.1: এই wrapper-এর সব কলকারীই গুণগত-সংবেদনশীল (শিক্ষক, পরীক্ষা,
+    এজেন্ট-সারসংক্ষেপ, কোডিং) — তাই সবসময় quality=True পথে যায়, যাতে
+    লম্বা JSON/ধাপ 700-token সীমায় কাটা না পড়ে। সাধারণ চ্যাট সরাসরি
+    ask_gemini ডাকে (fast পথ)।"""
     try:
         mem = get_memory()
     except Exception:
         mem = {}
     try:
-        out = ask_gemini(prompt, mem)
+        out = ask_gemini(prompt, mem, quality=True)
     except Exception:
         return None
     if out and str(out).strip():
@@ -1582,9 +1662,110 @@ def study_progress_text():
 
 VOICE_STATE = {"engine": "", "error": ""}
 
+_EDGE_INSTALL_FLAG = DATA / ".edge-tts-install-tried"
+_edge_install_started = False
+
+
+def _edge_available():
+    """True when the free edge-tts tool can actually be run: either the
+    `edge-tts` executable is on PATH or the `edge_tts` python module is
+    importable (make_tts tries both invocation styles)."""
+    if shutil.which("edge-tts") or shutil.which("edge-tts.exe"):
+        return True
+    try:
+        import importlib.util
+        return importlib.util.find_spec("edge_tts") is not None
+    except Exception:
+        return False
+
+
+def ensure_edge_tts():
+    """If edge-tts is missing, retry `pip install edge-tts` ONCE in a
+    background daemon thread (same idea as the start-sokhi.bat marker:
+    a flag file in data/ marks that the attempt was made, so we never
+    spawn installers repeatedly). Silent on failure. Lazy-triggered from
+    /api/status, /api/tts_test and make_tts_audio — main() untouched.
+    Returns True when edge-tts is already available."""
+    global _edge_install_started
+    if _edge_available():
+        return True
+    if _edge_install_started or _EDGE_INSTALL_FLAG.exists():
+        return False
+    _edge_install_started = True
+    try:
+        _EDGE_INSTALL_FLAG.write_text(
+            datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    except Exception:
+        pass
+
+    def _install():
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "edge-tts"],
+                           capture_output=True, text=True, timeout=600)
+        except Exception:
+            pass  # silent by design — Google/browser voices keep working
+
+    try:
+        threading.Thread(target=_install, daemon=True).start()
+    except Exception:
+        pass
+    return False
+
+
+def voice_identity(rate=None, pitch=None, cfg=None):
+    """F9 signature voice — the ONE place voice/rate/pitch come from, so
+    every engine (Edge, Google, and the values reported to the browser)
+    speaks with the same identity.
+
+    `rate` here is NOT an absolute rate: it is the mood adjustment sent by
+    the page (JS moodRate(), e.g. '-16%' when Bhaiya sounds tired/sad).
+    Final rate% = preset% + (voice_rate - 1) * 100 + mood_adjust%,
+    clamped to [-12%, +25%]: total slowdown NEVER below -12%.
+
+    `pitch`: an explicit value, when given, is the absolute pitch;
+    otherwise the preset pitch from config is used (clamped [-20%, +20%]
+    as a safety bound). Voice name always comes from config tts_voice."""
+    cfg = cfg if cfg is not None else get_config()
+    preset_pct = _parse_pct(cfg.get("tts_rate", "-3%"), -3.0)
+    slider = _clamp_voice_rate(cfg.get("voice_rate", 1.0))
+    mood_pct = _parse_pct(rate, 0.0) if rate is not None else 0.0
+    final_pct = preset_pct + (slider - 1.0) * 100.0 + mood_pct
+    final_pct = round(max(-12.0, min(25.0, final_pct)), 2)
+    if pitch is not None:
+        pitch_pct = _parse_pct(pitch, 4.0)
+    else:
+        pitch_pct = _parse_pct(cfg.get("tts_pitch", "+4%"), 4.0)
+    pitch_pct = max(-20.0, min(20.0, pitch_pct))
+    return {"voice": cfg.get("tts_voice", "bn-BD-NabanitaNeural"),
+            "rate": _fmt_pct(final_pct), "pitch": _fmt_pct(pitch_pct),
+            "rate_pct": final_pct, "pitch_pct": pitch_pct,
+            "voice_rate": slider, "preset": cfg.get("tts_preset", "মিষ্টি")}
+
+
+def tts_engine_status():
+    """Human-readable state of the voice engine, from edge-tts
+    availability + the cached result of the last TTS attempt."""
+    ident = voice_identity()
+    last = VOICE_STATE.get("engine", "")
+    if last == "edge-নাবনিতা":
+        return f"Edge — {ident['voice']} (আসল গলা)"
+    if last == "google-বাংলা":
+        return "Google fallback — Edge পাওয়া যাচ্ছে না"
+    if VOICE_STATE.get("error"):
+        return "Browser voice (শেষ আশ্রয়)"
+    if _edge_available():
+        return f"Edge — {ident['voice']} (আসল গলা)"
+    return "Google fallback — Edge পাওয়া যাচ্ছে না"
+
 
 def _tts_edge(text, out_file, rate=None, pitch=None):
-    voice = get_config().get("tts_voice", "bn-BD-NabanitaNeural")
+    # rate/pitch arriving here are FINAL, already resolved + clamped by
+    # voice_identity() in make_tts_audio; when called directly without
+    # them, resolve the same identity here (no mood adjustment).
+    ident = voice_identity()
+    voice = ident["voice"]
+    rate = rate if rate is not None else ident["rate"]
+    pitch = pitch if pitch is not None else ident["pitch"]
     candidates = []
     exe = shutil.which("edge-tts") or shutil.which("edge-tts.exe")
     if exe:
@@ -1593,10 +1774,9 @@ def _tts_edge(text, out_file, rate=None, pitch=None):
     last = "edge-tts পাওয়া যায়নি"
     for cmd in candidates:
         try:
-            cfg = get_config()
             r = subprocess.run(cmd + ["--voice", voice,
-                                      "--rate=" + (rate or cfg.get("tts_rate", "-8%")),
-                                      "--pitch=" + (pitch or cfg.get("tts_pitch", "+3%")),
+                                      "--rate=" + rate,
+                                      "--pitch=" + pitch,
                                       "--text", text, "--write-media", str(out_file)],
                                capture_output=True, text=True, timeout=30)
             if r.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1000:
@@ -1608,9 +1788,21 @@ def _tts_edge(text, out_file, rate=None, pitch=None):
 
 
 def _tts_google(text, out_file, rate=None, pitch=None):
+    # Google's free translate_tts endpoint has NO pitch control and only a
+    # best-effort speed hint (ttsspeed). We still pass the SAME clamped,
+    # identity-resolved rate as every other engine (as ttsspeed, capped at
+    # 1.0 because the endpoint ignores >1) and record the resolved
+    # rate/pitch in VOICE_STATE so status/logs show what was intended.
+    # Honest limit: Google may ignore ttsspeed entirely — pitch cannot be
+    # applied on this engine at all.
+    ident = voice_identity()
+    rate = rate if rate is not None else ident["rate"]
+    pitch = pitch if pitch is not None else ident["pitch"]
+    VOICE_STATE.update(rate=rate, pitch=pitch)
+    speed = max(0.24, min(1.0, 1.0 + _parse_pct(rate, 0.0) / 100.0))
     q = urllib.parse.quote(text)
     url = ("https://translate.google.com/translate_tts?ie=UTF-8&q=" + q +
-           "&tl=bn&client=tw-ob")
+           "&tl=bn&client=tw-ob&ttsspeed=" + f"{speed:.2f}")
     data = http_get_bytes(url, 20)
     if len(data) < 2000:
         raise RuntimeError("Google গলা ছোট/খালি সাড়া দিল")
@@ -1619,21 +1811,29 @@ def _tts_google(text, out_file, rate=None, pitch=None):
 
 
 def make_tts_audio(text, rate=None, pitch=None):
+    # One call = one text = one request per engine (no server-side
+    # chunking — short replies are never split; the 600-char cap is a
+    # safety trim only, and the page's own chunking is a client concern).
+    # `rate` = mood adjustment (JS moodRate); voice_identity() folds it
+    # into the final clamped rate/pitch used by BOTH engines.
     import hashlib
     text = (text or "").strip()[:600]
     if not text:
         return None
     TTS_CACHE.mkdir(parents=True, exist_ok=True)
-    cfg = get_config()
-    h = hashlib.md5(("v3|" + (rate or cfg.get("tts_rate", "")) + "|" + (pitch or cfg.get("tts_pitch", "")) + "|" + text).encode("utf-8")).hexdigest()
+    ident = voice_identity(rate, pitch)
+    if not _edge_available():
+        ensure_edge_tts()
+    h = hashlib.md5(("v4|" + ident["voice"] + "|" + ident["rate"] + "|" + ident["pitch"] + "|" + text).encode("utf-8")).hexdigest()
     out_file = TTS_CACHE / f"{h}.mp3"
     if out_file.exists() and out_file.stat().st_size > 1000:
+        VOICE_STATE.update(engine=VOICE_STATE.get("engine", ""), rate=ident["rate"], pitch=ident["pitch"])
         return out_file
     errors = []
     for engine, fn in (("edge-নাবনিতা", _tts_edge), ("google-বাংলা", _tts_google)):
         try:
-            if fn(text, out_file, rate, pitch):
-                VOICE_STATE.update(engine=engine, error="")
+            if fn(text, out_file, ident["rate"], ident["pitch"]):
+                VOICE_STATE.update(engine=engine, error="", rate=ident["rate"], pitch=ident["pitch"])
                 return out_file
         except Exception as e:
             errors.append(str(e))
@@ -2930,26 +3130,84 @@ def tasks_api(data):
     return {"tasks": away_load()}
 
 
-# ------------------------------------------- foundation (F3 / F5 / N14) — honest stubs
+# ------------------------------------------- foundation (F3 / F5 / N14) — v1.1.0 full-forms
+# Bridge protocol (N14/F5, Desktop side):
+#   Desktop -> outside : data/bridge/outbox/<timestamp>.json
+#   outside -> Desktop : data/bridge/inbox/<timestamp>.json
+#   File body: {"kind": "note|task|message|...", "text": "...", "ts": "ISO"}
+#   Remaining (Muse side): a Claude/WhatsApp-side worker must pick files
+#   up from outbox/, act on them and drop result files into inbox/ in the
+#   same format — Desktop already knows how to read those (bridge_sync_text).
+BRIDGE_DIR = DATA / "bridge"
+BRIDGE_OUTBOX = BRIDGE_DIR / "outbox"
+BRIDGE_INBOX = BRIDGE_DIR / "inbox"
+
+
+def _bridge_dirs():
+    try:
+        BRIDGE_OUTBOX.mkdir(parents=True, exist_ok=True)
+        BRIDGE_INBOX.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _bridge_count(folder):
+    try:
+        _bridge_dirs()
+        return len([p for p in folder.glob("*.json") if p.is_file()])
+    except Exception:
+        return 0
+
+
 def foundation_status():
     cfg = get_config()
+    out_n = _bridge_count(BRIDGE_OUTBOX)
+    in_n = _bridge_count(BRIDGE_INBOX)
+    legacy_n = 0
+    try:
+        legacy_n = len(load_json(BRIDGE_QUEUE_FILE, []))
+    except Exception:
+        legacy_n = 0
     return {
         "computer_use_gui": bool(cfg.get("computer_use_enabled", False)),
         "bridge_enabled": bool(cfg.get("bridge_enabled", False)),
-        "bridge_queue": len(load_json(BRIDGE_QUEUE_FILE, [])),
-        "note": ("F3 পূর্ণ GUI computer-use ও F5/N14 cloud-sync v1.0-তে foundation-only: "
-                 "config ফ্ল্যাগ ও bridge-queue কাঠামো প্রস্তুত; মূল কাজ (এজেন্ট দল, "
-                 "away-task তালিকা, WhatsApp সেতু Muse-Sokhi দিয়ে) পরের ধাপে যুক্ত হবে।"),
+        "bridge_queue": legacy_n,
+        "bridge_outbox": out_n,
+        "bridge_inbox": in_n,
+        "bridge_protocol": "file-json-v1 (outbox/inbox, {kind, text, ts})",
+        "note": ("v1.1.0 full-forms: F3 GUI computer-use (শুধু Windows, "
+                 "computer_use_enabled config + প্রতিটি কাজে আলাদা "
+                 "confirmation) ও N14/F5 bridge outbox/inbox ফাইল-প্রোটোকল "
+                 "এখন কার্যকর। বাকি শুধু Muse/WhatsApp-পক্ষের worker: "
+                 "outbox থেকে ফাইল তুলে কাজ করে inbox-এ ফল রাখলেই Desktop "
+                 "তা পড়তে পারবে।"),
     }
 
 
 def bridge_enqueue(item):
+    """Legacy queue (bridge-queue.json) + real outbox file (v1.1.0).
+    item: str or {"kind": ..., "text": ...}. Returns legacy queue length
+    (same return contract as v1.0)."""
+    if isinstance(item, dict):
+        kind = str(item.get("kind") or "note")[:40]
+        text = str(item.get("text") or item.get("item") or "")[:2000]
+    else:
+        kind, text = "note", str(item)[:2000]
+    payload = {"kind": kind, "text": text,
+               "ts": datetime.now().isoformat(timespec="seconds")}
     q = load_json(BRIDGE_QUEUE_FILE, [])
     if not isinstance(q, list):
         q = []
-    q.append({"item": str(item)[:300], "ts": now_str()})
+    q.append({"item": text[:300], "ts": now_str()})
     save_json(BRIDGE_QUEUE_FILE, q[-100:])
+    try:
+        _bridge_dirs()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        save_json(BRIDGE_OUTBOX / f"{stamp}.json", payload)
+    except Exception:
+        pass
     return len(q)
+
 
 
 # ------------------------------------------------------------------ brain
@@ -2965,6 +3223,1112 @@ def insights_text(mem):
     lines.append(f"মোট {mem['interaction_count']} বার কথা হয়েছে, মনে রেখেছি {len(mem['facts'])}টা তথ্য ও {len(mem['likes'])}টা পছন্দ।")
     return "\n".join(lines)
 
+
+
+
+# -*- coding: utf-8 -*-
+# =============================================================================
+#  Desktop Sokhi v1.1.0 — FULL-FORMS ট্র্যাক (এই সেকশনটি নতুন)
+#  F1 World Model · F2 Anticipatory · F3 GUI computer-use · F4 Projects ·
+#  F6 Growth diary · F7 Nightly research · F8 Prediction · N10 Coding agent ·
+#  N11 Documents/Research · N14/F5 Bridge (Desktop দিক)
+# -----------------------------------------------------------------------------
+#  সংযোগ (coordinator করবে — এই সেকশন handle_message/HTML/TTS ছোঁয় না):
+#      handle_message-এ:   _ff = fullforms_handle(text, low)
+#                          if _ff: return _ff
+#      panels_data-তে:     result.update(fullforms_panels()) জাতীয় মার্জ
+#
+#  ⚠️ Muse-পক্ষে বাকি কাজ (N14/F5): এই ফাইল থেকে WhatsApp/Muse-পক্ষের
+#  worker বানানো সম্ভব নয়। প্রোটোকল: কোনো Muse-পক্ষের worker যদি
+#  data/bridge/outbox/ থেকে timestamp-নামের JSON ফাইল তুলে কাজ করে
+#  ফলাফল data/bridge/inbox/-এ একই ফরম্যাটে রাখে —
+#  {"kind": "...", "text": "...", "ts": "ISO"} — Desktop সেটা
+#  bridge_sync_text() / 'ব্রিজের বার্তা পড়ো' দিয়ে পড়তে পারবে।
+#  সব ফাইল DATA (data/) ফোল্ডারে; stdlib only; Windows-নির্ভর অংশে
+#  OS-guard — Linux-এ crash নয়, পরিষ্কার বার্তা।
+# =============================================================================
+
+FF_WORLD_FILE = DATA / "world-model.json"
+FF_PROJECTS_FILE = DATA / "projects.json"
+FF_GROWTH_FILE = DATA / "growth-diary.json"
+FF_RESEARCH_QUEUE_FILE = DATA / "research-queue.json"
+FF_RESEARCH_NOTES_FILE = DATA / "research-notes.md"
+FF_GUI_STEPS_FILE = DATA / "gui-steps.json"
+FF_SANDBOX_DIR = DATA / "coding-sandbox"
+FF_DOCS_DIR = DATA / "documents"
+
+_ff_pending = {"action": None, "data": None}   # F3 confirmation gate (_n8 ধাঁচ)
+_ff_gui_steps_mem = []
+
+
+def _ff_ensure_dirs():
+    for d in (FF_SANDBOX_DIR, FF_DOCS_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    _bridge_dirs()
+
+
+def _ff_today():
+    return str(date.today())
+
+
+def _ff_stamp():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _ff_num(x):
+    try:
+        return _bn_num(x)
+    except Exception:
+        return str(x)
+
+
+def _ff_norm(s):
+    try:
+        return _norm_num_text(s)
+    except Exception:
+        return str(s or "")
+
+
+# ---------------------------------------------------------- F1: World Model
+def _ff_world_load():
+    wm = load_json(FF_WORLD_FILE, {})
+    if not isinstance(wm, dict):
+        wm = {}
+    wm.setdefault("habits", {})
+    wm.setdefault("people", {})
+    wm.setdefault("goals", [])
+    wm.setdefault("preferences", {})
+    wm.setdefault("updated", "")
+    return wm
+
+
+def _ff_world_save(wm):
+    try:
+        wm["updated"] = _ff_stamp()
+        save_json(FF_WORLD_FILE, wm)
+    except Exception:
+        pass
+
+
+def world_model_update(key_path, value):
+    """key-path ধরে world model আপডেট করে। যেমন:
+    world_model_update('goals', 'সরকারি চাকরি পাওয়া'),
+    world_model_update('people.রহিম.relation', 'বন্ধু'),
+    world_model_update('habits.study_time', 'রাত ৯টা')।
+    মাঝের নোড list হলে append, শেষ নোড list হলে append, নইলে set।"""
+    wm = _ff_world_load()
+    parts = [p.strip() for p in str(key_path or "").split(".") if p.strip()]
+    if not parts:
+        return wm
+    node = wm
+    for p in parts[:-1]:
+        nxt = node.get(p) if isinstance(node, dict) else None
+        if not isinstance(nxt, (dict, list)):
+            nxt = {}
+            node[p] = nxt
+        node = nxt
+    last = parts[-1]
+    if isinstance(node, list):
+        if value not in node:
+            node.append(value)
+    elif isinstance(node, dict):
+        cur = node.get(last)
+        if isinstance(cur, list):
+            if value not in cur:
+                cur.append(value)
+        else:
+            node[last] = value
+    _ff_world_save(wm)
+    return wm
+
+
+def world_model_text():
+    """প্রসঙ্গে ব্যবহারের মতো ছোট সারসংক্ষেপ।"""
+    wm = _ff_world_load()
+    goals = [g for g in wm.get("goals", []) if g]
+    people = wm.get("people", {}) or {}
+    habits = wm.get("habits", {}) or {}
+    prefs = wm.get("preferences", {}) or {}
+    if not goals and not people and not habits and not prefs:
+        return ("আমার world model এখনো প্রায় খালি — তোমার লক্ষ্য, মানুষজন, "
+                "অভ্যাস সম্পর্কে কথা হলেই আমি এখানে সাজিয়ে রাখব। "
+                "যেমন বলতে পারো: 'লক্ষ্য যোগ করো: সরকারি চাকরি পাওয়া'।")
+    lines = ["🌍 তোমার সম্পর্কে আমার world model:"]
+    if goals:
+        lines.append("লক্ষ্য: " + "; ".join(str(g) for g in goals[-5:]))
+    if people:
+        who = []
+        for name, info in list(people.items())[:8]:
+            rel = info.get("relation", "") if isinstance(info, dict) else ""
+            who.append(f"{name} ({rel})" if rel else str(name))
+        lines.append("মানুষজন: " + ", ".join(who))
+    if habits:
+        lines.append("অভ্যাস: " + "; ".join(
+            f"{k}: {v}" for k, v in list(habits.items())[:5]))
+    if prefs:
+        pl = []
+        for k, v in prefs.items():
+            pl.append(f"{k}: {', '.join(map(str, v)) if isinstance(v, list) else v}")
+        lines.append("পছন্দ: " + "; ".join(pl[:5]))
+    if wm.get("updated"):
+        lines.append(f"(সর্বশেষ হালনাগাদ: {wm['updated']})")
+    return "\n".join(lines)
+
+
+def _ff_world_learn(text):
+    """learn_from_text-এর ধাঁচে হালকা নিয়ম-ভিত্তিক হুক (নীরব — উত্তর নয়)।
+    নাম/লক্ষ্য/অভ্যাস/পছন্দ ধরলে world model-এ জমা হয়।"""
+    try:
+        changed = False
+        m = re.search(r"আমার লক্ষ্য(?:টা)?(?: হলো| হচ্ছে)?[:\- ]+(.+)", text)
+        if m:
+            g = m.group(1).strip().rstrip("।.")
+            wm = _ff_world_load()
+            if g and g not in wm["goals"]:
+                wm["goals"].append(g)
+                _ff_world_save(wm)
+            changed = True
+        m = re.search(r"আমার (বন্ধু|ভাই|বোন|বাবা|মা|শিক্ষক|বান্ধবী) ([^\s,।:]+)", text)
+        if m:
+            rel, name = m.group(1), m.group(2).strip()
+            wm = _ff_world_load()
+            ent = wm["people"].get(name) or {}
+            if ent.get("relation") != rel:
+                ent["relation"] = rel
+                wm["people"][name] = ent
+                _ff_world_save(wm)
+            changed = True
+        m = re.search(r"আমার অভ্যাস[:\- ]+(.+)", text)
+        if m:
+            h = m.group(1).strip().rstrip("।.")
+            wm = _ff_world_load()
+            key = "অভ্যাস-" + str(len(wm["habits"]) + 1)
+            if h and h not in wm["habits"].values():
+                wm["habits"][key] = h
+                _ff_world_save(wm)
+            changed = True
+        m = re.search(r"আমি (.+?) পছন্দ করি", text)
+        if m:
+            like = m.group(1).strip()
+            wm = _ff_world_load()
+            likes = wm["preferences"].get("পছন্দ")
+            if not isinstance(likes, list):
+                likes = []
+            if like and like not in likes:
+                likes.append(like)
+                wm["preferences"]["পছন্দ"] = likes[-20:]
+                _ff_world_save(wm)
+            changed = True
+        return changed
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------- F2: Anticipatory
+def _ff_deadline_hints():
+    """DATA-তে deadline/routine জাতীয় ফাইল থাকলে আগাম ইঙ্গিত বের করে।
+    Desktop v1.0-তে এ ধরনের কোনো ফাইল থাকে না — থাকলে এখানে ধরা পড়বে।"""
+    hints = []
+    try:
+        files = list(DATA.glob("*deadline*.json")) + list(DATA.glob("*routine*.json"))
+    except Exception:
+        files = []
+    today = date.today()
+    for f in files[:4]:
+        try:
+            data = load_json(f, None)
+            items = data if isinstance(data, list) else (
+                data.get("items", []) if isinstance(data, dict) else [])
+            for it in items[:20]:
+                if not isinstance(it, dict):
+                    continue
+                dstr = str(it.get("date") or it.get("deadline") or "")[:10]
+                try:
+                    d = date.fromisoformat(dstr)
+                except Exception:
+                    continue
+                delta = (d - today).days
+                title = str(it.get("title") or it.get("text") or "একটা কাজ")[:60]
+                if delta == 1:
+                    hints.append(f"কাল '{title}'-এর ডেডলাইন — আজই এগিয়ে রাখা ভালো।")
+                elif delta == 0:
+                    hints.append(f"আজই '{title}'-এর ডেডলাইন — সবার আগে এটা দেখো।")
+                elif 2 <= delta <= 3:
+                    hints.append(f"{_ff_num(delta)} দিন পর '{title}'-এর ডেডলাইন আসছে।")
+        except Exception:
+            continue
+    # চলমান মক টেস্টের সময়সীমা
+    try:
+        exam = load_json(_EXAM_SESSION_FILE, None)
+        if isinstance(exam, dict) and exam.get("deadline_ts"):
+            if time.time() > float(exam["deadline_ts"]):
+                hints.append("আগের মক টেস্টের সময় শেষ হয়ে গেছে — ফলটা দেখে নিলে ভালো হয়।")
+    except Exception:
+        pass
+    return hints
+
+
+def anticipatory_text():
+    """আজকের প্রস্তুতির ২–৩ লাইন আগাম সাজেশন; তথ্য না থাকলে সৎ বার্তা।"""
+    lines = []
+    prog = load_json(_STUDY_PROGRESS_FILE, {})
+    if not isinstance(prog, dict):
+        prog = {}
+    for h in _ff_deadline_hints():
+        lines.append("• " + h)
+    weak_all, last_topics, total_sessions = [], [], 0
+    stale_subjects = []
+    for subj, ent in prog.items():
+        if not isinstance(ent, dict):
+            continue
+        total_sessions += int(ent.get("sessions", 0) or 0)
+        for w in (ent.get("weak") or []):
+            weak_all.append((subj, w))
+        if ent.get("last_topic"):
+            last_topics.append((subj, ent["last_topic"]))
+        ld = str(ent.get("last_date") or "")
+        if ld and ld != _ff_today():
+            stale_subjects.append(subj)
+    if weak_all:
+        subj, w = weak_all[-1]
+        lines.append(f"• দুর্বল জায়গা '{w}' ({subj}) — আজ একটু সময় এটার রিভিশনে দিলে পরীক্ষায় কাজে লাগবে।")
+    if stale_subjects and last_topics:
+        subj, topic = last_topics[-1]
+        lines.append(f"• {subj}-এর '{topic}' যেখানে থেমেছিলে, আজ সেখান থেকেই আবার শুরু করলে ধারাবাহিকতা থাকবে।")
+    elif last_topics:
+        subj, topic = last_topics[-1]
+        lines.append(f"• {subj}-এ শেষ পড়েছিলে '{topic}' — আজ তার পরের ধাপটা নিলে ভালো হয়।")
+    if not lines:
+        return ("আজকের প্রস্তুতির আগাম সাজেশন দেওয়ার মতো তথ্য এখনো জমেনি — "
+                "পড়ার রেকর্ড, ডেডলাইন বা রুটিন কিছুই পাইনি। একটা পড়ার সেশন "
+                "শুরু করলেই ('শেখাও' বললেই) কাল থেকে আমি নিজে থেকে সাজেশন দিতে পারব।")
+    return "আজকের প্রস্তুতি (আগাম সাজেশন):\n" + "\n".join(lines[:3])
+
+
+# ------------------------------------------------- F8: Prediction (গতি-ভিত্তিক)
+def prediction_text():
+    """study progress-এর গতি থেকে সংখ্যায় অনুমান। তথ্য অপর্যাপ্ত হলে
+    সংখ্যা বানানো হয় না — সেটাই স্পষ্ট বলা হয়।"""
+    prog = load_json(_STUDY_PROGRESS_FILE, {})
+    if not isinstance(prog, dict) or not prog:
+        return ("পূর্বাভাস দেওয়ার মতো পড়ার রেকর্ড এখনো নেই — আগে কয়েকটা "
+                "পড়ার সেশন হলেই আমি গতি হিসাব করতে পারব। সংখ্যা বানিয়ে বলব না।")
+    total_steps = sum(int(e.get("total_steps", 0) or 0)
+                      for e in prog.values() if isinstance(e, dict))
+    total_sessions = sum(int(e.get("sessions", 0) or 0)
+                         for e in prog.values() if isinstance(e, dict))
+    try:
+        first = get_memory().get("first_day", "")
+        elapsed = (date.today() - date.fromisoformat(str(first)[:10])).days
+    except Exception:
+        elapsed = 0
+    if total_steps < 3 or elapsed < 1:
+        return (f"পূর্বাভাসের জন্য তথ্য এখনো কম (মোট ধাপ {_ff_num(total_steps)}টা, "
+                f"সেশন {_ff_num(total_sessions)}টা, হিসাবের সময়কাল {_ff_num(elapsed)} দিন)। "
+                "আর কয়েকদিন নিয়মিত পড়লেই গতি ধরে সংখ্যায় বলতে পারব — "
+                "এখন অনুমান বানিয়ে বলব না।")
+    rate = total_steps / elapsed  # ধাপ/দিন
+    remaining, known = 0, []
+    try:
+        lessons = OFFLINE_LESSONS
+    except Exception:
+        lessons = {}
+    for subj, ent in prog.items():
+        if subj in lessons and isinstance(ent, dict):
+            total = len(lessons[subj])
+            covered = min(int(ent.get("total_steps", 0) or 0), total)
+            if total - covered > 0:
+                remaining += total - covered
+                known.append(subj)
+    if not known:
+        return ("যেসব বিষয়ে তুমি পড়ছ, সেগুলোর মোট পাঠের সংখ্যা আমার জানা "
+                "পাঠক্রমে নেই — তাই 'বাকি কত' হিসাব করা যাচ্ছে না। গতি শুধু "
+                f"এটুকু বলতে পারি: দিনে গড়ে প্রায় {_ff_num(round(rate, 1))} ধাপ এগোচ্ছ।")
+    import math
+    days = math.ceil(remaining / rate) if rate > 0 else 0
+    return (f"এই গতিতে (দিনে গড়ে প্রায় {_ff_num(round(rate, 1))} ধাপ) জানা পাঠক্রমের "
+            f"বাকি {_ff_num(remaining)}টা ধাপ ({', '.join(known)}) শেষ হতে আনুমানিক "
+            f"{_ff_num(days)} দিন লাগতে পারে। এটা শুধু অফলাইন পাঠক্রমের হিসাব — "
+            "আসল সিলেবাস এর চেয়ে বড় হলে সময়ও বেশি লাগবে।")
+
+
+
+# ------------------------------------------------------------ F4: Projects
+def _ff_projects_load():
+    items = load_json(FF_PROJECTS_FILE, [])
+    return items if isinstance(items, list) else []
+
+
+def _ff_projects_save(items):
+    try:
+        save_json(FF_PROJECTS_FILE, items[-30:])
+    except Exception:
+        pass
+
+
+def _ff_project_current(items):
+    for p in reversed(items):
+        if isinstance(p, dict) and p.get("title"):
+            return p
+    return None
+
+
+def _ff_projects_text():
+    items = _ff_projects_load()
+    if not items:
+        return "এখনো কোনো প্রকল্প নেই। শুরু করতে বলো: 'প্রকল্প শুরু করো: <নাম>'।"
+    lines = ["📁 প্রকল্পের অবস্থা:"]
+    for p in items[-5:]:
+        steps = p.get("steps", []) or []
+        done = sum(1 for s in steps if isinstance(s, dict) and s.get("done"))
+        lines.append(f"• {p.get('title')}: ধাপ {_ff_num(done)}/{_ff_num(len(steps))} শেষ "
+                     f"(শুরু: {p.get('created', '—')})")
+        for i, s in enumerate(steps[:8], 1):
+            if isinstance(s, dict):
+                mark = "✅" if s.get("done") else "⬜"
+                lines.append(f"   {_ff_num(i)}. {mark} {s.get('text', '')}")
+    return "\n".join(lines)
+
+
+def _ff_projects_public():
+    out = []
+    for p in _ff_projects_load()[-10:]:
+        if not isinstance(p, dict):
+            continue
+        steps = [{"text": str(s.get("text", "")), "done": bool(s.get("done"))}
+                 for s in (p.get("steps", []) or []) if isinstance(s, dict)]
+        out.append({"title": str(p.get("title", "")), "created": str(p.get("created", "")),
+                    "steps": steps,
+                    "done": sum(1 for s in steps if s["done"]), "total": len(steps)})
+    return out
+
+
+# --------------------------------------------- F6: Growth diary + metrics
+def _ff_growth_counts():
+    try:
+        mem = get_memory()
+    except Exception:
+        mem = {}
+    rules_n = 0
+    try:
+        rules_n = len([ln for ln in rules_text().splitlines() if ln.strip()])
+    except Exception:
+        pass
+    know_n = 0
+    try:
+        know_n = len(load_json(KNOW_FILE, {}))
+    except Exception:
+        pass
+    return {"facts": len(mem.get("facts", []) or []),
+            "likes": len(mem.get("likes", []) or []),
+            "learned_notes": len(mem.get("learned_notes", []) or []),
+            "rules": rules_n, "knowledge": know_n,
+            "interactions": int(mem.get("interaction_count", 0) or 0)}
+
+
+def _ff_growth_record():
+    """আজকের তারিখ ধরে growth diary-তে এন্ট্রি আপডেট করে (একই দিনে আপডেট)।"""
+    counts = _ff_growth_counts()
+    diary = load_json(FF_GROWTH_FILE, [])
+    if not isinstance(diary, list):
+        diary = []
+    today = _ff_today()
+    entry = {"date": today, **counts}
+    for i, e in enumerate(diary):
+        if isinstance(e, dict) and e.get("date") == today:
+            diary[i] = entry
+            break
+    else:
+        diary.append(entry)
+    try:
+        save_json(FF_GROWTH_FILE, diary[-120:])
+    except Exception:
+        pass
+    return entry, diary
+
+
+def metrics_text():
+    entry, diary = _ff_growth_record()
+    first = diary[0] if diary else entry
+    lines = ["📈 আমার বৃদ্ধির হিসাব:"]
+    lines.append(f"• মনে থাকা তথ্য: {_ff_num(entry['facts'])}টা "
+                 f"(শুরুতে {_ff_num(first.get('facts', 0))}টা)")
+    lines.append(f"• শেখা নোট: {_ff_num(entry['learned_notes'])}টা, "
+                 f"শেখা উত্তর: {_ff_num(entry['knowledge'])}টা")
+    lines.append(f"• তোমার বসানো নিয়ম: {_ff_num(entry['rules'])}টা")
+    lines.append(f"• মোট কথা হয়েছে: {_ff_num(entry['interactions'])} বার")
+    lines.append(f"• ডায়েরিতে রেকর্ড আছে {_ff_num(len(diary))} দিনের "
+                 f"({first.get('date', '—')} থেকে আজ পর্যন্ত)")
+    return "\n".join(lines)
+
+
+# ------------------------------------------ F7: Nightly research (daemon)
+def _ff_research_load():
+    q = load_json(FF_RESEARCH_QUEUE_FILE, [])
+    return q if isinstance(q, list) else []
+
+
+def _ff_research_worker():
+    """প্রতি ঘণ্টায় একবার দেখে: রাত ১–৪টার মধ্যে queue-তে বিষয় থাকলে
+    web_search দিয়ে সারসংক্ষেপ research-notes.md-তে জমা করে।"""
+    while True:
+        try:
+            time.sleep(3600)
+            hour = datetime.now().hour
+            if not (1 <= hour < 4):
+                continue
+            q = _ff_research_load()
+            pending = [it for it in q if isinstance(it, dict)
+                       and it.get("status") in (None, "অপেক্ষায়")]
+            if not pending:
+                continue
+            item = pending[0]
+            topic = str(item.get("topic") or "")[:120]
+            if not topic:
+                item["status"] = "বাদ"
+                save_json(FF_RESEARCH_QUEUE_FILE, q)
+                continue
+            found = web_search(topic, 5)
+            summary = None
+            try:
+                summary = _gemini_or_none(
+                    f"বিষয়: {topic}\nনিচের ওয়েব ফলাফলের ভিত্তিতে ৫-৬ লাইনে "
+                    f"সহজ বাংলায় সারসংক্ষেপ লেখো:\n{found}")
+            except Exception:
+                summary = None
+            body = summary or found
+            try:
+                with FF_RESEARCH_NOTES_FILE.open("a", encoding="utf-8") as f:
+                    f.write(f"\n## {topic} — {_ff_stamp()}\n{body}\n")
+            except Exception:
+                pass
+            item["status"] = "শেষ"
+            item["done"] = _ff_today()
+            try:
+                save_json(FF_RESEARCH_QUEUE_FILE, q)
+            except Exception:
+                pass
+            try:
+                log_change(f"F7 রাতের গবেষণা শেষ: {topic[:60]}")
+            except Exception:
+                pass
+        except Exception:
+            try:
+                time.sleep(600)
+            except Exception:
+                pass
+
+
+_ff_research_started = {"on": False}
+try:
+    if not _ff_research_started["on"]:
+        threading.Thread(target=_ff_research_worker, daemon=True).start()
+        _ff_research_started["on"] = True
+except Exception:
+    pass
+
+
+
+# ------------------------------------------- F3: GUI computer-use (Windows)
+def _ff_is_win():
+    return sys.platform.startswith("win")
+
+
+def _ff_gui_log(step):
+    rec = {"ts": _ff_stamp(), "step": str(step)[:200]}
+    _ff_gui_steps_mem.append(rec)
+    del _ff_gui_steps_mem[:-50]
+    try:
+        old = load_json(FF_GUI_STEPS_FILE, [])
+        if not isinstance(old, list):
+            old = []
+        old.append(rec)
+        save_json(FF_GUI_STEPS_FILE, old[-50:])
+    except Exception:
+        pass
+
+
+def _ff_gui_steps_public():
+    if _ff_gui_steps_mem:
+        return list(_ff_gui_steps_mem[-10:])
+    old = load_json(FF_GUI_STEPS_FILE, [])
+    return old[-10:] if isinstance(old, list) else []
+
+
+def _ff_gui_guard(action_label):
+    """(চালানো যাবে কিনা, না গেলে বার্তা) — config + OS দুই গার্ড।"""
+    try:
+        enabled = bool(get_config().get("computer_use_enabled", False))
+    except Exception:
+        enabled = False
+    if not enabled:
+        return False, ("কম্পিউটার-নিয়ন্ত্রণ (F3) এখন বন্ধ আছে — config-তে "
+                       "computer_use_enabled চালু না করলে আমি কোনো ক্লিক/টাইপ "
+                       "করব না। এটা তোমার নিরাপত্তার জন্যই রাখা।")
+    if not _ff_is_win():
+        return False, ("এই কাজটা শুধু Windows-এ চলবে — GUI নিয়ন্ত্রণ "
+                       "Windows-এর user32 দিয়ে করা হয়; এই মেশিনে সেটা নেই।")
+    return True, ""
+
+
+def gui_mouse_move(x, y):
+    ok, msg = _ff_gui_guard("মাউস সরানো")
+    if not ok:
+        _ff_gui_log(f"মাউস সরানো আটকানো হলো: {msg[:80]}")
+        return False, msg
+    try:
+        import ctypes
+        ctypes.windll.user32.SetCursorPos(int(x), int(y))
+        _ff_gui_log(f"মাউস সরানো হলো: ({x}, {y})")
+        return True, f"মাউসটা ({_ff_num(x)}, {_ff_num(y)}) অবস্থানে সরিয়ে দিলাম।"
+    except Exception as e:
+        return False, f"মাউস সরাতে সমস্যা হলো: {e}"
+
+
+def gui_click(x=None, y=None):
+    ok, msg = _ff_gui_guard("ক্লিক")
+    if not ok:
+        _ff_gui_log(f"ক্লিক আটকানো হলো: {msg[:80]}")
+        return False, msg
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        if x is not None and y is not None:
+            u.SetCursorPos(int(x), int(y))
+            time.sleep(0.15)
+        u.mouse_event(0x0002, 0, 0, 0, 0)   # LEFTDOWN
+        time.sleep(0.05)
+        u.mouse_event(0x0004, 0, 0, 0, 0)   # LEFTUP
+        where = f" ({x}, {y})-তে" if x is not None else ""
+        _ff_gui_log(f"ক্লিক করা হলো{where}")
+        return True, f"ক্লিক করে দিলাম{where}।"
+    except Exception as e:
+        return False, f"ক্লিক করতে সমস্যা হলো: {e}"
+
+
+def gui_type_text(s):
+    ok, msg = _ff_gui_guard("টাইপ")
+    if not ok:
+        _ff_gui_log(f"টাইপ আটকানো হলো: {msg[:80]}")
+        return False, msg
+    try:
+        import ctypes
+
+        class _KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                        ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+        class _MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                        ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                        ("time", ctypes.c_ulong),
+                        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+        class _U(ctypes.Union):
+            _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT),
+                        ("pad", ctypes.c_byte * 32)]
+
+        class _INPUT(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_ulong), ("u", _U)]
+
+        KEYEVENTF_UNICODE, KEYEVENTF_KEYUP = 0x0004, 0x0002
+        send = ctypes.windll.user32.SendInput
+        text = str(s)[:500]
+        for ch in text:
+            for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+                inp = _INPUT()
+                inp.type = 1  # INPUT_KEYBOARD
+                inp.u.ki.wVk = 0
+                inp.u.ki.wScan = ord(ch)
+                inp.u.ki.dwFlags = flags
+                send(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+            time.sleep(0.01)
+        _ff_gui_log(f"টাইপ করা হলো: {text[:60]}")
+        return True, f"টাইপ করে দিলাম: '{text[:60]}'"
+    except Exception as e:
+        return False, f"টাইপ করতে সমস্যা হলো: {e}"
+
+
+def gui_screenshot(path=None):
+    ok, msg = _ff_gui_guard("স্ক্রিনশট")
+    if not ok:
+        _ff_gui_log(f"স্ক্রিনশট আটকানো হলো: {msg[:80]}")
+        return False, msg
+    try:
+        import ctypes
+        import struct
+        u, g = ctypes.windll.user32, ctypes.windll.gdi32
+        w, h = u.GetSystemMetrics(0), u.GetSystemMetrics(1)
+        hdc = u.GetDC(0)
+        mem = g.CreateCompatibleDC(hdc)
+        bmp = g.CreateCompatibleBitmap(hdc, w, h)
+        g.SelectObject(mem, bmp)
+        g.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020)
+
+        class _BIH(ctypes.Structure):
+            _fields_ = [("biSize", ctypes.c_ulong), ("biWidth", ctypes.c_long),
+                        ("biHeight", ctypes.c_long), ("biPlanes", ctypes.c_ushort),
+                        ("biBitCount", ctypes.c_ushort),
+                        ("biCompression", ctypes.c_ulong),
+                        ("biSizeImage", ctypes.c_ulong),
+                        ("biXPels", ctypes.c_long), ("biYPels", ctypes.c_long),
+                        ("biClrUsed", ctypes.c_ulong), ("biClrImp", ctypes.c_ulong)]
+
+        bih = _BIH()
+        bih.biSize, bih.biWidth, bih.biHeight = 40, w, -h
+        bih.biPlanes, bih.biBitCount = 1, 24
+        row = ((w * 3 + 3) // 4) * 4
+        buf = ctypes.create_string_buffer(row * h)
+        g.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bih), 0)
+        out = Path(path) if path else (DATA / f"screenshot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bmp")
+        img_size = row * h
+        header = b"BM" + struct.pack("<IHHI", 54 + img_size, 0, 0, 54)
+        info = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 24, 0, img_size, 2835, 2835, 0, 0)
+        out.write_bytes(header + info + buf.raw)
+        try:
+            g.DeleteObject(bmp)
+            g.DeleteDC(mem)
+            u.ReleaseDC(0, hdc)
+        except Exception:
+            pass
+        _ff_gui_log(f"স্ক্রিনশট সেভ হলো: {out.name}")
+        return True, f"স্ক্রিনশট নিয়ে সেভ করলাম: {out}"
+    except Exception as e:
+        return False, f"স্ক্রিনশট নিতে সমস্যা হলো: {e}"
+
+
+def _ff_gui_run_pending():
+    action, data = _ff_pending.get("action"), _ff_pending.get("data") or {}
+    _ff_pending["action"], _ff_pending["data"] = None, None
+    if action == "click":
+        _, msg = gui_click(data.get("x"), data.get("y"))
+        return msg
+    if action == "move":
+        _, msg = gui_mouse_move(data.get("x"), data.get("y"))
+        return msg
+    if action == "type":
+        _, msg = gui_type_text(data.get("text", ""))
+        return msg
+    if action == "screenshot":
+        _, msg = gui_screenshot()
+        return msg
+    return "কাজটা করা হলো।"
+
+
+def _ff_gui_gate(text, low):
+    stripped = (text or "").strip()
+    if ("বাতিল" in text or stripped in ("না", "না থাক", "থাক", "no")
+            or "cancel" in low):
+        _ff_pending["action"], _ff_pending["data"] = None, None
+        return "বাতিল করে দিলাম — কম্পিউটারে কিছু করা হয়নি।"
+    if any(w in text for w in ("হ্যাঁ", "করো")) or any(
+            w in low for w in ("yes", "confirm", "ok")):
+        return _ff_gui_run_pending()
+    _ff_pending["action"], _ff_pending["data"] = None, None
+    return "বাতিল করে দিলাম — কম্পিউটারে কিছু করা হয়নি।"
+
+
+def _ff_gui_ask(action, data, describe):
+    """confirmation ছাড়া কোনো GUI কাজ হয় না: আগে জিজ্ঞেস, 'হ্যাঁ' এলে কাজ।"""
+    ok, msg = _ff_gui_guard(describe)
+    if not ok:
+        _ff_gui_log(f"{describe} — অনুরোধ এলো কিন্তু গার্ডে আটকালো")
+        return msg
+    _ff_pending["action"], _ff_pending["data"] = action, data
+    return (f"কম্পিউটারে এই কাজটা করতে যাচ্ছি: {describe}। "
+            "নিশ্চিত করতে বলো 'হ্যাঁ' — অন্য কিছু বললেই বাতিল হয়ে যাবে।")
+
+
+# ------------------------------------- N10: Coding agent (sandbox only)
+def _ff_code_extract(raw):
+    if not raw:
+        return ""
+    m = re.search(r"```(?:python|py)?\s*\n(.*?)```", raw, re.S)
+    code = (m.group(1) if m else raw).strip()
+    return code if ("def " in code or "print(" in code or "import " in code
+                    or "=" in code) else ""
+
+
+def _ff_code_compile(path):
+    try:
+        r = subprocess.run([sys.executable, "-m", "py_compile", str(path)],
+                           capture_output=True, text=True, timeout=20)
+        return r.returncode == 0, (r.stderr or "")[-400:]
+    except Exception as e:
+        return False, str(e)[:400]
+
+
+def _ff_coding_do(brief):
+    _ff_ensure_dirs()
+    brief = (brief or "").strip()[:300]
+    if not brief:
+        return "কী বানাব সেটা বলো — যেমন: 'কোড বানাও: দুই সংখ্যার যোগ করার প্রোগ্রাম'।"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = FF_SANDBOX_DIR / f"code-{stamp}.py"
+    code, used_gemini = "", False
+    try:
+        raw = _gemini_or_none(
+            "শুধু Python কোড লিখো (stdlib only, অন্য কোনো ব্যাখ্যা নয়)। "
+            f"কাজ: {brief}\nকোডটা ছোট, চালানো যায় এমন ও নিরাপদ হবে; "
+            "শেষে if __name__ == '__main__': দিয়ে main() ডাকো।")
+        code = _ff_code_extract(raw)
+        used_gemini = bool(code)
+    except Exception:
+        code = ""
+    if not code:
+        safe_brief = brief.replace('"""', "")
+        code = ('# -*- coding: utf-8 -*-\n'
+                f'"""Sokhi coding agent (টেমপ্লেট) — কাজ: {safe_brief}"""\n\n\n'
+                "def main():\n"
+                f'    print("কাজ: {safe_brief}")\n'
+                "    # TODO: মূল লজিক এখানে বসাতে হবে\n\n\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n")
+    try:
+        path.write_text(code, encoding="utf-8")
+    except Exception as e:
+        return f"কোড ফাইল লিখতে পারলাম না: {e}"
+    ok, err = _ff_code_compile(path)
+    fixed_note = ""
+    if not ok and used_gemini:
+        try:
+            raw2 = _gemini_or_none(
+                "নিচের Python কোডে compile error আছে। শুধু ঠিক করা সম্পূর্ণ "
+                f"কোডটাই ফেরত দাও, ব্যাখ্যা নয়।\nError: {err}\nকোড:\n{code}")
+            code2 = _ff_code_extract(raw2)
+            if code2:
+                path.write_text(code2, encoding="utf-8")
+                ok, err = _ff_code_compile(path)
+                fixed_note = " একবার self-fix চেষ্টা করেছি।"
+        except Exception:
+            pass
+    _ff_gui_log(f"কোড বানানো হলো (sandbox): {path.name} — compile {'ok' if ok else 'fail'}")
+    if ok:
+        src = "Gemini দিয়ে" if used_gemini else "টেমপ্লেট দিয়ে (Gemini key নেই/সাড়া দেয়নি)"
+        return (f"কোড বানিয়ে sandbox-এ রাখলাম: data/coding-sandbox/{path.name} "
+                f"({src})। py_compile যাচাই: ✅ পাস।{fixed_note} "
+                "কোডটা নিজে থেকে চালাইনি — তুমি দেখে চালাতে পারো।")
+    return (f"কোড ফাইল বানালাম (data/coding-sandbox/{path.name}) কিন্তু compile "
+            f"যাচাইয়ে পাস করেনি:{fixed_note}\nশেষ error: {err[-200:]}")
+
+
+# ------------------------------------------ N11: Documents / Research
+def _ff_doc_slug(topic):
+    # শুধু ফাইল-নামে নিষিদ্ধ অক্ষর ছাঁটা হয় — বাংলা স্বরচিহ্নসহ বাকি সব থাকে
+    s = re.sub(r'[\\/:*?"<>|#\n\r\t]+', "", str(topic or "")).strip()
+    s = re.sub(r"\s+", "-", s)[:40].strip("-")
+    return s or "report"
+
+
+def _ff_doc_make(topic):
+    _ff_ensure_dirs()
+    topic = (topic or "").strip()[:120]
+    if not topic:
+        return "কোন বিষয়ে রিপোর্ট বানাব? যেমন: 'রিপোর্ট বানাও: ধান চাষে আধুনিক পদ্ধতি'।"
+    found = web_search(topic, 5)
+    summary = None
+    try:
+        summary = _gemini_or_none(
+            f"বিষয়: {topic}\nনিচের ওয়েব অনুসন্ধানের ফলের ভিত্তিতে সহজ "
+            f"বাংলায় একটি ছোট রিপোর্ট লেখো (ভূমিকা, মূল তথ্য, উপসংহার):\n{found}")
+    except Exception:
+        summary = None
+    body = summary or ("(Gemini সারসংক্ষেপ পাওয়া যায়নি — নিচে ওয়েব সার্চের "
+                       "কাঁচা ফল রাখা হলো।)\n\n" + found)
+    fname = f"{_ff_doc_slug(topic)}-{_ff_today()}.md"
+    path = FF_DOCS_DIR / fname
+    if path.exists():
+        path = FF_DOCS_DIR / f"{_ff_doc_slug(topic)}-{datetime.now().strftime('%H%M%S')}.md"
+    content = (f"# রিপোর্ট: {topic}\n\nতারিখ: {_ff_today()}\n"
+               f"তৈরি: Sokhi Desktop v1.1.0 (N11)\n\n{body}\n")
+    try:
+        path.write_text(content, encoding="utf-8")
+    except Exception as e:
+        return f"রিপোর্ট ফাইল লিখতে পারলাম না: {e}"
+    return (f"রিপোর্ট বানিয়ে রাখলাম: data/documents/{path.name} "
+            f"({_ff_num(len(content))} অক্ষর)। খুঁজতে চাইলে বলো: 'নথি খোঁজো: <শব্দ>'।")
+
+
+def _ff_doc_search(word):
+    _ff_ensure_dirs()
+    word = (word or "").strip()
+    if not word:
+        return "কোন শব্দ খুঁজব? যেমন: 'নথি খোঁজো: ধান'।"
+    wl = word.lower()
+    hits, scanned = [], 0
+    seen = set()
+    for base in (FF_DOCS_DIR, DATA):
+        try:
+            files = list(base.rglob("*.md")) + list(base.rglob("*.txt"))
+        except Exception:
+            files = []
+        for f in files[:300]:
+            try:
+                if f in seen or f.stat().st_size > 300_000:
+                    continue
+                seen.add(f)
+                scanned += 1
+                for i, ln in enumerate(
+                        f.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                    if wl in ln.lower():
+                        hits.append(f"• {f.name} (লাইন {_ff_num(i)}): {ln.strip()[:110]}")
+                        if len(hits) >= 10:
+                            break
+            except Exception:
+                continue
+            if len(hits) >= 10:
+                break
+        if len(hits) >= 10:
+            break
+    if not hits:
+        return (f"'{word}' শব্দটা কোনো নথিতে পেলাম না "
+                f"({_ff_num(scanned)}টা .md/.txt ফাইল খুঁজেছি)।")
+    return (f"'{word}' — {_ff_num(len(hits))}টা মিল পেলাম "
+            f"({_ff_num(scanned)}টা ফাইলে খুঁজে):\n" + "\n".join(hits))
+
+
+# ------------------------------------------ N14/F5: Bridge (Desktop side)
+def bridge_sync_text():
+    _bridge_dirs()
+    try:
+        enabled = bool(get_config().get("bridge_enabled", False))
+    except Exception:
+        enabled = False
+    out_files = sorted(BRIDGE_OUTBOX.glob("*.json"))
+    in_files = sorted(BRIDGE_INBOX.glob("*.json"))
+    legacy = load_json(BRIDGE_QUEUE_FILE, [])
+    legacy_n = len(legacy) if isinstance(legacy, list) else 0
+    lines = ["🌉 Bridge-এর অবস্থা (Desktop দিক):"]
+    lines.append(f"• bridge_enabled config: {'চালু' if enabled else 'বন্ধ'}")
+    lines.append(f"• outbox-এ অপেক্ষমাণ ফাইল: {_ff_num(len(out_files))}টা "
+                 f"(পুরনো queue: {_ff_num(legacy_n)}টা)")
+    lines.append(f"• inbox-এ আসা ফাইল: {_ff_num(len(in_files))}টা")
+    if in_files:
+        last = load_json(in_files[-1], {})
+        if isinstance(last, dict) and last:
+            lines.append(f"• সর্বশেষ inbox বার্তা [{last.get('kind', '?')}]: "
+                         f"{str(last.get('text', ''))[:120]}")
+        lines.append("সব পড়তে বলো: 'ব্রিজের বার্তা পড়ো'।")
+    else:
+        lines.append("• inbox এখনো খালি — Muse/WhatsApp-পক্ষের worker "
+                     "এখানে ফাইল রাখলেই আমি পড়তে পারব।")
+    return "\n".join(lines)
+
+
+def _ff_bridge_read_inbox():
+    _bridge_dirs()
+    in_files = sorted(BRIDGE_INBOX.glob("*.json"))
+    if not in_files:
+        return ("inbox-এ এখনো কিছু আসেনি। Muse/WhatsApp-পক্ষের worker "
+                "এখানে {kind, text, ts} ফরম্যাটে ফাইল রাখলেই আমি পড়তে পারব।")
+    lines = [f"inbox-এর সর্বশেষ {_ff_num(min(3, len(in_files)))}টা বার্তা:"]
+    for f in in_files[-3:]:
+        d = load_json(f, {})
+        if isinstance(d, dict):
+            lines.append(f"• [{d.get('kind', '?')} · {d.get('ts', '—')}] "
+                         f"{str(d.get('text', ''))[:180]}")
+        else:
+            lines.append(f"• {f.name}: (পড়া যায়নি)")
+    return "\n".join(lines)
+
+
+
+# ------------------------------------------------------------- routing
+def fullforms_handle(text, low):
+    """v1.1.0 full-forms কমান্ড রাউটার। মিললে reply string, না মিললে None।
+    কোনো অবস্থাতেই exception ছোড়ে না।"""
+    try:
+        text = (text or "").strip()
+        if not text:
+            return None
+        low = low or text.lower()
+        _ff_ensure_dirs()
+
+        # ০) F3 pending confirmation — _n8 ধাঁচে আগে নিষ্পত্তি
+        if _ff_pending.get("action"):
+            return _ff_gui_gate(text, low)
+
+        # হালকা world-model হুক (নীরব)
+        _ff_world_learn(text)
+
+        # ---- F1: World Model
+        if "বিশ্ব মডেল" in text or "world model" in low or "আমার সম্পর্কে কী জানো" in text:
+            return world_model_text()
+        m = re.search(r"লক্ষ্য যোগ করো[:\- ]+(.+)", text)
+        if m:
+            g = m.group(1).strip().rstrip("।.")
+            if g:
+                world_model_update("goals", g)
+                return f"লক্ষ্যটা world model-এ যোগ করে দিলাম: {g}"
+            return "লক্ষ্য হিসেবে কী যোগ করব, সেটা বলো।"
+
+        # ---- F2: Anticipatory
+        if ("আজকের প্রস্তুতি" in text or "আগাম সাজেশন" in text
+                or "আজ কী পড়ব" in text or "আজকের সাজেশন" in text):
+            return anticipatory_text()
+
+        # ---- F8: Prediction
+        if ("শেষ হতে কতদিন" in text or "কত দিনে শেষ" in text
+                or "কতদিন লাগবে" in text or "পূর্বাভাস" in text):
+            return prediction_text()
+
+        # ---- F6: Growth
+        if ("কতটা বেড়েছ" in text or "বৃদ্ধির হিসাব" in text
+                or "তোমার অগ্রগতি" in text):
+            return metrics_text()
+
+        # ---- N14/F5: Bridge
+        m = re.search(r"ব্রিজে পাঠাও[:\- ]+(.+)", text, re.S)
+        if m:
+            n = bridge_enqueue(m.group(1).strip())
+            return (f"বার্তাটা bridge outbox-এ রেখে দিলাম (queue-তে মোট "
+                    f"{_ff_num(n)}টা)। Muse-পক্ষের worker নিলেই কাজ হবে।")
+        if "ব্রিজের বার্তা পড়ো" in text or "ব্রিজের বার্তা দেখাও" in text:
+            return _ff_bridge_read_inbox()
+        if "ব্রিজের অবস্থা" in text or "bridge status" in low or "ব্রিজ স্ট্যাটাস" in text:
+            return bridge_sync_text()
+
+        # ---- F4: Projects
+        m = re.search(r"প্রকল্প শুরু করো[:\- ]+(.+)", text)
+        if m:
+            title = m.group(1).strip()[:80]
+            items = _ff_projects_load()
+            items.append({"title": title, "steps": [], "created": _ff_today()})
+            _ff_projects_save(items)
+            return (f"প্রকল্প শুরু হলো: {title}। ধাপ যোগ করতে বলো: "
+                    "'প্রকল্পের ধাপ যোগ করো: <ধাপ>'।")
+        m = re.search(r"প্রকল্পের ধাপ যোগ করো[:\- ]+(.+)", text)
+        if m:
+            step = m.group(1).strip()[:160]
+            items = _ff_projects_load()
+            cur = _ff_project_current(items)
+            if not cur:
+                return "আগে একটা প্রকল্প শুরু করো: 'প্রকল্প শুরু করো: <নাম>'।"
+            cur.setdefault("steps", []).append({"text": step, "done": False})
+            _ff_projects_save(items)
+            return f"'{cur.get('title')}' প্রকল্পে ধাপ যোগ হলো: {step}"
+        m = re.search(r"ধাপ শেষ(?: করো)?[:\- ]*([০-৯0-9]+)", text)
+        if m:
+            try:
+                n = int(_ff_norm(m.group(1)))
+            except Exception:
+                n = 0
+            items = _ff_projects_load()
+            cur = _ff_project_current(items)
+            if not cur:
+                return "কোনো প্রকল্পই নেই — ধাপ শেষ করার কিছু নেই।"
+            steps = cur.get("steps", []) or []
+            if not (1 <= n <= len(steps)):
+                return (f"'{cur.get('title')}'-এ মোট {_ff_num(len(steps))}টা ধাপ আছে — "
+                        f"{_ff_num(n)} নম্বর ধাপ নেই।")
+            steps[n - 1]["done"] = True
+            _ff_projects_save(items)
+            done = sum(1 for s in steps if s.get("done"))
+            return (f"ধাপ {_ff_num(n)} শেষ বলে চিহ্নিত করলাম ('{cur.get('title')}')। "
+                    f"অগ্রগতি: {_ff_num(done)}/{_ff_num(len(steps))} ধাপ শেষ।")
+        if "প্রকল্পের অবস্থা" in text or "প্রকল্প দেখাও" in text:
+            return _ff_projects_text()
+
+        # ---- F7: Research queue
+        m = re.search(r"গবেষণার বিষয়[:\- ]+(.+)", text)
+        if m:
+            topic = m.group(1).strip()[:120]
+            q = _ff_research_load()
+            q.append({"topic": topic, "added": _ff_today(), "status": "অপেক্ষায়"})
+            try:
+                save_json(FF_RESEARCH_QUEUE_FILE, q[-30:])
+            except Exception:
+                pass
+            return (f"গবেষণার বিষয় queue-তে রাখলাম: {topic}। রাত ১–৪টার মধ্যে "
+                    "আমি নিজে গবেষণা করে research-notes-এ সারসংক্ষেপ রেখে দেব।")
+        if "গবেষণার তালিকা" in text or "গবেষণার অবস্থা" in text:
+            q = _ff_research_load()
+            if not q:
+                return "গবেষণার queue এখন খালি। বিষয় দিতে বলো: 'গবেষণার বিষয়: <বিষয়>'।"
+            lines = ["🔬 গবেষণার queue:"]
+            for it in q[-8:]:
+                if isinstance(it, dict):
+                    lines.append(f"• {it.get('topic', '')} — {it.get('status', 'অপেক্ষায়')}")
+            return "\n".join(lines)
+
+        # ---- N10: Coding agent
+        m = re.search(r"কোড বানাও[:\- ]+(.+)", text, re.S)
+        if m:
+            return _ff_coding_do(m.group(1))
+
+        # ---- N11: Documents / Research
+        m = re.search(r"রিপোর্ট বানাও[:\- ]+(.+)", text)
+        if m:
+            return _ff_doc_make(m.group(1))
+        m = re.search(r"নথি খোঁজো[:\- ]+(.+)", text)
+        if m:
+            return _ff_doc_search(m.group(1))
+
+        # ---- F3: GUI computer-use (সবসময় আগে confirmation)
+        if "স্ক্রিনশট" in text and ("নাও" in text or "তোলো" in text or "নিয়ে" in text):
+            return _ff_gui_ask("screenshot", {}, "স্ক্রিনশট নেওয়া")
+        m = re.search(r"কম্পিউটারে টাইপ করো[:\- ]+(.+)", text, re.S)
+        if m:
+            return _ff_gui_ask("type", {"text": m.group(1).strip()[:200]},
+                               f"টাইপ করা: '{m.group(1).strip()[:60]}'")
+        m = re.search(r"মাউস (?:সরাও|নাড়াও|নাও)[:\- ]*([০-৯0-9]+)[ ,]+([০-৯0-9]+)", text)
+        if m:
+            x, y = int(_ff_norm(m.group(1))), int(_ff_norm(m.group(2)))
+            return _ff_gui_ask("move", {"x": x, "y": y}, f"মাউস সরানো ({x}, {y})-তে")
+        if ("ক্লিক করো" in text or "কম্পিউটারে ক্লিক" in text) and (
+                "কম্পিউটার" in text or "মাউস" in text or "স্ক্রিন" in text
+                or "এখানে" in text):
+            m = re.search(r"([০-৯0-9]+)[ ,]+([০-৯0-9]+)", text)
+            if m:
+                x, y = int(_ff_norm(m.group(1))), int(_ff_norm(m.group(2)))
+                return _ff_gui_ask("click", {"x": x, "y": y}, f"ক্লিক করা ({x}, {y})-তে")
+            return _ff_gui_ask("click", {"x": None, "y": None},
+                               "মাউসের বর্তমান জায়গায় ক্লিক করা")
+        return None
+    except Exception:
+        return None
+
+
+def fullforms_panels():
+    """Visual Hub-এর জন্য JSON-serializable dict। কখনো exception ছোড়ে না।"""
+    try:
+        counts = _ff_growth_counts()
+    except Exception:
+        counts = {}
+    try:
+        bridge = {"enabled": bool(get_config().get("bridge_enabled", False)),
+                  "outbox": _bridge_count(BRIDGE_OUTBOX),
+                  "inbox": _bridge_count(BRIDGE_INBOX)}
+        try:
+            legacy = load_json(BRIDGE_QUEUE_FILE, [])
+            bridge["legacy_queue"] = len(legacy) if isinstance(legacy, list) else 0
+        except Exception:
+            bridge["legacy_queue"] = 0
+    except Exception:
+        bridge = {"enabled": False, "outbox": 0, "inbox": 0, "legacy_queue": 0}
+    try:
+        projects = _ff_projects_public()
+    except Exception:
+        projects = []
+    try:
+        gui_steps = _ff_gui_steps_public()
+    except Exception:
+        gui_steps = []
+    try:
+        wm = _ff_world_load()
+        growth = dict(counts)
+        growth["goals"] = len(wm.get("goals", []) or [])
+        growth["people"] = len(wm.get("people", {}) or {})
+        diary = load_json(FF_GROWTH_FILE, [])
+        growth["diary_days"] = len(diary) if isinstance(diary, list) else 0
+    except Exception:
+        growth = dict(counts)
+    return {"projects": projects, "gui_steps": gui_steps,
+            "bridge": bridge, "growth": growth}
 
 def handle_message(text):
     text = (text or "").strip()
@@ -3071,6 +4435,13 @@ def handle_message(text):
         if _n8:
             return _n8
 
+        # --- v1.1 full-forms: F1 world model, F2 আগাম-প্রস্তুতি, F3 GUI
+        # computer-use, F4 প্রকল্প, F6 growth, F7 গবেষণা, F8 prediction,
+        # N10 কোডিং, N11 নথি/রিপোর্ট, bridge (Desktop দিক)
+        _ff = fullforms_handle(text, low)
+        if _ff:
+            return _ff
+
         # --- PC commands (allow-list)
         if any(w in low for w in ("খোলো", "খুলে দাও", "open ", "open")) and len(low) < 60:
             return pc_open(text)
@@ -3173,66 +4544,93 @@ HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root{
- --accent:#22b8f0; --accent2:#0b5cad; --deep:#0b3d91; --bg:#050a18; --panel:#0d2138cc; --line:#1d5f8a; --txt:#dff6ff;
+ --accent:#3aa6d6; --accent2:#256f96; --deep:#12314a;
+ --bg:#0a0e16; --panel:#121926; --panel2:#182233; --line:#263449;
+ --txt:#e8eef6; --muted:#93a3b8;
+ --radius:12px; --radius-sm:8px;
+ --shadow:0 1px 2px rgba(0,0,0,.28),0 6px 20px rgba(0,0,0,.16);
 }
-body[data-theme="blue"]{--accent:#22b8f0;--accent2:#0b5cad;--deep:#0b3d91;--bg:#050a18;--line:#1d5f8a}
-body[data-theme="purple"]{--accent:#b06cf0;--accent2:#6d28b8;--deep:#3b1470;--bg:#0d0518;--line:#5b2a9d}
-body[data-theme="gold"]{--accent:#f0b822;--accent2:#b8860b;--deep:#7a5a06;--bg:#141003;--line:#8a6d1d}
-body[data-theme="pink"]{--accent:#f06cae;--accent2:#b8326e;--deep:#70143c;--bg:#180510;--line:#9d2a5f}
+body[data-theme="blue"]{--accent:#3aa6d6;--accent2:#256f96;--deep:#12314a;--bg:#0a0e16;--line:#263449}
+body[data-theme="purple"]{--accent:#9b7ed0;--accent2:#6b4fa3;--deep:#2b1e47;--bg:#0e0a16;--line:#372e4d}
+body[data-theme="gold"]{--accent:#c9a227;--accent2:#8a6d1a;--deep:#3d2f08;--bg:#100d06;--line:#3d3620}
+body[data-theme="pink"]{--accent:#d67ba8;--accent2:#9c4a76;--deep:#3d1a2b;--bg:#120a10;--line:#40283a}
 *{box-sizing:border-box}
-body{margin:0;font-family:'Hind Siliguri','Segoe UI',sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;padding-bottom:96px;transition:background .4s}
-.tagline{text-align:center;font-size:11.5px;letter-spacing:.4px;opacity:.62;padding:8px 14px 0;line-height:1.5}
-header{text-align:center;padding:6px 8px 2px}
-h1{margin:2px 0 0;font-size:22px;letter-spacing:3px}
-.sub{opacity:.78;font-size:13px}
-#layout{display:grid;grid-template-columns:300px minmax(0,1fr) 400px;gap:12px;max-width:1560px;margin:8px auto;padding:0 10px;align-items:start}
-@media(max-width:1080px){#layout{grid-template-columns:1fr}}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px;margin-bottom:12px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
-.card h3{margin:0 0 8px;font-size:15px}
-.card .body{font-size:13.5px;line-height:1.55;white-space:pre-wrap;opacity:.94}
-.small{font-size:12px;opacity:.7}
-#orb{width:280px;height:300px;margin:2px auto;position:relative;cursor:pointer}
+html,body{height:100%;overflow:hidden}
+body{margin:0;font-family:'Hind Siliguri','Segoe UI',sans-serif;background:var(--bg);color:var(--txt);height:100vh;display:flex;flex-direction:column;font-size:15px;line-height:1.55;transition:background .4s}
+.tagline{flex:none;text-align:center;font-size:11px;letter-spacing:.03em;color:var(--muted);padding:8px 16px 0;line-height:1.5}
+header{flex:none;text-align:center;padding:4px 16px 8px}
+h1{margin:4px 0 0;font-size:20px;font-weight:600;letter-spacing:.14em}
+.sub{color:var(--muted);font-size:13px}
+#main{flex:1;min-height:0;min-width:0}
+#layout{display:grid;grid-template-columns:288px minmax(0,1fr) 400px;gap:16px;height:100%;min-height:0;max-width:1560px;width:100%;margin:0 auto;padding:8px 16px 12px;align-items:stretch}
+#leftcol,#centercol,#rightcol{min-height:0;min-width:0;display:flex;flex-direction:column}
+#leftcol{overflow-y:auto;overflow-x:hidden;padding-right:2px}
+#centercol{overflow-y:auto;overflow-x:hidden;padding:0 4px}
+#rightcol{overflow:hidden}
+@media(max-width:1080px){
+ #layout{grid-template-columns:1fr;grid-template-rows:minmax(96px,26%) auto minmax(0,1fr)}
+ #leftcol{max-height:100%}
+ #centercol{max-height:300px}
+ #rightcol{min-height:0}
+}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:12px;box-shadow:var(--shadow);flex:none;display:flex;flex-direction:column;min-height:0}
+.card h3{margin:0 0 8px;font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+.card .body{font-size:13.5px;line-height:1.6;white-space:pre-wrap}
+.small{font-size:12px;color:var(--muted)}
+#weather,#news{overflow-y:auto;min-height:0;max-height:24vh}
+#hubsteps{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7;white-space:pre-wrap;overflow-y:auto;min-height:0;max-height:24vh}
+#board{overflow-y:auto;min-height:0;max-height:18vh}
+#orb{width:280px;height:300px;margin:8px auto 0;position:relative;cursor:pointer;flex:none}
 #orb canvas{display:block;width:280px;height:300px}
-#orb.talking{filter:brightness(1.25)}
-.nodes{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:6px 0 2px}
-.nodes button{font-size:13px;padding:8px 12px;border-radius:999px}
-#chat{display:flex;flex-direction:column;gap:8px;min-height:200px}
-.msg{max-width:88%;padding:9px 12px;border-radius:14px;white-space:pre-wrap;line-height:1.5;font-size:15px;display:flex;gap:8px;align-items:flex-start}
-.me{align-self:flex-end;background:var(--accent2)}
-.sokhi{align-self:flex-start;background:#ffffff10;border:1px solid var(--line);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+#orb.talking{filter:brightness(1.2)}
+.nodes{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:12px 0 4px;flex:none}
+.nodes button{font-size:13px;padding:8px 14px;border-radius:999px}
+#chat{display:flex;flex-direction:column;gap:8px;flex:1;min-height:0;overflow-y:auto;padding:2px 6px 8px 2px}
+.msg{max-width:88%;padding:10px 14px;border-radius:var(--radius);white-space:pre-wrap;line-height:1.55;font-size:15px;display:flex;gap:8px;align-items:flex-start}
+.me{align-self:flex-end;background:var(--accent2);color:#fff}
+.sokhi{align-self:flex-start;background:var(--panel2);border:1px solid var(--line)}
 .avatar{flex:0 0 auto;width:24px;height:24px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#ffffffcc,var(--accent) 55%,var(--deep));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#04101f;margin-top:1px}
-#bar{position:fixed;left:0;right:0;bottom:0;background:#02040add;padding:10px;display:flex;gap:8px;max-width:820px;margin:0 auto;z-index:40}
-input,button,select,textarea{font-family:inherit;font-size:15px;border-radius:10px;border:1px solid var(--line);background:#0a1a2f;color:var(--txt);padding:9px}
-input{flex:1} button{cursor:pointer;background:var(--accent2)}
+#bar{flex:none;display:flex;gap:8px;align-items:center;width:100%;max-width:820px;margin:0 auto;padding:0 16px 12px;background:transparent;z-index:40}
+input,button,select,textarea{font-family:inherit;font-size:15px;border-radius:var(--radius-sm);border:1px solid var(--line);background:#0d1524;color:var(--txt);padding:9px 12px}
+input{flex:1;min-width:0}
+button{cursor:pointer;background:var(--panel2);transition:border-color .15s,background .15s}
+button:hover{border-color:var(--accent)}
 textarea{width:100%;resize:vertical}
-.quick{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-.quick button{font-size:13px;padding:7px 10px}
-#pinbox{max-width:420px;margin:30px auto;background:var(--panel);padding:18px;border-radius:14px;text-align:center;border:1px solid var(--line)}
-#gear{position:fixed;top:10px;right:10px;width:42px;height:42px;border-radius:50%;font-size:19px;padding:0;z-index:50}
-#modal{display:none;position:fixed;inset:0;background:#02040acc;z-index:60;overflow:auto}
-#modal .panel{max-width:460px;margin:40px auto;background:#0d2138;border:1px solid var(--line);border-radius:16px;padding:18px}
-#modal .panel h3{margin:0 0 8px;font-size:16px}
-#livebtn.on{background:#a00f2d;border-color:#ff5577}
-.tabs{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
-.tabs button{font-size:13.5px;padding:8px 11px;border-radius:999px;opacity:.75}
-.tabs button.on{opacity:1;background:var(--accent);color:#04101f;font-weight:600}
+input[type=range]{flex:1;padding:0;accent-color:var(--accent)}
+.quick{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;flex:none}
+.quick button{font-size:13px;padding:7px 12px;border-radius:999px}
+#pinbox{max-width:420px;margin:32px auto;background:var(--panel);padding:24px;border-radius:var(--radius);text-align:center;border:1px solid var(--line);box-shadow:var(--shadow)}
+#gear{position:fixed;top:10px;right:10px;width:42px;height:42px;border-radius:50%;font-size:18px;padding:0;z-index:50;box-shadow:var(--shadow)}
+#modal{display:none;position:fixed;inset:0;background:rgba(2,4,10,.72);z-index:60;overflow:hidden}
+#modal .panel{max-width:480px;max-height:calc(100vh - 48px);overflow-y:auto;min-height:0;margin:24px auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px;box-shadow:var(--shadow)}
+#modal .panel h3{margin:0 0 12px;font-size:16px;font-weight:600}
+#modal hr{border:none;border-top:1px solid var(--line);margin:16px 0}
+#ruleslist{overflow-y:auto;min-height:0;max-height:30vh}
+#livebtn.on{background:#8c1d33;border-color:#c94f6d;color:#fff}
+.tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;flex:none}
+.tabs button{font-size:13.5px;padding:8px 14px;border-radius:999px;color:var(--muted)}
+.tabs button.on{color:#04101f;background:var(--accent);border-color:var(--accent);font-weight:600}
 .tabpane{display:none}
-.tabpane.on{display:block}
-.agentcard{border:1px solid var(--line);border-radius:12px;padding:9px 11px;margin-bottom:8px;background:#ffffff08;font-size:13.5px}
-.agentcard .st{font-size:12px;opacity:.8}
-.step{font-size:12.5px;opacity:.85}
-.themebtns{display:flex;gap:6px;flex-wrap:wrap}
-.themebtns button{font-size:13px;padding:7px 11px}
-#examchip{display:none;align-items:center;gap:8px;background:#a00f2d;border:1px solid #ff5577;border-radius:999px;padding:5px 12px;font-size:13.5px;width:max-content;margin:8px auto}
-#examform{display:none;margin-top:10px}
-#examform .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tabpane.on{display:flex;flex-direction:column;flex:1;min-height:0}
+#agentlist{flex:1;min-height:0;overflow-y:auto;padding-right:4px}
+#noteslist,#tasklist{overflow-y:auto;min-height:0;flex:1;margin-top:8px;padding-right:4px}
+.agentcard{border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;margin-bottom:8px;background:var(--panel);font-size:13.5px;box-shadow:var(--shadow)}
+.agentcard .st{font-size:12px;color:var(--muted)}
+.step{font-size:12.5px;color:var(--muted)}
+.themebtns{display:flex;gap:8px;flex-wrap:wrap}
+.themebtns button{font-size:13px;padding:7px 12px}
+#examchip{display:none;align-items:center;gap:8px;background:#8c1d33;border:1px solid #c94f6d;border-radius:999px;padding:5px 12px;font-size:13.5px;width:max-content;margin:8px auto;flex:none}
+#examform{display:none;margin-top:12px}
+#examform .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 #examform input[type=number]{flex:0 0 84px}
-#idle{display:none;position:fixed;inset:0;background:#02040af2;z-index:90;text-align:center;padding-top:14vh;cursor:pointer}
+#idle{display:none;position:fixed;inset:0;background:rgba(2,4,10,.96);z-index:90;text-align:center;padding-top:14vh;cursor:pointer}
 #idle .clock{font-size:84px;font-weight:700;letter-spacing:2px}
-#idle .date{font-size:22px;opacity:.85;margin-top:6px}
-#idle .wx{font-size:16px;opacity:.7;margin-top:14px;white-space:pre-wrap}
-#hubsteps{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7;white-space:pre-wrap}
-.listitem{border-bottom:1px dashed #ffffff22;padding:6px 0;font-size:14px;white-space:pre-wrap}
+#idle .date{font-size:22px;color:var(--muted);margin-top:8px}
+#idle .wx{font-size:16px;color:var(--muted);margin-top:16px;white-space:pre-wrap}
+.listitem{border-bottom:1px solid var(--line);padding:8px 0;font-size:14px;white-space:pre-wrap}
+.secttl{font-size:14px;font-weight:600;margin-bottom:4px}
+.statline{font-size:13px;color:var(--muted);margin-bottom:8px}
+.hint{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5}
 </style></head><body data-theme="blue">
 <div class="tagline">Sokhi is the world's first Sci-Fi AI Desktop Experience — built for those who grew up dreaming of JARVIS, and refused to settle for boring software.</div>
 <header>
@@ -3242,9 +4640,9 @@ textarea{width:100%;resize:vertical}
 <button id="gear" title="সেটিংস" onclick="openSettings()">⚙️</button>
 <div id="modal" onclick="if(event.target===this)this.style.display='none'">
  <div class="panel">
-  <h3>⚙️ সেটিংস</h3>
-  <div style="font-size:14px;margin-bottom:4px">স্মার্ট মাথা (Gemini ফ্রি key)</div>
-  <div id="keystat" style="font-size:13px;opacity:.85;margin-bottom:8px">key-র অবস্থা জানা যাচ্ছে…</div>
+  <h3>সেটিংস</h3>
+  <div class="secttl">স্মার্ট মাথা (Gemini ফ্রি key)</div>
+  <div id="keystat" class="statline">key-র অবস্থা জানা যাচ্ছে…</div>
   <input id="apikey" type="password" placeholder="Gemini key বসাও (শুধু এই ল্যাপটপেই থাকবে)" style="width:100%;margin-bottom:8px">
   <div style="display:flex;gap:6px;flex-wrap:wrap">
    <button onclick="saveKey()">সেভ করো</button>
@@ -3252,44 +4650,53 @@ textarea{width:100%;resize:vertical}
    <button onclick="clearKey()">key মোছো</button>
   </div>
   <div id="keymsg" style="font-size:13px;margin-top:8px"></div>
-  <div style="font-size:12px;opacity:.7;margin-top:6px">key কাউকে পাঠাবে না — এই ঘরে বসালেই শুধু এই ল্যাপটপে সেভ থাকে।</div>
-  <hr style="border-color:var(--line);margin:14px 0">
-  <div style="font-size:14px;margin-bottom:4px">আমাকে যে নামে ডাকবে</div>
+  <div class="hint">key কাউকে পাঠাবে না — এই ঘরে বসালেই শুধু এই ল্যাপটপে সেভ থাকে।</div>
+  <hr>
+  <div class="secttl">আমাকে যে নামে ডাকবে</div>
   <div style="display:flex;gap:6px">
    <input id="callname" type="text" placeholder="যেমন: সোনা / জান (ফাঁকা রাখলে নাম ছাড়া)" style="flex:1">
    <button onclick="saveCall()">সেভ</button>
   </div>
-  <div style="font-size:12px;opacity:.7;margin-top:6px">চ্যাটে বললেও হবে: "আমাকে সোনা বলে ডাকো"। Sokhi আর ভাইয়া বলে ডাকবে না।</div>
-  <hr style="border-color:var(--line);margin:14px 0">
-  <div style="font-size:14px;margin-bottom:4px">গলা (ভয়েস)</div>
-  <div id="voicestat" style="font-size:13px;opacity:.85;margin-bottom:8px">গলার অবস্থা জানা যাচ্ছে…</div>
-  <button onclick="testVoice()">🔊 গলা টেস্ট করো</button>
-  <div style="font-size:13px;margin-top:10px">গলার টোন:
+  <div class="hint">চ্যাটে বললেও হবে: "আমাকে সোনা বলে ডাকো"। Sokhi আর ভাইয়া বলে ডাকবে না।</div>
+  <hr>
+  <div class="secttl">গলা (ভয়েস)</div>
+  <div id="voicestat" class="statline">গলার অবস্থা জানা যাচ্ছে…</div>
+  <div id="voiceengine" class="statline"></div>
+  <button onclick="testVoice()">গলা টেস্ট করো</button>
+  <div style="font-size:13px;margin-top:12px">গলার টোন:
    <select id="tonepreset" onchange="saveTone()"><option>মিষ্টি</option><option>স্বাভাবিক</option><option>প্রাণবন্ত</option></select>
   </div>
-  <hr style="border-color:var(--line);margin:14px 0">
-  <div style="font-size:14px;margin-bottom:6px">🎨 রঙের থিম</div>
-  <div class="themebtns">
-   <button onclick="setTheme('blue')">🔵 নীল</button>
-   <button onclick="setTheme('purple')">🟣 বেগুনি</button>
-   <button onclick="setTheme('gold')">🟡 সোনালি</button>
-   <button onclick="setTheme('pink')">🌸 গোলাপি</button>
+  <div style="font-size:13px;margin-top:12px">
+   <label for="voicerate">গলার গতি: <span id="voicerateval">1.00×</span></label>
+   <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
+    <span class="small">ধীর</span>
+    <input id="voicerate" type="range" min="0.8" max="1.2" step="0.05" value="1" oninput="voiceRateInput()" onchange="saveVoiceRate()">
+    <span class="small">দ্রুত</span>
+   </div>
   </div>
-  <hr style="border-color:var(--line);margin:14px 0">
-  <div style="font-size:14px;margin-bottom:4px">GitHub — নিজে আপডেটের ঠিকানা</div>
-  <div id="ghstat" style="font-size:13px;opacity:.85;margin-bottom:8px">…</div>
+  <hr>
+  <div class="secttl" style="margin-bottom:6px">রঙের থিম</div>
+  <div class="themebtns">
+   <button onclick="setTheme('blue')">নীল</button>
+   <button onclick="setTheme('purple')">বেগুনি</button>
+   <button onclick="setTheme('gold')">সোনালি</button>
+   <button onclick="setTheme('pink')">গোলাপি</button>
+  </div>
+  <hr>
+  <div class="secttl">GitHub — নিজে আপডেটের ঠিকানা</div>
+  <div id="ghstat" class="statline">…</div>
   <div style="display:flex;gap:6px">
    <input id="updateurl" type="text" placeholder="raw manifest.json-এর লিংক বসাও" style="flex:1">
    <button onclick="saveUrl()">সেভ</button>
   </div>
-  <div style="font-size:12px;opacity:.7;margin-top:6px">লিংক বসালেই Sokhi GitHub থেকে নিজে নতুন ভার্সন এনে বসাতে পারবে। ধাপগুলো Saba-র গাইডে আছে।</div>
-  <hr style="border-color:var(--line);margin:14px 0">
-  <div style="font-size:14px;margin-bottom:4px">নিজে নিজে আপগ্রেড</div>
-  <div id="autostat" style="font-size:13px;opacity:.85;margin-bottom:8px">…</div>
+  <div class="hint">লিংক বসালেই Sokhi GitHub থেকে নিজে নতুন ভার্সন এনে বসাতে পারবে। ধাপগুলো Saba-র গাইডে আছে।</div>
+  <hr>
+  <div class="secttl">নিজে নিজে আপগ্রেড</div>
+  <div id="autostat" class="statline">…</div>
   <button onclick="document.getElementById('modal').style.display='none';quick('আপগ্রেড চেক করো')">এখনই স্ব-আপগ্রেড চেক করো</button>
-  <hr style="border-color:var(--line);margin:14px 0">
+  <hr>
   <div id="rulesec">
-  <div style="font-size:14px;margin-bottom:4px">📋 আমার নিয়ম (N13)</div>
+  <div class="secttl">আমার নিয়ম (N13)</div>
   <div class="small" style="margin-bottom:6px">তুমি যে নিয়ম দেবে, Sokhi সবসময় মেনে চলবে। নতুন নিয়ম যোগ করলে সেটা সেভ হয়ে থাকবে।</div>
   <div id="ruleslist" style="font-size:13.5px;white-space:pre-wrap;margin-bottom:8px">নিয়ম লোড হচ্ছে…</div>
   <div style="display:flex;gap:6px">
@@ -3311,10 +4718,10 @@ textarea{width:100%;resize:vertical}
 <div id="layout">
 
  <div id="leftcol">
-  <div class="card"><h3>🌦️ আবহাওয়া</h3><div class="body" id="weather">লোড হচ্ছে…</div></div>
-  <div class="card"><h3>📰 আজকের headlines</h3><div class="body" id="news">লোড হচ্ছে…</div></div>
-  <div class="card"><h3>🛰️ Visual Hub</h3><div class="small" style="margin-bottom:6px">চলমান agent কাজের ধাপ</div><div id="hubsteps">এখন কোনো কাজ চলছে না।</div></div>
-  <div class="card"><h3>🖍️ Whiteboard</h3><div class="body" id="board">বোর্ড খালি।</div>
+  <div class="card"><h3>আবহাওয়া</h3><div class="body" id="weather">লোড হচ্ছে…</div></div>
+  <div class="card"><h3>আজকের headlines</h3><div class="body" id="news">লোড হচ্ছে…</div></div>
+  <div class="card"><h3>Visual Hub</h3><div class="small" style="margin-bottom:6px">চলমান agent কাজের ধাপ</div><div id="hubsteps">এখন কোনো কাজ চলছে না।</div></div>
+  <div class="card"><h3>Whiteboard</h3><div class="body" id="board">বোর্ড খালি।</div>
    <button style="margin-top:8px;font-size:13px" onclick="clearBoard()">বোর্ড মোছো</button></div>
  </div>
 
@@ -3322,27 +4729,27 @@ textarea{width:100%;resize:vertical}
   <div id="orb" title="কথা থামাতে চাপ দাও"><canvas id="pcanvas" width="280" height="300"></canvas></div>
   <h1 style="text-align:center">SOKHI</h1>
   <div class="nodes">
-   <button onclick="quick('কী কী মনে রেখেছ?')">💾 Memory</button>
-   <button onclick="quick('প্যাটার্ন বিশ্লেষণ করো')">🌌 Soul</button>
-   <button id="skillsnode" onclick="quick('তোমার স্কিলগুলো কী কী?')">🧩 Skills</button>
-   <button onclick="openSettings()">⚙️ Settings</button>
+   <button onclick="quick('কী কী মনে রেখেছ?')">Memory</button>
+   <button onclick="quick('প্যাটার্ন বিশ্লেষণ করো')">Soul</button>
+   <button id="skillsnode" onclick="quick('তোমার স্কিলগুলো কী কী?')">Skills</button>
+   <button onclick="openSettings()">Settings</button>
   </div>
   <div id="examchip"><span id="examtimer">⏳ 00:00</span><button style="font-size:12.5px;padding:4px 10px" onclick="finishExam()">শেষ করো</button></div>
   <div class="quick">
-   <button onclick="quick('আজকের খবর দাও')">📰 খবর</button>
-   <button onclick="quick('আবহাওয়া কেমন?')">🌦️ আবহাওয়া</button>
-   <button onclick="quick('ইউটিউব খোলো')">▶️ YouTube</button>
-   <button onclick="quick('প্যাটার্ন বিশ্লেষণ করো')">🧠 আমার প্যাটার্ন</button>
-   <button onclick="quick('কী কী মনে রেখেছ?')">💾 স্মৃতি</button>
-   <button onclick="quick('তোমার ভার্সন কত?')">🔖 ভার্সন</button>
-   <button onclick="quick('সিস্টেমের অবস্থা দেখাও')">💻 PC-র অবস্থা</button>
-   <button onclick="quick('আমাকে গণিত শেখাও')">🎓 শেখাও</button>
-   <button onclick="quick('কতদূর হলো?')">🤖 কতদূর হলো</button>
-   <button onclick="toggleExamForm()">📝 মক টেস্ট</button>
-   <button onclick="openRules()">📋 নিয়ম</button>
+   <button onclick="quick('আজকের খবর দাও')">খবর</button>
+   <button onclick="quick('আবহাওয়া কেমন?')">আবহাওয়া</button>
+   <button onclick="quick('ইউটিউব খোলো')">YouTube</button>
+   <button onclick="quick('প্যাটার্ন বিশ্লেষণ করো')">আমার প্যাটার্ন</button>
+   <button onclick="quick('কী কী মনে রেখেছ?')">স্মৃতি</button>
+   <button onclick="quick('তোমার ভার্সন কত?')">ভার্সন</button>
+   <button onclick="quick('সিস্টেমের অবস্থা দেখাও')">PC-র অবস্থা</button>
+   <button onclick="quick('আমাকে গণিত শেখাও')">শেখাও</button>
+   <button onclick="quick('কতদূর হলো?')">কতদূর হলো</button>
+   <button onclick="toggleExamForm()">মক টেস্ট</button>
+   <button onclick="openRules()">নিয়ম</button>
   </div>
   <div id="examform" class="card">
-   <h3>📝 মক টেস্ট শুরু করো</h3>
+   <h3>মক টেস্ট শুরু করো</h3>
    <div class="row">
     <select id="examsubject"><option>বাংলা সাহিত্য</option><option>বাংলা ব্যাকরণ</option><option>গণিত</option><option>ইংরেজি</option><option>সাধারণ জ্ঞান</option><option>ICT</option></select>
     <input id="examcount" type="number" value="10" min="1" max="100" title="প্রশ্ন সংখ্যা">
@@ -3355,10 +4762,10 @@ textarea{width:100%;resize:vertical}
 
  <div id="rightcol">
   <div class="tabs">
-   <button id="tabbtn-chat" class="on" onclick="showTab('chat')">💬 চ্যাট</button>
-   <button id="tabbtn-agents" onclick="showTab('agents')">🤖 এজেন্ট</button>
-   <button id="tabbtn-notes" onclick="showTab('notes')">📝 নোট</button>
-   <button id="tabbtn-tasks" onclick="showTab('tasks')">✅ টাস্ক</button>
+   <button id="tabbtn-chat" class="on" onclick="showTab('chat')">চ্যাট</button>
+   <button id="tabbtn-agents" onclick="showTab('agents')">এজেন্ট</button>
+   <button id="tabbtn-notes" onclick="showTab('notes')">নোট</button>
+   <button id="tabbtn-tasks" onclick="showTab('tasks')">টাস্ক</button>
   </div>
   <div class="tabpane on" id="pane-chat"><div id="chat"></div></div>
   <div class="tabpane" id="pane-agents"><div id="agentlist"><div class="small">কোনো agent কাজ নেই।</div></div></div>
@@ -3379,7 +4786,7 @@ textarea{width:100%;resize:vertical}
 <div id="bar">
  <input id="text" placeholder="Sokhi-কে বলো... (বাংলা/Banglish)" onkeydown="if(event.key==='Enter')send()">
  <button onclick="mic()">🎤</button>
- <button id="livebtn" onclick="toggleLive()">🔴 লাইভ</button>
+ <button id="livebtn" onclick="toggleLive()">লাইভ</button>
  <button onclick="send()">পাঠাও</button>
 </div>
 
@@ -3416,15 +4823,25 @@ function showTab(name){
  if(name==='notes')loadNotes();
  if(name==='tasks')loadTasks();
  if(name==='agents')pollAgents()}
+window.voiceRate=window.voiceRate||1;
+function chatDistFromBottom(){
+ const c=document.getElementById('chat');if(!c)return 0;
+ return c.scrollHeight-c.scrollTop-c.clientHeight}
+function scrollChatToBottom(){
+ const c=document.getElementById('chat');if(!c)return;
+ c.scrollTop=c.scrollHeight;
+ requestAnimationFrame(()=>{c.scrollTop=c.scrollHeight})}
 function add(t,who){
+ const c=document.getElementById('chat');
+ const distBefore=c?chatDistFromBottom():0;
  const d=document.createElement('div');d.className='msg '+who;
  if(who==='sokhi'){
   const av=document.createElement('span');av.className='avatar';av.textContent='স';d.appendChild(av);
   const tx=document.createElement('span');tx.textContent=t;d.appendChild(tx);
   d.style.cursor='pointer';d.title='শুনতে চাপ দাও';d.onclick=()=>speak(t)}
  else{d.textContent=t}
- document.getElementById('chat').appendChild(d);
- d.scrollIntoView({behavior:'smooth',block:'end'})}
+ c.appendChild(d);
+ if(who==='me'||distBefore<=120)scrollChatToBottom()}
 let edgeOk=null, speakingNow=false, currentAudio=null, speakToken=0;
 function stopSpeak(){speakToken++;try{speechSynthesis.cancel()}catch(e){} if(currentAudio){try{currentAudio.pause()}catch(e){} currentAudio=null} speakingNow=false;document.getElementById('orb').classList.remove('talking');setMood('calm')}
 function chunksOf(t){
@@ -3440,13 +4857,14 @@ async function edgeSpeak(text,rate){
  return new Promise(res=>{const a=new Audio(url);currentAudio=a;a.onended=()=>{URL.revokeObjectURL(url);if(currentAudio===a)currentAudio=null;res()};a.onerror=()=>res();a.play().catch(()=>res())})}
 function synthSpeak(text,rate){
  return new Promise(res=>{
- try{const u=new SpeechSynthesisUtterance(text);u.lang='bn-BD';u.rate=rate?.8:.92;u.pitch=1.05;
+ try{const u=new SpeechSynthesisUtterance(text);u.lang='bn-BD';u.rate=(rate?.8:.92)*(window.voiceRate||1);u.pitch=1.05;
  const vs=speechSynthesis.getVoices();
  const f=vs.find(v=>/google/i.test(v.name)&&/bn|বাংলা/i.test(v.lang+v.name))||vs.find(v=>/bn/i.test(v.lang)&&/female|নাবনিতা|nabanita/i.test(v.name))||vs.find(v=>/bn/i.test(v.lang))||vs.find(v=>/female/i.test(v.name));
  if(f)u.voice=f;u.onend=()=>res();u.onerror=()=>res();speechSynthesis.speak(u)}catch(e){res()}})}
 async function speak(t,rate){
  const my=++speakToken;speakingNow=true;setMood('speaking');const orb=document.getElementById('orb');orb.classList.add('talking');
- try{for(const c of chunksOf(t)){
+ const chunks=(t&&t.length<180)?[t]:chunksOf(t);
+ try{for(const c of chunks){
   if(my!==speakToken)break;
   if(edgeOk!==false){try{await edgeSpeak(c,rate);edgeOk=true;continue}catch(e){edgeOk=false}}
   if(my!==speakToken)break;
@@ -3458,10 +4876,10 @@ function toggleLive(){liveOn?stopLive():startLive()}
 function startLive(){
  const R=window.SpeechRecognition||window.webkitSpeechRecognition;
  if(!R){alert('এই ব্রাউজারে লাইভ কথা হবে না ল্যাপটপের Chrome-এ খোলো');return}
- liveOn=true;setMood('listening');document.getElementById('livebtn').classList.add('on');document.getElementById('livebtn').textContent='⏹️ লাইভ চালু';
+ liveOn=true;setMood('listening');document.getElementById('livebtn').classList.add('on');document.getElementById('livebtn').textContent='লাইভ চালু';
  add('লাইভ মোড চালু — এখন শুধু কথা বলো, আমি শুনে উত্তর দেব। থামাতে বলো: লাইভ বন্ধ।','sokhi');
  listen()}
-function stopLive(){liveOn=false;setMood('calm');const b=document.getElementById('livebtn');b.classList.remove('on');b.textContent='🔴 লাইভ';
+function stopLive(){liveOn=false;setMood('calm');const b=document.getElementById('livebtn');b.classList.remove('on');b.textContent='লাইভ';
  document.getElementById('orb').classList.remove('listening');try{recog&&recog.abort()}catch(e){}setStatus('লাইভ বন্ধ')}
 function listen(){
  if(!liveOn||speakingNow)return;
@@ -3538,6 +4956,15 @@ async function saveTone(){
  const v=document.getElementById('tonepreset').value;
  await api('/api/settings',{tts_preset:v});edgeOk=null;
  document.getElementById('voicestat').textContent='টোন বদলেছে: '+v+' — টেস্ট করে শোনো';}
+function voiceRateInput(){
+ const el=document.getElementById('voicerate');if(!el)return;
+ const v=parseFloat(el.value)||1;window.voiceRate=v;
+ const lbl=document.getElementById('voicerateval');if(lbl)lbl.textContent=v.toFixed(2)+'×'}
+async function saveVoiceRate(){
+ const el=document.getElementById('voicerate');if(!el)return;
+ const v=parseFloat(el.value)||1;window.voiceRate=v;
+ const lbl=document.getElementById('voicerateval');if(lbl)lbl.textContent=v.toFixed(2)+'×';
+ try{await api('/api/settings',{voice_rate:v})}catch(e){}}
 async function saveUrl(){
  const v=document.getElementById('updateurl').value.trim();
  const j=await api('/api/settings',{update_url:v});
@@ -3550,7 +4977,7 @@ async function clearKey(){
 async function testVoice(){
  document.getElementById('voicestat').textContent='গলা টেস্ট হচ্ছে…';
  const j=await api('/api/tts_test',{});
- if(j.ok){document.getElementById('voicestat').textContent='✅ ভালো গলা চলছে: '+j.engine;speak('আসসালামু আলাইকুম, আমি সখী। আমার গলা এখন এমন শোনাবে।')}
+ if(j.ok){document.getElementById('voicestat').textContent='ভালো গলা চলছে: '+j.engine;const ve2=document.getElementById('voiceengine');if(ve2&&j.engine)ve2.textContent='গলা: '+j.engine;speak('আসসালামু আলাইকুম, আমি সখী। আমার গলা এখন এমন শোনাবে।')}
  else{document.getElementById('voicestat').textContent='❌ ভালো গলা আসেনি — ব্রাউজারের গলা চলবে। কারণ: '+j.error}}
 async function testKey(){
  document.getElementById('keymsg').textContent='টেস্ট হচ্ছে… একটু অপেক্ষা করো';
@@ -3719,9 +5146,11 @@ armIdle();
  if(!pin()){document.getElementById('pinbox').style.display='block';return}
  try{const s=await api('/api/status');document.getElementById('main').style.display='block';
  document.getElementById('status').textContent='ভার্সন v'+s.version+' • স্কিল '+s.skills+'টা • কথা হয়েছে '+s.interactions+' বার • সম্পূর্ণ ফ্রি';
- document.getElementById('skillsnode').textContent='🧩 Skills '+s.skills+'টা';
+ document.getElementById('skillsnode').textContent='Skills '+s.skills+'টা';
  document.getElementById('keystat').textContent=s.key_set?'✅ key বসানো আছে — স্মার্ট মাথা চালু':'❌ key বসানো নেই — অফলাইন মাথায় চলছে';
- document.getElementById('voicestat').textContent=s.voice_engine?('✅ ভালো গলা চলছে: '+s.voice_engine):(s.voice_edge?'ভালো গলা বসানো আছে — টেস্ট করে দেখো':'⚠️ ভালো গলার টুল এখনো বসেনি — Sokhi আবার চালালে পেছনে বসবে; টেস্ট বোতামে আসল গলা যাচাই হবে');
+ document.getElementById('voicestat').textContent=s.voice_engine?('ভালো গলা চলছে: '+s.voice_engine):(s.voice_edge?'ভালো গলা বসানো আছে — টেস্ট করে দেখো':'ভালো গলার টুল এখনো বসেনি — Sokhi আবার চালালে পেছনে বসবে; টেস্ট বোতামে আসল গলা যাচাই হবে');
+ const ve=document.getElementById('voiceengine');if(ve)ve.textContent=s.voice_engine?('গলা: '+s.voice_engine):'';
+ if(s.voice_rate!=null){const vr=parseFloat(s.voice_rate);if(!isNaN(vr)){window.voiceRate=vr;const vel=document.getElementById('voicerate');if(vel)vel.value=vr;const vlbl=document.getElementById('voicerateval');if(vlbl)vlbl.textContent=vr.toFixed(2)+'×'}}
  document.getElementById('callname').value=s.call_name||'';
  document.getElementById('tonepreset').value=s.tts_preset||'মিষ্টি';
  if(s.update_url)document.getElementById('updateurl').value=s.update_url;
@@ -3755,11 +5184,34 @@ def panels_data():
         except Exception:
             pass
         _panels_cache["ts"] = time.time()
-    return {"weather_text": apply_call_name(_panels_cache["weather"]),
-            "news_text": apply_call_name(_panels_cache["news"])}
+    _pd = {"weather_text": apply_call_name(_panels_cache["weather"]),
+           "news_text": apply_call_name(_panels_cache["news"])}
+    try:
+        _pd.update(fullforms_panels())
+    except Exception:
+        pass
+    return _pd
 
 
 # --------------------------------------------------------------- server
+
+_daily_release_lock = threading.Lock()
+
+
+def _kick_daily_release():
+    """daily_release_if_due()-কে background thread-এ চালায় (v1.1 latency
+    fix) — দিনের প্রথম chat/status অনুরোধে self-upgrade-এর ভারী কাজ যেন
+    উত্তরে দেরি না করে। lock থাকায় একসঙ্গে একটিই রান হয়।"""
+    def _run():
+        if _daily_release_lock.acquire(blocking=False):
+            try:
+                daily_release_if_due()
+            except Exception:
+                pass
+            finally:
+                _daily_release_lock.release()
+    threading.Thread(target=_run, daemon=True).start()
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -3789,7 +5241,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/status":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
-            daily_release_if_due()
+            _kick_daily_release()
+            ensure_edge_tts()
             mem, ver = get_memory(), get_version()
             caps = load_json(CAPS_FILE, [])
             return self._json({"ok": True, "version": ver["version"],
@@ -3798,7 +5251,7 @@ class Handler(BaseHTTPRequestHandler):
                                "facts": len(mem["facts"]),
                                "knowledge": len(load_json(KNOW_FILE, {})),
                                "auto_upgrade": bool(get_config().get("auto_self_upgrade", True)),
-                               "voice_engine": VOICE_STATE.get("engine", ""),
+                               "voice_engine": tts_engine_status(), "voice_rate": _clamp_voice_rate(get_config().get("voice_rate", 1.0)),
                                "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে")})
         if self.path == "/api/memory":
             if not self._pin_ok():
@@ -3842,10 +5295,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             data = {}
         if self.path == "/api/tts_test":
+            ensure_edge_tts()
             audio = make_tts_audio("আসসালামু আলাইকুম, আমি সখী।")
             if audio:
-                return self._json({"ok": True, "engine": VOICE_STATE.get("engine", "")})
-            return self._json({"ok": False, "error": VOICE_STATE.get("error", "অজানা সমস্যা")})
+                return self._json({"ok": True, "engine": VOICE_STATE.get("engine", ""), "voice_engine": tts_engine_status(), "voice": voice_identity()["voice"], "rate": VOICE_STATE.get("rate", ""), "pitch": VOICE_STATE.get("pitch", "")})
+            return self._json({"ok": False, "engine": VOICE_STATE.get("engine", ""), "voice_engine": tts_engine_status(), "error": VOICE_STATE.get("error", "অজানা সমস্যা")})
         if self.path == "/api/tts":
             audio = make_tts_audio(str(data.get("text") or ""), data.get("rate") or None, data.get("pitch") or None)
             if not audio:
@@ -3859,13 +5313,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/settings":
             preset = str(data.get("tts_preset") or "")
-            presets = {"মিষ্টি": ("-10%", "+4%"), "স্বাভাবিক": ("-4%", "+2%"), "প্রাণবন্ত": ("+2%", "+6%")}
+            presets = {"মিষ্টি": ("-3%", "+4%"), "স্বাভাবিক": ("0%", "+1%"), "প্রাণবন্ত": ("+5%", "+5%")}
             if preset in presets:
                 cfg = get_config()
                 cfg["tts_preset"] = preset
                 cfg["tts_rate"], cfg["tts_pitch"] = presets[preset]
                 save_config(cfg)
                 return self._json({"ok": True, "tts_preset": preset})
+            if "voice_rate" in data:
+                try:
+                    vr = _clamp_voice_rate(float(data.get("voice_rate")))
+                except Exception:
+                    return self._json({"ok": False, "error": "voice_rate সংখ্যা হতে হবে (0.8–1.2)"})
+                cfg = get_config()
+                cfg["voice_rate"] = vr
+                save_config(cfg)
+                return self._json({"ok": True, "voice_rate": vr})
             if isinstance(data.get("call_name"), str):
                 cfg = get_config()
                 cfg["call_name"] = data["call_name"].strip()[:40]
@@ -3924,11 +5387,25 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("action") == "clear":
                 wb_clear()
             return self._json({"ok": True, "lines": wb_lines()})
-        daily_release_if_due()
+        # /api/chat (v1.1, problem 4): measure the whole request and log it.
+        # NOTE: no TTS is built on this path — voice is a separate /api/tts
+        # call made by the page AFTER the text reply arrives, so the text
+        # is never blocked waiting for audio.
+        _chat_t0 = time.perf_counter()
+        _kick_daily_release()
         _msg = data.get("message", "")
         reply = apply_call_name(care_suffix(handle_message(_msg)))
         convo_remember(_msg, reply)
-        self._json({"reply": reply})
+        _chat_ms = int((time.perf_counter() - _chat_t0) * 1000)
+        try:
+            with (DATA / "latency.log").open("a", encoding="utf-8") as _lf:
+                _lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                          f"/api/chat ms={_chat_ms} "
+                          f"gemini_ms={LAST_LATENCY.get('ms')} "
+                          f"model={LAST_LATENCY.get('model')}\n")
+        except Exception:
+            pass
+        self._json({"reply": reply, "ms": _chat_ms})
 
 
 def local_ip():
@@ -3942,7 +5419,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 def main():
@@ -3971,7 +5448,8 @@ def main():
         register_capability("teacher", "শিক্ষক মোড (সব বিষয়) + সময় ধরে মক টেস্ট + হোয়াইটবোর্ড")
         register_capability("pc-pack-n8", "N8 দৈনন্দিন PC কমান্ড প্যাক (১২টি)")
         register_capability("rules-n13", "কথা বলে নিয়ম বসানো ও স্কিল-খসড়া অনুমোদন")
-        log_change(f"আপগ্রেড: v{APP_VERSION} — নতুন ড্যাশবোর্ড (তিন-কলাম, কণা-চরিত্র, থিম, idle স্ক্রিন), Gemini conversation buffer, এজেন্ট দল, শিক্ষক+মক টেস্ট+হোয়াইটবোর্ড, N8 PC প্যাক, N13 কথা-বলে আপগ্রেড")
+        register_capability("fullforms-v11", "F1 world model, F2 আগাম-প্রস্তুতি, F3 GUI computer-use (গেটসহ), F4 প্রকল্প, F6 growth diary, F7 রাতের গবেষণা, F8 prediction, N10 কোডিং এজেন্ট, N11 নথি/রিপোর্ট, bridge (Desktop দিক)")
+        log_change(f"আপগ্রেড: v{APP_VERSION} — professional UI polish + স্থির গ্রিড/প্যানেল-স্ক্রল/auto-scroll, গলার গতি ঠিক (preset পুনঃসামঞ্জস্য + মোট slowdown cap −12% + গতি স্লাইডার) ও Edge নির্ভরযোগ্যতা, reply দ্রুত (fast-first মডেল + timeout 12s + daily-release background-এ), F1–F8/N10/N11 পূর্ণ রূপ, bridge Desktop প্রোটোকল")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
