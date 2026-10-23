@@ -144,11 +144,13 @@ def get_config():
     cfg = load_json(CONFIG_FILE, {})
     cfg.setdefault("gemini_api_key", os.environ.get("GEMINI_API_KEY", ""))
     cfg.setdefault("gemini_model", "gemini-3.8-flash")
+    cfg.setdefault("gemini_model_mode", "auto")
     cfg.setdefault("git_auto_push", False)
     cfg.setdefault("city", "Dhaka")
     cfg.setdefault("auto_self_upgrade", True)
     cfg.setdefault("update_url", "")
     cfg.setdefault("tts_voice", "bn-BD-NabanitaNeural")
+    cfg.setdefault("browser_voice", "")
     cfg.setdefault("call_name", "")
     cfg.setdefault("tts_preset", "মিষ্টি")
     cfg.setdefault("tts_rate", "-3%")
@@ -172,6 +174,51 @@ def get_config():
 
 def save_config(cfg):
     save_json(CONFIG_FILE, cfg)
+
+
+TTS_VOICE_WHITELIST = {
+    "bn-BD-NabanitaNeural": "নাবনিতা (নারী কণ্ঠ)",
+    "bn-BD-PradeepNeural": "প্রদীপ (পুরুষ কণ্ঠ)",
+}
+
+BROWSER_VOICE_MAX_LEN = 120
+
+TTS_VOICE_ERROR = "গলা বাছাই করা গেল না — শুধু নাবনিতা বা প্রদীপ গলা বেছে নাও।"
+BROWSER_VOICE_TYPE_ERROR = "ব্রাউজারের গলার নাম ঠিকমতো আসেনি — আবার বেছে নাও।"
+BROWSER_VOICE_LEN_ERROR = "ব্রাউজারের গলার নাম বেশি লম্বা — আবার বেছে নাও।"
+
+
+def validate_tts_voice(v):
+    """Edge voice যাচাই। ইনপুট: settings POST-এর data["tts_voice"]।
+
+    Returns (True, voice) শুধুমাত্র v হুবহু whitelist-এর একটি key হলে
+    (কোনো strip/case-folding করা হয় না — Edge-এর voice id case-sensitive)।
+    নইলে (False, plain-Bangla error message)।
+    Pure function: কোনো I/O নেই, exception ছোঁড়ে না।
+    """
+    if not isinstance(v, str):
+        return (False, TTS_VOICE_ERROR)
+    if v in TTS_VOICE_WHITELIST:
+        return (True, v)
+    return (False, TTS_VOICE_ERROR)
+
+
+def validate_browser_voice(v):
+    """Browser (Web Speech) voice NAME যাচাই।
+
+    নীতি: v অবশ্যই str হতে হবে, দৈর্ঘ্য <= BROWSER_VOICE_MAX_LEN (120)।
+    "" বৈধ — মানে "স্বয়ংক্রিয়"-তে ফিরে যাওয়া। বৈধ মান VERBATIM ফেরত
+    দেওয়া হয় (strip করা হয় না): নামটা ব্যবহারকারীর ডিভাইস থেকে আসা
+    voice name, JS-এ শুধু exact-name তুলনায় ব্যবহৃত হয় — quote/brace
+    জাতীয় অক্ষর থাকলেও ক্ষতি নেই, JSON encoding সেটা সামলে নেয়।
+    Returns (True, v) অথবা (False, plain-Bangla error message)।
+    Pure function: কোনো I/O নেই, exception ছোঁড়ে না।
+    """
+    if not isinstance(v, str):
+        return (False, BROWSER_VOICE_TYPE_ERROR)
+    if len(v) > BROWSER_VOICE_MAX_LEN:
+        return (False, BROWSER_VOICE_LEN_ERROR)
+    return (True, v)
 
 
 def get_memory():
@@ -568,6 +615,62 @@ _last_gemini_error = {"info": ""}
 LAST_LATENCY = {}
 
 
+# v1.8 #49: custom মডেল ব্যর্থ হলে চ্যাটে জানানোর নোটিশ (per-process)।
+# ask_gemini() প্রতিবার শুরুতেই এটা খালি করে; জয়ী মডেল configured-এর
+# থেকে আলাদা হলেই (শুধু custom mode-এ) এতে লেখা বসে।
+LAST_MODEL_NOTICE = {"text": ""}
+
+
+def _model_notice(configured, winning):
+    """custom মডেল পাওয়া না গেলে চ্যাটে দেখানোর বাংলা নোটিশ।"""
+    return (f"(নোট: তুমি বেছে দিয়েছিলে '{configured}' মডেল, কিন্তু সেটা এখন "
+            f"পাওয়া যায়নি — তাই '{winning}' মডেল দিয়ে উত্তর দিলাম।)")
+
+
+def _model_notice_for(cfg, configured, winning, attempted):
+    """নোটিশ বসবে কি না ঠিক করে; বসলে লেখাটা ফেরত দেয়, নইলে ""।
+
+    শর্ত (সবগুলো একসাথে): mode == "custom", configured ফাঁকা নয়,
+    winning != configured, আর configured সত্যিই attempt হয়েছিল
+    (attempted = যে model list-টা আসলে ঘোরানো হয়েছে)।"""
+    if (cfg or {}).get("gemini_model_mode") != "custom":
+        return ""
+    if not configured or winning == configured:
+        return ""
+    if configured not in (attempted or []):
+        return ""
+    return _model_notice(configured, winning)
+
+
+def _gemini_order(cfg, quality):
+    """ask_gemini()-এর attempt order ফেরত দেয় (list, deduped)।
+
+    auto (ডিফল্ট): v1.7.0-র হুবহু order —
+        quality=True : (configured, 3.5-flash, 2.5-flash, 3.5-flash-lite)
+        quality=False: (3.5-flash-lite, configured, 3.5-flash), cap 3
+    custom: configured সবার আগে, তারপর ওই পথের বাকি মডেলগুলো আগের
+        relative order-এই; dedupe; fast path-এ cap 3 আগের মতোই।
+    অজানা mode মান auto হিসেবেই ধরা হয় (defensive)।"""
+    cfg = cfg or {}
+    configured = cfg.get("gemini_model", "gemini-3.8-flash")
+    if quality:
+        base = (configured, "gemini-3.5-flash", "gemini-2.5-flash",
+                "gemini-3.5-flash-lite")
+    else:
+        base = ("gemini-3.5-flash-lite", configured, "gemini-3.5-flash")
+    if cfg.get("gemini_model_mode") == "custom":
+        order = (configured,) + tuple(m for m in base if m != configured)
+    else:
+        order = base
+    models = []
+    for m in order:
+        if m and m not in models:
+            models.append(m)
+    if not quality:
+        models = models[:3]
+    return models
+
+
 def _log_gemini_error(model, err):
     info = f"model={model} error={err}"
     _last_gemini_error["info"] = info
@@ -591,6 +694,7 @@ def ask_gemini(user_text, mem, quality=False, image=None):
     original backups) and the full 1024-token budget — use it for
     quality-sensitive calls (teacher steps, exam-question generation).
     Every call records its total ms + winning model in LAST_LATENCY."""
+    LAST_MODEL_NOTICE["text"] = ""
     _t0 = time.perf_counter()
 
     def _record(model, attempts, ok):
@@ -661,17 +765,7 @@ def ask_gemini(user_text, mem, quality=False, image=None):
                              "maxOutputTokens": 1024 if quality else 700},
     }
     configured = cfg.get("gemini_model", "gemini-3.8-flash")
-    if quality:
-        order = (configured, "gemini-3.5-flash", "gemini-2.5-flash",
-                 "gemini-3.5-flash-lite")
-    else:
-        order = ("gemini-3.5-flash-lite", configured, "gemini-3.5-flash")
-    models = []
-    for m in order:
-        if m and m not in models:
-            models.append(m)
-    if not quality:
-        models = models[:3]
+    models = _gemini_order(cfg, quality)
     attempts = 0
     for model in models:
         attempts += 1
@@ -686,6 +780,9 @@ def ask_gemini(user_text, mem, quality=False, image=None):
                 data = json.loads(r.read().decode("utf-8"))
             text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             _record(model, attempts, True)
+            _notice = _model_notice_for(cfg, configured, model, models)
+            if _notice:
+                LAST_MODEL_NOTICE["text"] = _notice
             return text_out
         except Exception as e:
             detail = str(e)
@@ -2395,6 +2492,690 @@ def study_pack_handle(text, low=None):
             return ("কোন বিষয়ের মাস্টারি টেস্ট দেবে? বিষয়ের নামসহ বলো — "
                     "যেমন: 'গণিত মাস্টারি টেস্ট'।")
         return mastery_questions_text(subj, bank=bank, lessons=lessons)
+    return None
+
+
+# -*- coding: utf-8 -*-
+"""
+chart_pack.py — Desktop Sokhi v1.8.0, item #47: ইনলাইন SVG চার্ট/ডায়াগ্রাম উত্তর
+
+PASTE-READY FRAGMENT for sokhi.py — এই ফাইলটা নিজে কোনো sokhi.py নয়।
+ইন্টিগ্রেশন: INTEGRATION-A.md দেখো (study pack-এর পরে, handle_message-এর আগে)।
+
+Features:
+  chart_series(kind, ...)   আসল লোকাল ডেটা থেকে চার্টের সিরিজ (dict/None)
+  svg_bar_chart(series)     horizontal-bar SVG (str)
+  svg_line_chart(series)    polyline SVG (str)
+  concept_svg(subject, ...) ধারণা-মানচিত্রের vertical node diagram (str/None)
+  chart_reply(text)         চ্যাট ডিসপ্যাচার — উত্তরে [[CHART:...]] মার্কার বসায়
+
+House rules honoured:
+  * 100% free, offline-only, stdlib only — কোনো external JS lib, কোনো
+    web service, কোনো AI image generation নয়। চার্ট = নিজের আসল ডেটা
+    থেকে বানানো SVG; ডেটা না থাকলে সেটা সহজ বাংলায় বলা হয়।
+  * Pure-Python functions: ডেটা প্যারামিটার দিয়ে inject করা যায়
+    (test_chart_pack.py তাই করে)। প্যারামিটার None হলে host sokhi.py-র
+    globals CALL TIME-এ globals().get(...) দিয়ে resolve করা হয় —
+    _resolve_progress / _resolve_wrong / _resolve_lessons / _resolve_bank /
+    _wrong_counts_by_subject / _bn (বা _bn_num) / _NO_DATA /
+    concept_map_text / coverage_text / _subject_in_text।
+    ফলে fragment-টা sokhi.py-তে paste করলেও চলে, standalone test-এ
+    stub দিলেও চলে।
+  * সব SVG text html-escape করা — বিষয়ের নামে <b> থাকলেও markup ভাঙবে না।
+  * সংখ্যা দেখানো হয় Bangla digits-এ (host _bn/_bn_num থাকলে সেটা,
+    না থাকলে স্থানীয় fallback)।
+
+Data shapes (host-এর সঙ্গে মিলিয়ে):
+  study-progress.json = {subject: {"sessions": int, "mock_tests": int,
+                                   "last_topic": str, "weak": [str]}}
+  OFFLINE_LESSONS = {subject: [{"topic": str, ...}]}
+  OFFLINE_BANK    = {subject: [question dicts]}
+  wrong-book      = [{"subject": ..., "topic": ...}]
+
+Coverage হিসাব coverage_text()-এর EXACT mirror:
+  per subject: total = len(lessons[subject]);
+  touched = যেসব lesson topic progress[subject].last_topic হিসেবে বা
+            progress[subject].weak[]-তে আছে;
+  pct = round(touched * 100 / total)   (total == 0 হলে ওই বিষয় বাদ)
+"""
+
+import html
+from collections import Counter
+
+# ------------------------------------------------------------------ theme
+_CHART_W = 640
+_CHART_BAR_FILL = "#3aa6d6"
+_CHART_TXT = "#e8eef6"
+_CHART_MUTED = "#93a3b8"
+_CHART_LINE = "#263449"
+_CHART_BOX_FILL = "#182233"
+_CHART_TITLE_FILL = "#12314a"
+_CHART_WEAK_FILL = "#5a2436"
+_CHART_WEAK_LINE = "#c94f6d"
+_CHART_FONT = "'Hind Siliguri','Segoe UI',sans-serif"
+_CHART_CONCEPT_CAP = 14
+
+_CHART_KINDS = ("coverage", "wrong", "bank", "activity")
+
+
+# ------------------------------------------------------- global fallbacks
+# সব lookup CALL TIME-এ globals() থেকে — paste করলে host-এর helper জেতে,
+# test-এ stub দিলে stub জেতে। কোনো helper না থাকলে নিরাপদ local fallback।
+
+def _chart_bn(x):
+    """Bangla digits: host _bn (study pack) বা _bn_num থাকলে সেটা,
+    না থাকলে স্থানীয় translate।"""
+    for _name in ("_bn", "_bn_num"):
+        _fn = globals().get(_name)
+        if callable(_fn):
+            try:
+                return str(_fn(x))
+            except Exception:
+                pass
+    return str(x).translate(str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯"))
+
+
+def _chart_no_data():
+    _v = globals().get("_NO_DATA")
+    return str(_v) if _v else "এখনো ডেটা নেই"
+
+
+def _chart_resolve(name, explicit, want_type, empty):
+    """host resolver (_resolve_*) থাকলে তাকে explicit arg দিয়ে ডাকা হয়;
+    না থাকলে explicit নিজেই, তাও না থাকলে খালি মান।"""
+    _fn = globals().get(name)
+    if callable(_fn):
+        try:
+            _out = _fn(explicit)
+        except TypeError:
+            try:
+                _out = _fn()
+            except Exception:
+                _out = None
+        except Exception:
+            _out = None
+        if isinstance(_out, want_type):
+            return _out
+        return empty
+    if isinstance(explicit, want_type):
+        return explicit
+    return empty
+
+
+def _chart_progress(progress=None):
+    return _chart_resolve("_resolve_progress", progress, dict, {})
+
+
+def _chart_wrong(wrong=None):
+    return _chart_resolve("_resolve_wrong", wrong, list, [])
+
+
+def _chart_lessons(lessons=None):
+    return _chart_resolve("_resolve_lessons", lessons, dict, {})
+
+
+def _chart_bank(bank=None):
+    return _chart_resolve("_resolve_bank", bank, dict, {})
+
+
+def _chart_wrong_counts(wrong):
+    """বিষয়ভিত্তিক ভুলের Counter — host _wrong_counts_by_subject থাকলে
+    সেটাই; না থাকলে একই নিয়মে স্থানীয় গণনা।"""
+    _fn = globals().get("_wrong_counts_by_subject")
+    if callable(_fn):
+        try:
+            _out = _fn(wrong)
+            if isinstance(_out, Counter):
+                return _out
+            if isinstance(_out, dict):
+                return Counter(_out)
+        except Exception:
+            pass
+    _c = Counter()
+    for _w in wrong or []:
+        if isinstance(_w, dict):
+            _c[str(_w.get("subject") or "অজানা বিষয়")] += 1
+    return _c
+
+
+def _chart_esc(x):
+    return html.escape(str(x if x is not None else ""), quote=True)
+
+
+def _chart_val_text(value, unit):
+    """SVG-তে দেখানোর মান: Bangla digit + unit (% হলে গায়ে লেগে, নাহলে ফাঁক দিয়ে)।"""
+    _t = _chart_bn(value)
+    _u = str(unit or "")
+    if not _u:
+        return _t
+    if _u == "%":
+        return _t + "%"
+    return _t + " " + _u
+
+
+def _chart_subject_in_text(text, bank, lessons):
+    """বিষয় শনাক্ত: host _subject_in_text থাকলে সেটা (study pack-এর
+    signature (text, bank, lessons)); না থাকলে bank/lessons-এর key
+    সরাসরি text-এ খোঁজা হয়। শেষ ভরসা host _detect_subject।"""
+    _fn = globals().get("_subject_in_text")
+    if callable(_fn):
+        try:
+            _out = _fn(text, bank, lessons)
+        except TypeError:
+            try:
+                _out = _fn(text)
+            except Exception:
+                _out = None
+        except Exception:
+            _out = None
+        if _out:
+            return str(_out)
+    _raw = str(text or "")
+    for _subj in list((bank or {}).keys()) + \
+            [s for s in (lessons or {}).keys() if s not in (bank or {})]:
+        if _subj and str(_subj) in _raw:
+            return str(_subj)
+    _fn2 = globals().get("_detect_subject")
+    if callable(_fn2):
+        try:
+            _out = _fn2(_raw)
+        except TypeError:
+            try:
+                _out = _fn2(_raw, _raw.lower())
+            except Exception:
+                _out = None
+        except Exception:
+            _out = None
+        if _out:
+            return str(_out)
+    return None
+
+
+def _chart_host_text(name, *args, **kwargs):
+    """concept_map_text / coverage_text-কে host globals থেকে ডাকে;
+    signature না মিললে শুধু positional দিয়ে আবার চেষ্টা। না থাকলে None।"""
+    _fn = globals().get(name)
+    if not callable(_fn):
+        return None
+    try:
+        return _fn(*args, **kwargs)
+    except TypeError:
+        try:
+            return _fn(*args)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _chart_num(x):
+    try:
+        return int(x or 0)
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return 0
+
+
+# =====================================================================
+#  সিরিজ তৈরি — আসল ডেটা থেকে; ডেটা না থাকলে None (কিছু বানানো হয় না)
+# =====================================================================
+
+def chart_series(kind, progress=None, wrong=None, lessons=None, bank=None):
+    """kind অনুযায়ী চার্ট-সিরিজ ফেরত দেয়:
+      {"title": str, "labels": [str], "values": [number], "unit": str}
+    ডেটা না থাকলে (বা অজানা kind হলে) None।
+
+    kinds:
+      "coverage" — বিষয়ভিত্তিক সিলেবাস-কভারেজ % (coverage_text-এর
+                   হিসাবের exact mirror; lessons-এর ক্রমে)
+      "wrong"    — ভুলের খাতায় বিষয়ভিত্তিক ভুলের সংখ্যা (বেশি থেকে কম)
+      "bank"     — OFFLINE_BANK-এ বিষয়ভিত্তিক প্রশ্নের সংখ্যা (bank-এর ক্রমে)
+      "activity" — বিষয়ভিত্তিক sessions + mock_tests (progress-এর ক্রমে)
+    """
+    kind = str(kind or "").strip().lower()
+
+    if kind == "coverage":
+        lessons = _chart_lessons(lessons)
+        progress = _chart_progress(progress)
+        labels, values = [], []
+        for _subj in (lessons or {}).keys():
+            _steps = lessons.get(_subj) or []
+            _total = len(_steps)
+            if _total <= 0:
+                continue
+            _topics = [str(_s.get("topic") or "") for _s in _steps
+                       if isinstance(_s, dict)]
+            _ent = progress.get(_subj) or {}
+            if not isinstance(_ent, dict):
+                _ent = {}
+            _touched = set()
+            _lt = str(_ent.get("last_topic") or "")
+            if _lt and _lt in _topics:
+                _touched.add(_lt)
+            for _w in _ent.get("weak", []) or []:
+                if str(_w) in _topics:
+                    _touched.add(str(_w))
+            labels.append(str(_subj))
+            values.append(round(len(_touched) * 100 / _total))
+        if not labels:
+            return None
+        return {"title": "সিলেবাস-কভারেজ", "labels": labels,
+                "values": values, "unit": "%"}
+
+    if kind == "wrong":
+        wrong = _chart_wrong(wrong)
+        _counts = _chart_wrong_counts(wrong)
+        _pairs = [(s, c) for s, c in _counts.most_common() if c > 0]
+        if not _pairs:
+            return None
+        return {"title": "বিষয়ভিত্তিক ভুল (ভুলের খাতা)",
+                "labels": [str(s) for s, _c in _pairs],
+                "values": [int(c) for _s, c in _pairs], "unit": "টি ভুল"}
+
+    if kind == "bank":
+        bank = _chart_bank(bank)
+        labels, values = [], []
+        for _subj in (bank or {}).keys():
+            _n = len(bank.get(_subj) or [])
+            if _n > 0:
+                labels.append(str(_subj))
+                values.append(int(_n))
+        if not labels:
+            return None
+        return {"title": "প্রশ্ন-ব্যাংকে বিষয়ভিত্তিক প্রশ্ন",
+                "labels": labels, "values": values, "unit": "টি প্রশ্ন"}
+
+    if kind == "activity":
+        progress = _chart_progress(progress)
+        labels, values = [], []
+        for _subj in (progress or {}).keys():
+            _ent = progress.get(_subj) or {}
+            if not isinstance(_ent, dict):
+                continue
+            labels.append(str(_subj))
+            values.append(_chart_num(_ent.get("sessions", 0)) +
+                          _chart_num(_ent.get("mock_tests", 0)))
+        if not labels or sum(values) <= 0:
+            return None
+        return {"title": "পড়ার কার্যকলাপ (সেশন + মক টেস্ট)",
+                "labels": labels, "values": values, "unit": "টি"}
+
+    return None
+
+
+# =====================================================================
+#  SVG — বার চার্ট
+# =====================================================================
+
+def _chart_empty_svg(title=None):
+    """series না থাকলে দেখানোর মতো নিরীহ SVG (crash নয়)।"""
+    _t = _chart_esc(title or _chart_no_data())
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{_CHART_W}" '
+        f'height="64" viewBox="0 0 {_CHART_W} 64" role="img" '
+        f'style="background:transparent">'
+        f'<text x="16" y="38" font-family="{_CHART_FONT}" font-size="15" '
+        f'fill="{_CHART_MUTED}">{_t}</text></svg>')
+
+
+def svg_bar_chart(series):
+    """Horizontal-bar SVG (str)। width 640, viewBox, স্বচ্ছ background,
+    বার #3aa6d6, লেখা #e8eef6 / muted #93a3b8; সব text escape করা,
+    মান Bangla digit-এ। series None/খালি হলে no-data SVG।"""
+    if not isinstance(series, dict):
+        return _chart_empty_svg()
+    _labels = [str(x) for x in (series.get("labels") or [])]
+    _values = list(series.get("values") or [])
+    if not _labels or not _values:
+        return _chart_empty_svg(series.get("title"))
+    _n = min(len(_labels), len(_values))
+    _labels, _values = _labels[:_n], _values[:_n]
+    _unit = str(series.get("unit") or "")
+    _title = str(series.get("title") or "চার্ট")
+
+    _max = 0
+    for _v in _values:
+        try:
+            _max = max(_max, float(_v))
+        except Exception:
+            pass
+    if _max <= 0:
+        _max = 1
+
+    _label_w = 176          # বামে বিষয়ের নামের জায়গা
+    _bar_x = _label_w + 8
+    _bar_max_w = _CHART_W - _bar_x - 92   # ডানে মান-লেবেলের জায়গা
+    _row_h = 34
+    _top = 40
+    _height = _top + _n * _row_h + 10
+
+    _out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{_CHART_W}" '
+        f'height="{_height}" viewBox="0 0 {_CHART_W} {_height}" '
+        f'role="img" style="background:transparent">',
+        f"<title>{_chart_esc(_title)}</title>",
+        f'<text x="8" y="24" font-family="{_CHART_FONT}" font-size="16" '
+        f'font-weight="700" fill="{_CHART_TXT}">{_chart_esc(_title)}</text>',
+    ]
+    for _i in range(_n):
+        _v = _values[_i]
+        try:
+            _fv = float(_v)
+        except Exception:
+            _fv = 0
+        _y = _top + _i * _row_h
+        _bw = max(2, int(_fv / _max * _bar_max_w)) if _fv > 0 else 0
+        _ty = _y + 20
+        _out.append(
+            f'<text x="8" y="{_ty}" font-family="{_CHART_FONT}" '
+            f'font-size="13.5" fill="{_CHART_TXT}">'
+            f'{_chart_esc(_labels[_i])}</text>')
+        if _bw > 0:
+            _out.append(
+                f'<rect x="{_bar_x}" y="{_y + 4}" width="{_bw}" '
+                f'height="18" rx="4" fill="{_CHART_BAR_FILL}"/>')
+        _out.append(
+            f'<text x="{_bar_x + _bw + 8}" y="{_ty}" '
+            f'font-family="{_CHART_FONT}" font-size="13.5" '
+            f'fill="{_CHART_MUTED}">'
+            f'{_chart_esc(_chart_val_text(_v, _unit))}</text>')
+    _out.append("</svg>")
+    return "".join(_out)
+
+
+# =====================================================================
+#  SVG — লাইন চার্ট
+# =====================================================================
+
+def svg_line_chart(series):
+    """সাধারণ polyline SVG (str): পয়েন্টে dot + মান-লেবেল, নিচে
+    বিষয়ের নাম। একই theme/escaping/Bangla-digit নিয়ম বার চার্টের মতো।
+    series None/খালি হলে no-data SVG।"""
+    if not isinstance(series, dict):
+        return _chart_empty_svg()
+    _labels = [str(x) for x in (series.get("labels") or [])]
+    _values = list(series.get("values") or [])
+    if not _labels or not _values:
+        return _chart_empty_svg(series.get("title"))
+    _n = min(len(_labels), len(_values))
+    _labels, _values = _labels[:_n], _values[:_n]
+    _unit = str(series.get("unit") or "")
+    _title = str(series.get("title") or "চার্ট")
+
+    _max = 0
+    for _v in _values:
+        try:
+            _max = max(_max, float(_v))
+        except Exception:
+            pass
+    if _max <= 0:
+        _max = 1
+
+    _height = 264
+    _left, _right, _plot_top, _plot_bottom = 44, 20, 52, 216
+    _plot_w = _CHART_W - _left - _right
+    _plot_h = _plot_bottom - _plot_top
+
+    def _px(i):
+        if _n == 1:
+            return _left + _plot_w // 2
+        return int(_left + i * _plot_w / (_n - 1))
+
+    def _py(v):
+        try:
+            _fv = float(v)
+        except Exception:
+            _fv = 0
+        return int(_plot_bottom - (_fv / _max) * _plot_h)
+
+    _pts = [(_px(i), _py(_values[i])) for i in range(_n)]
+    _points_attr = " ".join(f"{x},{y}" for x, y in _pts)
+
+    _out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{_CHART_W}" '
+        f'height="{_height}" viewBox="0 0 {_CHART_W} {_height}" '
+        f'role="img" style="background:transparent">',
+        f"<title>{_chart_esc(_title)}</title>",
+        f'<text x="8" y="24" font-family="{_CHART_FONT}" font-size="16" '
+        f'font-weight="700" fill="{_CHART_TXT}">{_chart_esc(_title)}</text>',
+        f'<line x1="{_left}" y1="{_plot_bottom}" x2="{_CHART_W - _right}" '
+        f'y2="{_plot_bottom}" stroke="{_CHART_LINE}" stroke-width="1"/>',
+    ]
+    if _n > 1:
+        _out.append(
+            f'<polyline points="{_points_attr}" fill="none" '
+            f'stroke="{_CHART_BAR_FILL}" stroke-width="2.5" '
+            f'stroke-linejoin="round" stroke-linecap="round"/>')
+    for _i, (_x, _y) in enumerate(_pts):
+        _out.append(
+            f'<circle cx="{_x}" cy="{_y}" r="4.5" fill="{_CHART_BAR_FILL}"/>')
+        _out.append(
+            f'<text x="{_x}" y="{max(12, _y - 10)}" text-anchor="middle" '
+            f'font-family="{_CHART_FONT}" font-size="13" '
+            f'fill="{_CHART_TXT}">'
+            f'{_chart_esc(_chart_val_text(_values[_i], _unit))}</text>')
+        _out.append(
+            f'<text x="{_x}" y="{_plot_bottom + 22}" text-anchor="middle" '
+            f'font-family="{_CHART_FONT}" font-size="12.5" '
+            f'fill="{_CHART_MUTED}">{_chart_esc(_labels[_i])}</text>')
+    _out.append("</svg>")
+    return "".join(_out)
+
+
+# =====================================================================
+#  SVG — ধারণা-মানচিত্র (vertical chain diagram)
+# =====================================================================
+
+def concept_svg(subject, progress=None, lessons=None):
+    """এক বিষয়ের ধারণা-মানচিত্র: উপরে বিষয়ের title node, নিচে তীর
+    দিয়ে জোড়া topic box-এর উল্লম্ব শৃঙ্খল। দুর্বল টপিক (progress-এর
+    weak[]) আলাদা fill (#5a2436) + '⚠' prefix পায়। সর্বোচ্চ ১৪টা topic
+    box; বাকিগুলো শেষে একটা '+আরও Nটি' node-এ দেখানো হয়।
+    বিষয়ের কোনো lesson না থাকলে None (concept_map_text-এর no-data
+    শর্তের mirror)। সব text escape করা।"""
+    lessons = _chart_lessons(lessons)
+    progress = _chart_progress(progress)
+    subject = str(subject or "").strip()
+    if not subject:
+        return None
+    _steps = [s for s in (lessons.get(subject) or []) if isinstance(s, dict)]
+    if not _steps:
+        return None
+    _topics = [str(s.get("topic") or "সাধারণ") for s in _steps]
+
+    _ent = progress.get(subject) or {}
+    if not isinstance(_ent, dict):
+        _ent = {}
+    _weak_set = set(str(w) for w in (_ent.get("weak", []) or []))
+
+    _shown = _topics[:_CHART_CONCEPT_CAP]
+    _extra = len(_topics) - len(_shown)
+
+    # node তালিকা: (text, kind) — kind: title / topic / weak / more
+    _nodes = [(subject, "title")]
+    for _t in _shown:
+        _nodes.append((_t, "weak" if _t in _weak_set else "topic"))
+    if _extra > 0:
+        _nodes.append((f"+আরও {_chart_bn(_extra)}টি", "more"))
+
+    _box_w, _box_h, _gap = 480, 36, 16
+    _box_x = (_CHART_W - _box_w) // 2
+    _top_pad = 14
+    _height = _top_pad * 2 + len(_nodes) * _box_h + \
+        (len(_nodes) - 1) * _gap
+
+    _out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{_CHART_W}" '
+        f'height="{_height}" viewBox="0 0 {_CHART_W} {_height}" '
+        f'role="img" style="background:transparent">',
+        "<defs>"
+        f'<marker id="chartArrow" markerWidth="8" markerHeight="8" '
+        f'refX="6" refY="3" orient="auto">'
+        f'<path d="M0,0 L7,3 L0,6 Z" fill="{_CHART_BAR_FILL}"/></marker>'
+        "</defs>",
+        f"<title>{_chart_esc('ধারণা-মানচিত্র — ' + subject)}</title>",
+    ]
+    _cx = _CHART_W // 2
+    for _i, (_text, _kind) in enumerate(_nodes):
+        _y = _top_pad + _i * (_box_h + _gap)
+        if _i > 0:
+            _y1 = _y - _gap - 1
+            _out.append(
+                f'<line x1="{_cx}" y1="{_y1}" x2="{_cx}" y2="{_y - 2}" '
+                f'stroke="{_CHART_BAR_FILL}" stroke-width="2" '
+                f'marker-end="url(#chartArrow)"/>')
+        if _kind == "title":
+            _fill, _stroke, _weight = _CHART_TITLE_FILL, _CHART_BAR_FILL, "700"
+            _disp = _text
+        elif _kind == "weak":
+            _fill, _stroke, _weight = \
+                _CHART_WEAK_FILL, _CHART_WEAK_LINE, "600"
+            _disp = "⚠ " + _text
+        elif _kind == "more":
+            _fill, _stroke, _weight = _CHART_BOX_FILL, _CHART_LINE, "400"
+            _disp = _text
+        else:
+            _fill, _stroke, _weight = _CHART_BOX_FILL, _CHART_LINE, "400"
+            _disp = _text
+        if len(_disp) > 54:
+            _disp = _disp[:54].rstrip() + "…"
+        _out.append(
+            f'<rect x="{_box_x}" y="{_y}" width="{_box_w}" '
+            f'height="{_box_h}" rx="8" fill="{_fill}" stroke="{_stroke}"/>')
+        _out.append(
+            f'<text x="{_cx}" y="{_y + 23}" text-anchor="middle" '
+            f'font-family="{_CHART_FONT}" font-size="14" '
+            f'font-weight="{_weight}" fill="{_CHART_TXT}">'
+            f'{_chart_esc(_disp)}</text>')
+    _out.append("</svg>")
+    return "".join(_out)
+
+
+# =====================================================================
+#  চ্যাট ডিসপ্যাচার — উত্তরে [[CHART:...]] মার্কার বসায়
+#  (frontend মার্কার দেখে /api/chart থেকে SVG এনে inline বসায়;
+#   speak() মার্কার পড়ে না — INTEGRATION-A.md দেখো)
+# =====================================================================
+
+_CHART_INTROS = {
+    "coverage": "📊 তোমার সিলেবাস-কভারেজের চার্ট:",
+    "wrong": "📊 ভুলের খাতা অনুযায়ী বিষয়ভিত্তিক ভুলের চার্ট:",
+    "bank": "📊 অফলাইন প্রশ্ন-ব্যাংকে বিষয়ভিত্তিক প্রশ্নের চার্ট:",
+    "activity": "📊 তোমার পড়ার কার্যকলাপের চার্ট (সেশন + মক টেস্ট):",
+}
+_CHART_SCORE_INTRO = (
+    "📊 সৎ কথা: প্রতি টেস্টের স্কোরের ইতিহাস আলাদা করে রাখা নেই, "
+    "তাই স্কোরের বদলে তোমার সেশন + মক টেস্টের সংখ্যার চার্ট দেখাচ্ছি:")
+
+
+def _chart_kind_no_data(kind):
+    """নির্দিষ্ট kind-এর চার্ট চাওয়া হলেও তার ডেটা নেই — kind ধরে
+    কারণসহ সহজ বাংলা বার্তা (_NO_DATA host থেকে call time-এ নেওয়া)।"""
+    _nd = _chart_no_data()
+    _why = {
+        "wrong": ("ভুলের খাতা খালি — এখনো কোনো মক টেস্টে ভুল জমেনি। "
+                  "মক টেস্ট দিলে ভুলগুলো জমবে, তখন ভুলের চার্ট আঁকব।"),
+        "bank": ("অফলাইন প্রশ্ন-ব্যাংক খালি — কোনো বিষয়েই প্রশ্ন পাইনি, "
+                 "তাই প্রশ্নের চার্ট আঁকা যাচ্ছে না।"),
+        "activity": ("পড়ার রেকর্ডে এখনো কোনো সেশন বা মক টেস্ট নেই। "
+                     "'শেখাও' বলে পড়া শুরু করলেই কার্যকলাপের হিসাব "
+                     "শুরু হবে, তখন চার্ট আঁকব।"),
+        "coverage": ("পাঠের তালিকা বা কভারেজের ডেটা পাইনি। পড়া শুরু "
+                    "করলেই কভারেজ হিসাব শুরু হবে।"),
+    }.get(kind, "এই ধরনের ডেটা এখনো জমেনি।")
+    return f"{_nd} — চার্ট আঁকার মতো ডেটা পাইনি: {_why}"
+
+
+def chart_reply(text):
+    """চার্ট/ডায়াগ্রাম চাওয়া হলে উত্তর + মার্কার, নাহলে None।
+
+    নিয়ম:
+      * 'ধারণা' + 'মানচিত্র' + শনাক্তযোগ্য বিষয় -> concept_map_text(...)
+        + [[CHART:concept:<subject>]] (concept ডেটা থাকলেই; নাহলে None,
+        যাতে পুরনো route-ই উত্তর দেয়)।
+      * 'কভারেজ' -> coverage_text(...) + [[CHART:coverage]]
+        (coverage সিরিজ থাকলেই; নাহলে None)।
+      * 'চার্ট' -> kind বাছাই: 'ভুল'->wrong, 'প্রশ্ন'->bank,
+        'স্কোর'/'কার্যকলাপ'->activity, 'কভারেজ'->coverage;
+        নির্দিষ্ট kind না চাইলে coverage/activity/wrong/bank ক্রমে
+        যেটায় প্রথম ডেটা মেলে। নির্দিষ্ট kind চেয়ে তার ডেটা না
+        থাকলে অন্য kind-এর চার্ট চুপিচুপি বসানো হয় না — সেই
+        kind-এরই সহজ বাংলা no-data কারণ বলা হয় (সততার নিয়ম)।
+        'স্কোর' চাইলে intro-তে সত্যটা বলা হয়: per-test স্কোরের
+        ইতিহাস রাখা নেই, চার্টে সেশন+টেস্ট সংখ্যা (activity)।
+        কোনো kind-এই ডেটা না থাকলেও একই ধাঁচের no-data বার্তা।
+      * বাকি সব ক্ষেত্রে None।
+    """
+    text = str(text or "").strip()
+    if not text:
+        return None
+    progress = _chart_progress()
+    wrong = _chart_wrong()
+    lessons = _chart_lessons()
+    bank = _chart_bank()
+
+    # --- ধারণা-মানচিত্র (ডায়াগ্রাম)
+    if "ধারণা" in text and "মানচিত্র" in text:
+        _subj = _chart_subject_in_text(text, bank, lessons)
+        if not _subj:
+            return None
+        _steps = [s for s in (lessons.get(_subj) or [])
+                  if isinstance(s, dict)]
+        if not _steps:
+            return None
+        _body = _chart_host_text(
+            "concept_map_text", _subj, progress=progress, lessons=lessons)
+        if _body is None:
+            _body = (f"🗺️ ধারণা-মানচিত্র — {_subj}\n"
+                     + " → ".join(str(s.get("topic") or "সাধারণ")
+                                  for s in _steps))
+        return str(_body) + f"\n[[CHART:concept:{_subj}]]"
+
+    # --- কভারেজ (টেক্সট রিপোর্ট + চার্ট একসাথে)
+    if "কভারেজ" in text:
+        if chart_series("coverage", progress=progress, wrong=wrong,
+                        lessons=lessons, bank=bank) is None:
+            return None
+        _body = _chart_host_text(
+            "coverage_text", progress=progress, lessons=lessons)
+        if _body is None:
+            _body = _CHART_INTROS["coverage"]
+        return str(_body) + "\n[[CHART:coverage]]"
+
+    # --- সাধারণ চার্ট চাওয়া
+    if "চার্ট" in text:
+        if "ভুল" in text:
+            _want = "wrong"
+        elif "প্রশ্ন" in text:
+            _want = "bank"
+        elif "স্কোর" in text or "কার্যকলাপ" in text:
+            _want = "activity"
+        elif "কভারেজ" in text:
+            _want = "coverage"
+        else:
+            _want = None
+        _series_kw = dict(progress=progress, wrong=wrong,
+                          lessons=lessons, bank=bank)
+        if _want is not None:
+            if chart_series(_want, **_series_kw) is not None:
+                if _want == "activity" and "স্কোর" in text:
+                    _intro = _CHART_SCORE_INTRO
+                else:
+                    _intro = _CHART_INTROS[_want]
+                return _intro + f"\n[[CHART:{_want}]]"
+            # নির্দিষ্ট kind চাওয়া হয়েছে, কিন্তু তার ডেটাই নেই —
+            # অন্য চার্ট বসিয়ে ভান করা হবে না; কারণটা বলা হলো।
+            return _chart_kind_no_data(_want)
+        for _kind in ("coverage", "activity", "wrong", "bank"):
+            if chart_series(_kind, **_series_kw) is not None:
+                return _CHART_INTROS[_kind] + f"\n[[CHART:{_kind}]]"
+        return (f"{_chart_no_data()} — চার্ট আঁকার মতো ডেটা পাইনি। "
+                "পড়া শুরু করলে, মক টেস্ট দিলে বা ভুলের খাতায় ভুল জমলে "
+                "সেই আসল রেকর্ড দিয়েই চার্ট আঁকব — কোনো সংখ্যা বানিয়ে "
+                "দেব না। তুমি চাইলে 'শেখাও' বলে পড়া শুরু করো, কিংবা "
+                "একটা মক টেস্ট দাও।")
     return None
 
 
@@ -7727,6 +8508,11 @@ def handle_message(text):
                 _mstart = mastery_start(_msubj)
                 if _mstart:
                     return _mstart
+        # --- v1.8.0 chart pack (#47): inline SVG charts/diagrams
+        if not exam_active():
+            _ch = chart_reply(text)
+            if _ch:
+                return _ch
         _sp = study_pack_handle(text, low)
         if _sp:
             return _sp
@@ -7756,6 +8542,9 @@ def handle_message(text):
         if smart:
             knowledge_put(text, smart)
             auto_evolve(mem)
+            _notice = (LAST_MODEL_NOTICE.get("text") or "").strip()
+            if _notice:
+                return smart + "\n\n" + _notice
             return smart
         log_unanswered(text)
 
@@ -7903,6 +8692,9 @@ input[type=range]{flex:1;padding:0;accent-color:var(--accent)}
 .mdcode .codecopy{position:absolute;top:6px;right:6px;font-size:11px;padding:2px 8px;border-radius:999px}
 .msg-body a{color:var(--accent);text-decoration:underline}
 .msg-body.folded{max-height:170px;overflow:hidden}
+.chartbox{margin-top:10px;background:#0d1524;border:1px solid var(--line);border-radius:var(--radius-sm);padding:10px 12px;overflow-x:auto;font-size:13px;color:var(--muted)}
+.chartbox svg{max-width:100%;height:auto;display:block}
+.msg-body .chartbox{white-space:normal}
 </style></head><body data-theme="blue">
 <div class="tagline">Sokhi is the world's first Sci-Fi AI Desktop Experience — built for those who grew up dreaming of JARVIS, and refused to settle for boring software.</div>
 <header>
@@ -8156,9 +8948,12 @@ function synthSpeak(text,rate){
  return new Promise(res=>{
  try{const u=new SpeechSynthesisUtterance(text);u.lang='bn-BD';u.rate=(rate?.8:.92)*(window.voiceRate||1);u.pitch=1.05;
  const vs=speechSynthesis.getVoices();
- const f=vs.find(v=>/google/i.test(v.name)&&/bn|বাংলা/i.test(v.lang+v.name))||vs.find(v=>/bn/i.test(v.lang)&&/female|নাবনিতা|nabanita/i.test(v.name))||vs.find(v=>/bn/i.test(v.lang))||vs.find(v=>/female/i.test(v.name));
+ const fe8chosen=window.browserVoiceName?vs.find(v=>v.name===window.browserVoiceName):null;
+ const f=fe8chosen||vs.find(v=>/google/i.test(v.name)&&/bn|বাংলা/i.test(v.lang+v.name))||vs.find(v=>/bn/i.test(v.lang)&&/female|নাবনিতা|nabanita/i.test(v.name))||vs.find(v=>/bn/i.test(v.lang))||vs.find(v=>/female/i.test(v.name));
  if(f)u.voice=f;u.onend=()=>res();u.onerror=()=>res();speechSynthesis.speak(u)}catch(e){res()}})}
 async function speak(t,rate){
+ t=String(t==null?'':t).replace(/\[\[CHART:[^\]]*\]\]/g,'').replace(/\n{3,}/g,'\n\n'); // #47: চার্ট-মার্কার কখনো পড়া হবে না
+ if(!t.trim())return; // #47: শুধু মার্কার থাকলে বলার কিছু নেই
  const my=++speakToken;speakingNow=true;setMood('speaking');const orb=document.getElementById('orb');orb.classList.add('talking');
  const chunks=(t&&t.length<180)?[t]:chunksOf(t);
  try{for(const c of chunks){
@@ -8263,14 +9058,45 @@ function renderMarkdown(src){
    html+='<div class="mdline">'+mdInlineCode(line)+'</div>'}
   closeList()}
  return html||'<div class="mdline"></div>'}
+async function attachCharts(body, markers){
+ if(!body||!markers||!markers.length)return;
+ for(const m of markers){
+  if(!m||!m.kind)continue;
+  const box=document.createElement('div');
+  box.className='chartbox';
+  box.textContent='📊 চার্ট আঁকছি…';
+  body.appendChild(box);
+  let url='/api/chart?kind='+encodeURIComponent(m.kind);
+  if(m.kind==='concept'&&m.subject)url+='&subject='+encodeURIComponent(m.subject);
+  try{
+   const r=await fetch(url,{headers:{'X-PIN':pin()}});
+   const j=await r.json().catch(()=>null);
+   if(r.ok&&j&&j.ok&&j.svg){box.innerHTML=j.svg}
+   else{box.textContent=(j&&j.error)?j.error:'চার্ট আনা গেল না — এই মুহূর্তে ডেটা নেই বা সার্ভার সাড়া দেয়নি।'}
+  }catch(e){
+   box.textContent='চার্ট আনা গেল না — সংযোগে সমস্যা হয়েছে, একটু পরে আবার চেষ্টা করো।'}
+ }
+ if(typeof scrollChatToBottom==='function')scrollChatToBottom();
+}
+
 function renderFinalBody(d,full){
  const body=d.querySelector('.msg-body');if(!body)return;
- if(d.classList.contains('sokhi')){body.innerHTML=renderMarkdown(full);body.classList.add('md')}
- else body.textContent=full;
+ // #47: extract [[CHART:...]] markers BEFORE markdown rendering
+ const chartMarkers=[]; // #47
+ const chartRe=/\[\[CHART:([^\]]+)\]\]/g; // #47
+ let cleaned=String(full==null?'':full).replace(chartRe,function(_m,inner){ // #47
+  inner=String(inner).trim(); // #47
+  if(inner.indexOf('concept:')===0)chartMarkers.push({kind:'concept',subject:inner.slice('concept:'.length).trim()}); // #47
+  else if(inner)chartMarkers.push({kind:inner}); // #47
+  return ''}); // #47
+ cleaned=cleaned.replace(/\n{3,}/g,'\n\n'); // #47: collapse the gap the marker left
+ if(d.classList.contains('sokhi')){body.innerHTML=renderMarkdown(cleaned);body.classList.add('md')}
+ else body.textContent=cleaned;
+ if(d.classList.contains('sokhi')&&chartMarkers.length)attachCharts(body,chartMarkers); // #47
  const act=d.querySelector('.msg-actions');
  if(act){const old=act.querySelector('.foldbtn');if(old)old.remove()}
  body.classList.remove('folded');
- if(full&&full.length>700&&act){
+ if(cleaned&&cleaned.length>700&&act){
   body.classList.add('folded');
   const fb=document.createElement('button');fb.type='button';fb.className='foldbtn';fb.textContent='আরও দেখাও';
   fb.onclick=e=>{e.stopPropagation();const nowFolded=body.classList.toggle('folded');fb.textContent=nowFolded?'আরও দেখাও':'কম দেখাও';if(!nowFolded)scrollChatToBottom()};
@@ -8281,14 +9107,15 @@ function startReveal(d,full){
  const body=d.querySelector('.msg-body');if(!body)return;
  body.classList.remove('md','folded');body.style.whiteSpace='pre-wrap';body.textContent='';
  const state={msgEl:d,full:full,pos:0,done:false,raf:0};
+ const disp=String(full).replace(/\[\[CHART:[^\]]*\]\]/g,''); // #47: reveal-এ মার্কার দেখাবে না
  activeReveal=state;updateStopBtn();
  const step=()=>{
   if(state.done)return;
-  const inc=Math.max(3,Math.ceil(full.length/70));
-  state.pos=Math.min(full.length,state.pos+inc);
-  body.textContent=full.slice(0,state.pos);
+  const inc=Math.max(3,Math.ceil(disp.length/70));
+  state.pos=Math.min(disp.length,state.pos+inc);
+  body.textContent=disp.slice(0,state.pos);
   if(chatDistFromBottom()<=180)scrollChatToBottom();
-  if(state.pos<full.length)state.raf=requestAnimationFrame(step);
+  if(state.pos<disp.length)state.raf=requestAnimationFrame(step);
   else completeReveal(state)};
  state.raf=requestAnimationFrame(step)}
 function completeReveal(state){
@@ -9802,11 +10629,165 @@ window.dailyLoadBazaar = loadBazaar;
 window.dailyLoadCard = loadDailyCard;
 })();
 
+function buildSettingsV18Model(){
+ const panel=document.querySelector('#modal .panel');if(!panel)return;
+ if(document.getElementById('fe8modelsec'))return;
+ const closeBtn=Array.prototype.slice.call(panel.querySelectorAll('button')).find(function(b){return b.textContent.trim()==='বন্ধ করো'});
+ const box=document.createElement('div');box.id='fe8modelsec';
+ box.innerHTML=
+  '<hr><div class="secttl">🧠 Gemini মডেল</div>'+
+  '<div style="font-size:13px;margin-top:6px">কোন মডেলটা আগে চেষ্টা হবে: '+
+  '<select id="fe8model">'+
+  '<option value="auto">স্বয়ংক্রিয় (সুপারিশ — মডেল নিজে বেছে নেবে)</option>'+
+  '<option value="gemini-3.5-flash-lite">দ্রুত (flash-lite)</option>'+
+  '<option value="gemini-3.5-flash">gemini-3.5-flash</option>'+
+  '<option value="gemini-2.5-flash">gemini-2.5-flash</option>'+
+  '<option value="gemini-3.8-flash">gemini-3.8-flash (বর্তমান ডিফল্ট)</option>'+
+  '<option value="custom">নিজের মডেলের নাম…</option>'+
+  '</select></div>'+
+  '<div id="fe8modelcustomrow" style="display:none;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:13px">'+
+  '<input id="fe8modelcustom" type="text" placeholder="যেমন: gemini-2.5-flash" style="flex:1;min-width:160px">'+
+  '<button id="fe8modelsave" type="button">সেভ</button></div>'+
+  '<div id="fe8modelmsg" class="small" style="margin-top:6px"></div>'+
+  '<div class="hint">নিজে মডেল বেছে দিলে সেটাই আগে চেষ্টা হবে; পাওয়া না গেলে নিজে থেকে অন্য ফ্রি মডেলে চলে যাবে আর চ্যাটে জানিয়ে দেবে।</div>';
+ if(closeBtn)panel.insertBefore(box,closeBtn);else panel.appendChild(box);
+ const sel=$('fe8model');
+ const row=$('fe8modelcustomrow');
+ const inp=$('fe8modelcustom');
+ const msg=$('fe8modelmsg');
+ function showMsg(t,isErr){
+  if(!msg)return;
+  msg.textContent=t||'';
+  msg.style.color=isErr?'#c0392b':''}
+ async function saveModel(val){
+  showMsg('সেভ হচ্ছে…');
+  try{
+   const r=await api('/api/settings',{gemini_model:val});
+   if(r&&r.ok===false){showMsg(r.error||'সেভ হয়নি — মডেলের নামটা আবার দেখো।',true);return false}
+   showMsg('সেভ হয়ে গেছে ✓');
+   return true;
+  }catch(e){showMsg('সেভ হয়নি — আবার চেষ্টা করো।',true);return false}}
+ if(sel)sel.addEventListener('change',function(){
+  if(sel.value==='custom'){
+   if(row)row.style.display='flex';
+   showMsg('নিচে মডেলের নাম লিখে সেভ চাপো।');
+   if(inp)inp.focus();
+  }else{
+   if(row)row.style.display='none';
+   saveModel(sel.value);
+  }});
+ const sv=$('fe8modelsave');
+ if(sv)sv.addEventListener('click',function(){
+  const v=inp?inp.value.trim():'';
+  if(!v){showMsg('আগে মডেলের নামটা লেখো।',true);return}
+  saveModel(v)});
+ fe8LoadModel();
+}
+async function fe8LoadModel(){
+ const sel=$('fe8model');if(!sel)return;
+ const row=$('fe8modelcustomrow');
+ const inp=$('fe8modelcustom');
+ try{
+  const s=await apiGet('/api/status');
+  if(!s)return;
+  if(!s.gemini_model_mode||s.gemini_model_mode==='auto'){
+   sel.value='auto';
+   if(row)row.style.display='none';
+   return}
+  const known=['gemini-3.5-flash-lite','gemini-3.5-flash','gemini-2.5-flash','gemini-3.8-flash'];
+  const m=s.gemini_model||'';
+  if(known.indexOf(m)>=0){
+   sel.value=m;
+   if(row)row.style.display='none';
+  }else{
+   sel.value='custom';
+   if(row)row.style.display='flex';
+   if(inp)inp.value=m;
+  }
+ }catch(e){}}
+/* boot (আলাদা করে যোগ করো): buildSettingsExtras();-এর পরে
+   buildSettingsV18Model(); */
+
+window.browserVoiceName=window.browserVoiceName||'';
+
+function populateBrowserVoices(){
+ const sel=$('fe8browser');if(!sel)return;
+ let vs=[];try{vs=speechSynthesis.getVoices()||[]}catch(e){}
+ const cur=sel.value||window.browserVoiceName||'';
+ sel.innerHTML='';
+ const auto=document.createElement('option');auto.value='';auto.textContent='স্বয়ংক্রিয় (ডিভাইসের সেরা বাংলা গলা)';sel.appendChild(auto);
+ vs.forEach(function(v){const o=document.createElement('option');o.value=v.name;o.textContent=v.name+' — '+(v.lang||'');sel.appendChild(o)});
+ /* Preserve the current selection when that voice still exists on this
+    device; if it does not (e.g. name saved from another device), the select
+    falls back to "" (স্বয়ংক্রিয়) on screen. The saved config is NOT
+    rewritten here — populate never saves. */
+ if(cur&&vs.some(function(v){return v.name===cur}))sel.value=cur;else sel.value=''}
+
+async function fe8LoadVoices(){
+ try{const s=await apiGet('/api/status');if(!s)return;
+  if(s.tts_voice){const ev=$('fe8edgevoice');if(ev)ev.value=s.tts_voice}
+  window.browserVoiceName=s.browser_voice||'';
+  populateBrowserVoices();
+  const bs=$('fe8browser');if(bs&&window.browserVoiceName)bs.value=window.browserVoiceName;
+ }catch(e){}}
+
+async function fe8TestVoice(){
+ const sample='আসসালামু আলাইকুম, আমি সখী।';
+ const name=window.browserVoiceName||'';
+ if(name){
+  try{const vs=speechSynthesis.getVoices()||[];
+   const v=vs.find(function(x){return x.name===name});
+   if(v){const u=new SpeechSynthesisUtterance(sample);u.voice=v;u.lang=v.lang||'bn-BD';u.rate=.92*(window.voiceRate||1);u.pitch=1.05;speechSynthesis.speak(u);return}
+  }catch(e){}
+  /* Chosen name is not present on THIS device — fall through to the
+     Edge-then-synthSpeak path below instead of staying silent. */}
+ try{if(typeof edgeSpeak!=='function')throw 'noedge';await edgeSpeak(sample);return}catch(e){}
+ try{await synthSpeak(sample)}catch(e){}}
+
+function buildSettingsV18Voice(){
+ const panel=document.querySelector('#modal .panel');if(!panel)return;
+ if($('fe8settings'))return;
+ const closeBtn=Array.prototype.slice.call(panel.querySelectorAll('button')).find(function(b){return b.textContent.trim()==='বন্ধ করো'});
+ const box=document.createElement('div');box.id='fe8settings';
+ box.innerHTML=
+  '<hr><div class="secttl">🗣️ কণ্ঠ বাছাই</div>'+
+  '<div style="font-size:13px;margin-top:6px">Edge গলা: '+
+  '<select id="fe8edgevoice"><option value="bn-BD-NabanitaNeural">নাবনিতা (নারী কণ্ঠ)</option><option value="bn-BD-PradeepNeural">প্রদীপ (পুরুষ কণ্ঠ)</option></select></div>'+
+  '<div style="font-size:13px;margin-top:6px">ব্রাউজারের গলা: '+
+  '<select id="fe8browser"><option value="">স্বয়ংক্রিয় (ডিভাইসের সেরা বাংলা গলা)</option></select></div>'+
+  '<div style="margin-top:8px"><button id="fe8voicetest" type="button">কণ্ঠ পরীক্ষা</button> <span id="fe8voicemsg" class="small"></span></div>'+
+  '<div class="hint">Edge গলা ইন্টারনেটে তৈরি হয়; ব্রাউজারের গলা ডিভাইসের নিজের। গলার গতি আগের স্লাইডারেই বদলায়।</div>';
+ if(closeBtn)panel.insertBefore(box,closeBtn);else panel.appendChild(box);
+ const ev=$('fe8edgevoice');
+ if(ev)ev.addEventListener('change',async function(){
+  const msg=$('fe8voicemsg');
+  try{const j=await api('/api/settings',{tts_voice:ev.value});
+   if(j&&j.ok){if(msg)msg.textContent='✅ Edge গলা সেভ হয়েছে'}
+   else{if(msg)msg.textContent='❌ '+(j&&j.error?j.error:'সেভ হয়নি');fe8LoadVoices()}
+  }catch(e){if(msg)msg.textContent='❌ সেভ হয়নি — আবার চেষ্টা করো'}});
+ const bs=$('fe8browser');
+ if(bs)bs.addEventListener('change',async function(){
+  window.browserVoiceName=bs.value;
+  const msg=$('fe8voicemsg');
+  try{const j=await api('/api/settings',{browser_voice:bs.value});
+   if(j&&j.ok){if(msg)msg.textContent=bs.value?'✅ ব্রাউজারের গলা সেভ হয়েছে':'✅ ব্রাউজারের গলা স্বয়ংক্রিয় রাখা হয়েছে'}
+   else{if(msg)msg.textContent='❌ '+(j&&j.error?j.error:'সেভ হয়নি')}
+  }catch(e){if(msg)msg.textContent='❌ সেভ হয়নি — আবার চেষ্টা করো'}});
+ const tb=$('fe8voicetest');
+ if(tb)tb.addEventListener('click',function(){fe8TestVoice()});
+ if(window.speechSynthesis){
+  try{speechSynthesis.addEventListener('voiceschanged',populateBrowserVoices)}
+  catch(e){try{speechSynthesis.onvoiceschanged=populateBrowserVoices}catch(e2){}}}
+ populateBrowserVoices();
+ fe8LoadVoices()}
+
 /* ================= বুট ================= */
 buildConvoBar();
 buildMemoryPane();
 buildPinsPane();
 buildSettingsExtras();
+buildSettingsV18Model();
+buildSettingsV18Voice();
 buildFocusButton();
 buildBrainBadge();
 buildAttach();
@@ -10240,6 +11221,24 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("X-PIN", "") == get_pin()
 
     def do_GET(self):
+        # --- v1.8.0 #47: inline chart SVG (query string থাকে, তাই parse করে)
+        _parsed = urllib.parse.urlparse(self.path)
+        if _parsed.path == "/api/chart":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            _qs = urllib.parse.parse_qs(_parsed.query)
+            _kind = (_qs.get("kind") or [""])[0].strip()
+            _subj = (_qs.get("subject") or [""])[0].strip()
+            if _kind == "concept":
+                _svg = concept_svg(_subj) if _subj else None
+                if not _svg:
+                    return self._json({"ok": False, "error": f"{_NO_DATA} — এই বিষয়ের ধারণা-মানচিত্র আঁকার মতো পাঠ পাইনি।"})
+                return self._json({"ok": True, "kind": "concept", "title": f"ধারণা-মানচিত্র — {_subj}", "svg": _svg})
+            _series = chart_series(_kind)
+            if not _series:
+                return self._json({"ok": False, "error": f"{_NO_DATA} — চার্ট আঁকার মতো ডেটা পাইনি।"})
+            _svg = svg_line_chart(_series) if _kind == "coverage" else svg_bar_chart(_series)
+            return self._json({"ok": True, "kind": _kind, "title": _series.get("title", ""), "svg": _svg})
         if self.path in ("/", "/index.html"):
             body = HTML.encode("utf-8")
             self.send_response(200)
@@ -10262,7 +11261,7 @@ class Handler(BaseHTTPRequestHandler):
                                "knowledge": len(load_json(KNOW_FILE, {})),
                                "auto_upgrade": bool(get_config().get("auto_self_upgrade", True)),
                                "voice_engine": tts_engine_status(), "voice_rate": _clamp_voice_rate(get_config().get("voice_rate", 1.0)),
-                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
+                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
         if self.path == "/api/memory":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
@@ -10412,6 +11411,19 @@ class Handler(BaseHTTPRequestHandler):
                 _dl = max(0.3, min(1.0, _dl))
                 cfg = get_config(); cfg["dim_level"] = _dl; save_config(cfg)
                 return self._json({"ok": True, "dim_level": _dl})
+            if "gemini_model" in data:
+                _gm = str(data.get("gemini_model") or "").strip()
+                cfg = get_config()
+                if _gm == "auto":
+                    cfg["gemini_model_mode"] = "auto"
+                    save_config(cfg)
+                    return self._json({"ok": True, "gemini_model": cfg.get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": "auto"})
+                if len(_gm) > 80 or not re.match(r"^gemini[A-Za-z0-9._\-]{0,74}$", _gm):
+                    return self._json({"ok": False, "error": "মডেলের নামটা ঠিক লাগছে না — 'gemini' দিয়ে শুরু হতে হবে, শুধু ইংরেজি অক্ষর/সংখ্যা/./-/_ চলবে, আর সর্বোচ্চ ৮০ অক্ষর। যেমন: gemini-2.5-flash"})
+                cfg["gemini_model"] = _gm
+                cfg["gemini_model_mode"] = "custom"
+                save_config(cfg)
+                return self._json({"ok": True, "gemini_model": _gm, "gemini_model_mode": "custom"})
             preset = str(data.get("tts_preset") or "")
             presets = {"মিষ্টি": ("-3%", "+4%"), "স্বাভাবিক": ("0%", "+1%"), "প্রাণবন্ত": ("+5%", "+5%")}
             if preset in presets:
@@ -10429,6 +11441,18 @@ class Handler(BaseHTTPRequestHandler):
                 cfg["voice_rate"] = vr
                 save_config(cfg)
                 return self._json({"ok": True, "voice_rate": vr})
+            if "tts_voice" in data:
+                _ok, _res = validate_tts_voice(data.get("tts_voice"))
+                if not _ok:
+                    return self._json({"ok": False, "error": _res})
+                cfg = get_config(); cfg["tts_voice"] = _res; save_config(cfg)
+                return self._json({"ok": True, "tts_voice": _res})
+            if "browser_voice" in data:
+                _ok, _res = validate_browser_voice(data.get("browser_voice"))
+                if not _ok:
+                    return self._json({"ok": False, "error": _res})
+                cfg = get_config(); cfg["browser_voice"] = _res; save_config(cfg)
+                return self._json({"ok": True, "browser_voice": _res})
             if isinstance(data.get("call_name"), str):
                 cfg = get_config()
                 cfg["call_name"] = data["call_name"].strip()[:40]
@@ -10616,7 +11640,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 
 def main():
@@ -10667,6 +11691,8 @@ def main():
         log_change(f"আপগ্রেড: v{APP_VERSION} — professional UI polish + স্থির গ্রিড/প্যানেল-স্ক্রল/auto-scroll, গলার গতি ঠিক (preset পুনঃসামঞ্জস্য + মোট slowdown cap −12% + গতি স্লাইডার) ও Edge নির্ভরযোগ্যতা, reply দ্রুত (fast-first মডেল + timeout 12s + daily-release background-এ), F1–F8/N10/N11 পূর্ণ রূপ, bridge Desktop প্রোটোকল")
         register_capability("v13-parked", "ভাষা পছন্দ (বাংলা/Banglish/English), বার্তা ও কথোপকথন pin, backup/restore, wake word, রাতের auto-dim, sync ফাইল")
         log_change("আপগ্রেড: v1.3.0 — parked ৬টি: উত্তরের ভাষা পছন্দ, pin (বার্তা + কথোপকথন), সব কথোপকথন backup/restore, wake word 'Sokhi', রাতের auto-dim, বহু-ডিভাইস sync (ফাইল-ভিত্তিক)")
+        register_capability("v18-deferred3", "ছবি/চার্ট উত্তর (inline SVG), Gemini মডেল বাছাই, কণ্ঠ বাছাই (Edge + ব্রাউজার) ও কণ্ঠ পরীক্ষা")
+        log_change("আপগ্রেড: v1.8.0 — deferred ৩টি: #47 আসল ডেটা থেকে inline SVG চার্ট/ধারণা-মানচিত্র, #49 Gemini মডেল বাছাই (auto/custom + fallback নোটিশ), #50 কণ্ঠ বাছাই (Edge নাবনিতা/প্রদীপ + ব্রাউজারের গলা) ও কণ্ঠ পরীক্ষা বোতাম")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
