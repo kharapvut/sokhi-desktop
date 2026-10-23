@@ -157,6 +157,9 @@ def get_config():
     cfg.setdefault("bridge_enabled", False)
     cfg.setdefault("computer_use_enabled", False)
     cfg.setdefault("away_mode", True)
+    cfg.setdefault("reply_style", "স্বাভাবিক")
+    cfg.setdefault("quiet_start", "")
+    cfg.setdefault("quiet_end", "")
     if not CONFIG_FILE.exists():
         save_json(CONFIG_FILE, cfg)
     return cfg
@@ -513,7 +516,7 @@ def _log_gemini_error(model, err):
         pass
 
 
-def ask_gemini(user_text, mem, quality=False):
+def ask_gemini(user_text, mem, quality=False, image=None):
     """Smart brain — Gemini FREE tier only. Tries free models so one
     model's limit/overload does not drop Sokhi back to her offline brain.
     The real error is logged (never the key itself) so failures can be
@@ -555,9 +558,32 @@ def ask_gemini(user_text, mem, quality=False):
         system += ("\n\n[ডাকনামের নিয়ম — সবচেয়ে জরুরি, আগের সব নির্দেশের উপরে] "
                    "তুমি তাকে কোনো নামে ডাকবে না — 'ভাইয়া' বা 'মনির ভাইয়া' বলবে না; "
                    "শুধু তুমি-রূপে, নাম ছাড়া কথা বলবে।")
+    _style = (cfg.get("reply_style") or "স্বাভাবিক").strip()
+    if _style == "সংক্ষেপ":
+        system += "\nউত্তর খুব সংক্ষেপে, ১-৩ বাক্যে দাও।"
+    elif _style == "বিস্তারিত":
+        system += "\nউত্তর বিস্তারিতভাবে, ধাপে ধাপে দাও।"
+    _contents = gemini_contents(user_text)
+    if image:
+        try:
+            _img = image
+            if isinstance(_img, str):
+                # data-URL string: data:<mime>;base64,<data>
+                _m = re.match(r"data:([^;]+);base64,(.*)", _img, re.S)
+                if _m:
+                    _img = {"mime_type": _m.group(1), "data": _m.group(2).strip()}
+                else:
+                    _img = {"mime_type": "image/png", "data": _img}
+            _mime = str(_img.get("mime_type") or _img.get("mime") or "image/png")
+            _data = str(_img.get("data") or "")
+            if _data and _contents:
+                _contents[-1]["parts"].append(
+                    {"inline_data": {"mime_type": _mime, "data": _data}})
+        except Exception:
+            pass
     body = {
         "system_instruction": {"parts": [{"text": system}]},
-        "contents": gemini_contents(user_text),
+        "contents": _contents,
         # 700 tokens is plenty for everyday chat and returns sooner;
         # quality calls keep the full 1024 for long teacher-style answers.
         "generationConfig": {"temperature": 0.4,
@@ -2768,6 +2794,276 @@ def gemini_contents(user_text):
     return merged
 
 
+
+# ------------------------------------------------ v1.2.0: conversations store
+# DATA/"conversations.json": {"active": id, "items":[{id,title,created,
+# updated,messages:[{r,t,ts}]}]} — multiple titled chats (ideas 15-21).
+CONVERSATIONS_FILE = DATA / "conversations.json"
+FEEDBACK_FILE = DATA / "feedback.json"
+_DEFAULT_CONVO_TITLE = "নতুন কথোপকথন"
+
+
+def _new_convo_id():
+    return "c" + str(int(time.time() * 1000)) + secrets.token_hex(3)
+
+
+def convos_load():
+    """Load the conversations store; always returns a sane dict."""
+    data = load_json(CONVERSATIONS_FILE, None)
+    if not isinstance(data, dict):
+        return {"active": None, "items": []}
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+    data["items"] = items
+    if data.get("active") not in [it.get("id") for it in items if isinstance(it, dict)]:
+        data["active"] = items[0].get("id") if items else None
+    return data
+
+
+def convos_save(data):
+    try:
+        save_json(CONVERSATIONS_FILE, data)
+    except Exception:
+        pass
+    return data
+
+
+def _convo_find(data, cid):
+    for it in data.get("items", []):
+        if isinstance(it, dict) and it.get("id") == cid:
+            return it
+    return None
+
+
+def convo_new(title=None):
+    """Create a new conversation, make it active, and return it."""
+    data = convos_load()
+    now = int(time.time())
+    title = str(title or "").strip()[:80] or _DEFAULT_CONVO_TITLE
+    item = {"id": _new_convo_id(), "title": title,
+            "created": now, "updated": now, "messages": []}
+    data.setdefault("items", []).append(item)
+    data["active"] = item["id"]
+    convos_save(data)
+    return item
+
+
+def convo_active():
+    """Return the active conversation dict (creating one if none exists)."""
+    data = convos_load()
+    item = _convo_find(data, data.get("active"))
+    if item is None:
+        if data.get("items"):
+            item = data["items"][0]
+            data["active"] = item.get("id")
+            convos_save(data)
+        else:
+            item = convo_new()
+    return item
+
+
+def convo_append(user_text, reply):
+    """Append a user+model exchange to the active conversation.
+    Auto-titles from the first user message when the title is still
+    empty/the default. Returns the active conversation item."""
+    data = convos_load()
+    item = _convo_find(data, data.get("active"))
+    if item is None:
+        if data.get("items"):
+            item = data["items"][0]
+            data["active"] = item.get("id")
+        else:
+            now = int(time.time())
+            item = {"id": _new_convo_id(), "title": _DEFAULT_CONVO_TITLE,
+                    "created": now, "updated": now, "messages": []}
+            data.setdefault("items", []).append(item)
+            data["active"] = item["id"]
+    now = int(time.time())
+    item.setdefault("messages", [])
+    item["messages"].append({"r": "user", "t": str(user_text or ""), "ts": now})
+    item["messages"].append({"r": "model", "t": str(reply or ""), "ts": now})
+    item["updated"] = now
+    if not str(item.get("title") or "").strip() or item.get("title") == _DEFAULT_CONVO_TITLE:
+        first_user = str(user_text or "").strip()
+        if first_user:
+            item["title"] = first_user[:40]
+    convos_save(data)
+    return item
+
+
+def convos_api(data):
+    """POST /api/convos handler (ideas 15-21)."""
+    data = data or {}
+    action = str(data.get("action") or "").strip()
+    store = convos_load()
+    if action == "create":
+        item = convo_new(data.get("title"))
+        return {"ok": True, "id": item["id"], "active": item["id"],
+                "title": item.get("title", "")}
+    if action == "switch":
+        cid = str(data.get("id") or "")
+        if _convo_find(store, cid) is None:
+            return {"ok": False, "error": "এই কথোপকথনটা খুঁজে পাইনি।"}
+        store["active"] = cid
+        convos_save(store)
+        return {"ok": True, "id": cid, "active": cid}
+    if action == "get":
+        cid = str(data.get("id") or store.get("active") or "")
+        item = _convo_find(store, cid)
+        if item is None:
+            return {"ok": False, "error": "এই কথোপকথনটা খুঁজে পাইনি।", "messages": []}
+        return {"ok": True, "id": item.get("id"), "title": item.get("title", ""),
+                "messages": item.get("messages", [])}
+    if action == "rename":
+        cid = str(data.get("id") or "")
+        item = _convo_find(store, cid)
+        title = str(data.get("title") or "").strip()[:80]
+        if item is None:
+            return {"ok": False, "error": "এই কথোপকথনটা খুঁজে পাইনি।"}
+        if not title:
+            return {"ok": False, "error": "নতুন নামটা লিখে দাও।"}
+        item["title"] = title
+        item["updated"] = int(time.time())
+        convos_save(store)
+        return {"ok": True, "id": cid, "title": title}
+    if action == "delete":
+        cid = str(data.get("id") or "")
+        if _convo_find(store, cid) is None:
+            return {"ok": False, "error": "এই কথোপকথনটা খুঁজে পাইনি।"}
+        was_active = store.get("active") == cid
+        store["items"] = [it for it in store.get("items", [])
+                          if not (isinstance(it, dict) and it.get("id") == cid)]
+        if not store["items"]:
+            convos_save(store)
+            item = convo_new()
+            return {"ok": True, "id": cid, "active": item["id"]}
+        if was_active:
+            store["active"] = store["items"][-1].get("id")
+        convos_save(store)
+        return {"ok": True, "id": cid, "active": store.get("active")}
+    if action == "clear":
+        item = _convo_find(store, store.get("active"))
+        if item is None:
+            item = convo_new()
+            return {"ok": True, "id": item["id"], "active": item["id"]}
+        item["messages"] = []
+        item["updated"] = int(time.time())
+        convos_save(store)
+        return {"ok": True, "id": item.get("id"), "active": item.get("id")}
+    if action == "search":
+        q = str(data.get("q") or "").strip()
+        if not q:
+            return {"ok": True, "results": [], "items": []}
+        ql = q.lower()
+        results = []
+        for it in store.get("items", []):
+            if not isinstance(it, dict):
+                continue
+            title = str(it.get("title") or "")
+            snippet = ""
+            if ql in title.lower():
+                snippet = title[:80]
+            else:
+                for m in it.get("messages", []):
+                    t = str(m.get("t") or "")
+                    idx = t.lower().find(ql)
+                    if idx >= 0:
+                        start = max(0, idx - 20)
+                        snippet = t[start:start + 80]
+                        break
+                if not snippet:
+                    continue
+            results.append({"id": it.get("id"), "title": title, "snippet": snippet})
+        return {"ok": True, "results": results, "items": results}
+    if action == "truncate":
+        cid = str(data.get("id") or store.get("active") or "")
+        item = _convo_find(store, cid)
+        if item is None:
+            return {"ok": False, "error": "এই কথোপকথনটা খুঁজে পাইনি।"}
+        try:
+            keep = int(data.get("keep", 0))
+        except Exception:
+            keep = 0
+        keep = max(0, keep)
+        item["messages"] = list(item.get("messages", []))[:keep]
+        item["updated"] = int(time.time())
+        convos_save(store)
+        return {"ok": True, "id": cid, "count": len(item["messages"])}
+    return {"ok": False, "error": "কী করতে হবে বুঝতে পারিনি — action ঠিক করে পাঠাও।"}
+
+
+def memory_api(data):
+    """POST /api/memory handler (ideas 22-24): view-side mutations."""
+    data = data or {}
+    action = str(data.get("action") or "").strip()
+    mem = get_memory()
+    if action == "delete_fact":
+        try:
+            idx = int(data.get("index"))
+        except Exception:
+            return {"ok": False, "error": "তথ্যের নম্বরটা ঠিক করে পাঠাও।"}
+        facts = mem.setdefault("facts", [])
+        if 0 <= idx < len(facts):
+            facts.pop(idx)
+            save_json(MEMORY_FILE, mem)
+            return {"ok": True, "facts": facts}
+        return {"ok": False, "error": "এই নম্বরের কোনো তথ্য পাইনি।"}
+    if action == "add_fact":
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "যে তথ্যটা মনে রাখতে হবে, সেটা লিখে দাও।"}
+        mem.setdefault("facts", []).append(text[:500])
+        save_json(MEMORY_FILE, mem)
+        return {"ok": True, "facts": mem["facts"]}
+    if action == "delete_note":
+        try:
+            idx = int(data.get("index"))
+        except Exception:
+            return {"ok": False, "error": "নোটের নম্বরটা ঠিক করে পাঠাও।"}
+        notes = mem.setdefault("learned_notes", [])
+        if 0 <= idx < len(notes):
+            notes.pop(idx)
+            save_json(MEMORY_FILE, mem)
+            return {"ok": True, "learned_notes": notes}
+        return {"ok": False, "error": "এই নম্বরের কোনো নোট পাইনি।"}
+    return {"ok": False, "error": "কী করতে হবে বুঝতে পারিনি — action ঠিক করে পাঠাও।"}
+
+
+def feedback_api(data):
+    """POST /api/feedback handler (idea 13): 👍/👎 rating log."""
+    data = data or {}
+    rating = str(data.get("rating") or "").strip()
+    if rating not in ("up", "down"):
+        return {"ok": False, "error": "রেটিংটা 'up' বা 'down' হতে হবে।"}
+    text = str(data.get("text") or "")[:200]
+    items = load_json(FEEDBACK_FILE, [])
+    if not isinstance(items, list):
+        items = []
+    items.append({"ts": int(time.time()), "rating": rating, "text": text})
+    save_json(FEEDBACK_FILE, items[-500:])
+    return {"ok": True}
+
+
+def _parse_image_data_url(image):
+    """Parse a data-URL (or raw base64) into {mime_type, data} or None."""
+    if not image:
+        return None
+    if isinstance(image, dict):
+        d = str(image.get("data") or "")
+        if d:
+            return {"mime_type": str(image.get("mime_type") or image.get("mime") or "image/png"),
+                    "data": d}
+        return None
+    s = str(image).strip()
+    m = re.match(r"data:([^;]+);base64,(.*)", s, re.S)
+    if m:
+        return {"mime_type": m.group(1), "data": m.group(2).strip()}
+    if s:
+        return {"mime_type": "image/png", "data": s}
+    return None
+
+
 def layered_memory_block(mem):
     """Layered memory (N3): recent learned notes + custom rules, for the
     Gemini system prompt."""
@@ -4631,6 +4927,41 @@ input[type=range]{flex:1;padding:0;accent-color:var(--accent)}
 .secttl{font-size:14px;font-weight:600;margin-bottom:4px}
 .statline{font-size:13px;color:var(--muted);margin-bottom:8px}
 .hint{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5}
+/* v1.2 fe1 */
+#bar{flex-wrap:wrap;align-items:flex-end}
+#bar textarea#text{flex:1;width:auto;min-width:0;resize:none;max-height:132px;overflow-y:auto;line-height:1.45}
+#suggest{display:flex;flex-wrap:wrap;gap:6px;flex:0 0 100%;justify-content:center}
+#suggest:empty{display:none}
+.chip{font-size:12.5px;padding:6px 12px;border-radius:999px;background:var(--panel2)}
+#stopbtn{background:#8c1d33;border-color:#c94f6d;color:#fff}
+#scrollbtn{position:fixed;right:18px;bottom:88px;z-index:45;border-radius:999px;padding:8px 14px;font-size:13px;box-shadow:var(--shadow);background:var(--accent2);color:#fff;border:1px solid var(--line)}
+.msg-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.me .msg-main{align-items:flex-end}
+.msg-body{white-space:pre-wrap;word-break:break-word;min-width:0}
+.msg-body.md{white-space:normal}
+.msg-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.me .msg-meta{flex-direction:row-reverse}
+.ts{font-size:11px;color:var(--muted);opacity:.85}
+.msg-actions{display:inline-flex;gap:4px;flex-wrap:wrap}
+.msg-actions button{font-size:11px;padding:2px 8px;border-radius:999px;line-height:1.5}
+.msg-actions button.rated{background:var(--accent);color:#04101f;border-color:var(--accent)}
+.msg.thinking{opacity:.92}
+.thinkdots span{animation:thinkblink 1.2s infinite;display:inline-block}
+.thinkdots span:nth-child(2){animation-delay:.2s}
+.thinkdots span:nth-child(3){animation-delay:.4s}
+@keyframes thinkblink{0%,60%,100%{opacity:.15}30%{opacity:1}}
+.mdline{margin:1px 0}
+.mdgap{height:8px}
+.mdh{font-weight:700;font-size:16px;margin:6px 0 3px}
+.mdlist{margin:4px 0 4px 18px;padding:0}
+.mdlist li{margin:2px 0}
+.msg-body code{background:rgba(0,0,0,.35);padding:1px 5px;border-radius:5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+.mdcode{position:relative;margin:8px 0;background:#0a101d;border:1px solid var(--line);border-radius:8px}
+.mdcode pre{margin:0;padding:10px 12px;overflow-x:auto}
+.mdcode pre code{background:transparent;padding:0;font-size:13px;white-space:pre}
+.mdcode .codecopy{position:absolute;top:6px;right:6px;font-size:11px;padding:2px 8px;border-radius:999px}
+.msg-body a{color:var(--accent);text-decoration:underline}
+.msg-body.folded{max-height:170px;overflow:hidden}
 </style></head><body data-theme="blue">
 <div class="tagline">Sokhi is the world's first Sci-Fi AI Desktop Experience — built for those who grew up dreaming of JARVIS, and refused to settle for boring software.</div>
 <header>
@@ -4784,10 +5115,13 @@ input[type=range]{flex:1;padding:0;accent-color:var(--accent)}
 </div>
 
 <div id="bar">
- <input id="text" placeholder="Sokhi-কে বলো... (বাংলা/Banglish)" onkeydown="if(event.key==='Enter')send()">
+ <div id="suggest"></div>
+ <textarea id="text" rows="1" placeholder="Sokhi-কে বলো... (বাংলা/Banglish)"></textarea>
  <button onclick="mic()">🎤</button>
  <button id="livebtn" onclick="toggleLive()">লাইভ</button>
+ <button id="stopbtn" onclick="stopAll()" style="display:none">⏹ থামাও</button>
  <button onclick="send()">পাঠাও</button>
+ <button id="scrollbtn" onclick="scrollChatToBottom()" style="display:none">⬇ সর্বশেষ</button>
 </div>
 
 <div id="idle">
@@ -4831,17 +5165,39 @@ function scrollChatToBottom(){
  const c=document.getElementById('chat');if(!c)return;
  c.scrollTop=c.scrollHeight;
  requestAnimationFrame(()=>{c.scrollTop=c.scrollHeight})}
-function add(t,who){
- const c=document.getElementById('chat');
- const distBefore=c?chatDistFromBottom():0;
+function add(t,who,opts){
+ opts=opts||{};
+ const c=document.getElementById('chat');if(!c)return null;
+ const distBefore=chatDistFromBottom();
  const d=document.createElement('div');d.className='msg '+who;
+ const idx=(typeof opts.idx==='number')?opts.idx:msgSeq;
+ d.dataset.idx=idx;msgSeq=Math.max(msgSeq,idx+1);
+ d._full=String(t==null?'':t);
+ if(opts.err)d.dataset.err='1';
+ const main=document.createElement('div');main.className='msg-main';
+ const body=document.createElement('div');body.className='msg-body';main.appendChild(body);
+ const meta=document.createElement('div');meta.className='msg-meta';
+ const tsEl=document.createElement('span');tsEl.className='ts';tsEl.textContent=fmtTs(opts.ts);meta.appendChild(tsEl);
+ const act=document.createElement('span');act.className='msg-actions';meta.appendChild(act);
+ main.appendChild(meta);
  if(who==='sokhi'){
   const av=document.createElement('span');av.className='avatar';av.textContent='স';d.appendChild(av);
-  const tx=document.createElement('span');tx.textContent=t;d.appendChild(tx);
-  d.style.cursor='pointer';d.title='শুনতে চাপ দাও';d.onclick=()=>speak(t)}
- else{d.textContent=t}
+  d.appendChild(main);
+  d.style.cursor='pointer';d.title='শুনতে চাপ দাও';
+  if(!opts.noActions)buildSokhiActions(d,act);
+  body.addEventListener('click',e=>{
+   if(e.target.closest('button')||e.target.closest('a'))return;
+   if(activeReveal&&activeReveal.msgEl===d){finishReveal();return}
+   speak(d._full)});
+  if(opts.reveal)startReveal(d,d._full);else renderFinalBody(d,d._full)}
+ else{
+  d.appendChild(main);
+  body.textContent=d._full;
+  if(!opts.noActions)buildMeActions(d,act)}
  c.appendChild(d);
- if(who==='me'||distBefore<=120)scrollChatToBottom()}
+ if(who==='me'||distBefore<=120)scrollChatToBottom();
+ if(who==='sokhi')refreshRegenButtons();
+ return d}
 let edgeOk=null, speakingNow=false, currentAudio=null, speakToken=0;
 function stopSpeak(){speakToken++;try{speechSynthesis.cancel()}catch(e){} if(currentAudio){try{currentAudio.pause()}catch(e){} currentAudio=null} speakingNow=false;document.getElementById('orb').classList.remove('talking');setMood('calm')}
 function chunksOf(t){
@@ -4901,7 +5257,14 @@ function listen(){
 function moodRate(t){return /ক্লান্ত|মন খারাপ|ভালো লাগছে না|টেনশন|দুঃখ|কষ্ট হচ্ছে/.test(t)?'-16%':null}
 let examActive=false, examEndAt=0, examTimerId=null;
 async function send(speakIt){
- const el=document.getElementById('text');const t=el.value.trim();if(!t)return;el.value='';
+ const el=document.getElementById('text');const t=el.value.trim();if(!t)return;el.value='';autoGrowText();
+ lastUserText=t;
+ if(pendingEditIdx!==null){
+  const keep=pendingEditIdx;pendingEditIdx=null;
+  if(!examActive){
+   try{await api('/api/convos',{action:'truncate',keep:keep})}catch(e){}
+   document.querySelectorAll('#chat .msg').forEach(m=>{const ix=parseInt(m.dataset.idx,10);if(!isNaN(ix)&&ix>=keep)m.remove()});
+   msgSeq=keep;clearSuggestions()}}
  add(t,'me');
  if(examActive){
   try{const j=await api('/api/exam',{action:'answer',answer:t});
@@ -4909,8 +5272,271 @@ async function send(speakIt){
    if(j&&(j.done||j.finished||j.ended))endExamUi();
   }catch(e){}
   return}
- try{const j=await api('/api/chat',{message:t});add(j.reply,'sokhi');if(speakIt)speak(j.reply,moodRate(t))}catch(e){}}
-function quick(t){document.getElementById('text').value=t;send()}
+ await fetchReply(t,speakIt)}
+function quick(t){const el=document.getElementById('text');el.value=t;autoGrowText();send()}
+/* ---------- v1.2 fe1: chat experience (ideas 1-14, 34, 40) ---------- */
+let msgSeq=0, activeReveal=null, thinkingEl=null, thinkingTimer=null, thinkingStart=0;
+let lastFailedText='', lastUserText='', pendingEditIdx=null, stopRequested=false, suggRotate=0;
+function bnDigits(s){return String(s).replace(/[0-9]/g,d=>'০১২৩৪৫৬৭৮৯'[+d])}
+function fmtTs(ts){
+ let d;
+ if(ts==null||ts==='')d=new Date();
+ else if(typeof ts==='number')d=new Date(ts<1e12?ts*1000:ts);
+ else if(typeof ts==='string'&&/^\d+$/.test(ts.trim())){const n=+ts;d=new Date(n<1e12?n*1000:n)}
+ else{d=new Date(ts);if(isNaN(d.getTime()))d=new Date()}
+ const h=d.getHours();
+ const period=h<4?'রাত':h<6?'ভোর':h<12?'সকাল':h<17?'দুপুর':h<19?'বিকেল':h<21?'সন্ধ্যা':'রাত';
+ let h12=h%12;if(h12===0)h12=12;
+ return period+' '+bnDigits(h12)+':'+bnDigits(String(d.getMinutes()).padStart(2,'0'))}
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function mdInline(esc){
+ let s=esc;
+ s=s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+ s=s.replace(/(^|[\s(])(https?:\/\/[^\s<]+)/g,'$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+ s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+ s=s.replace(/(^|[^*])\*([^\*\n]+)\*/g,'$1<em>$2</em>');
+ return s}
+function mdInlineCode(line){
+ const parts=line.split(/`([^`]+)`/);
+ return parts.map((p,i)=>i%2===1?'<code>'+p+'</code>':mdInline(p)).join('')}
+function renderMarkdown(src){
+ const text=String(src==null?'':src);
+ const blocks=text.split(/```(?:\w+)?\n?/);
+ let html='';
+ for(let bi=0;bi<blocks.length;bi++){
+  if(bi%2===1){
+   const code=blocks[bi].replace(/\n$/,'');
+   html+='<div class="mdcode"><button type="button" class="codecopy">📋 কপি</button><pre><code>'+escapeHtml(code)+'</code></pre></div>';
+   continue}
+  const seg=escapeHtml(blocks[bi]);
+  const lines=seg.split('\n');let inList=false;
+  const closeList=()=>{if(inList){html+='</ul>';inList=false}};
+  for(const line of lines){
+   const h=line.match(/^(#{1,3})\s+(.*)$/);
+   if(h){closeList();html+='<div class="mdh">'+mdInlineCode(h[2])+'</div>';continue}
+   const li=line.match(/^\s*[-•]\s+(.*)$/);
+   if(li){if(!inList){html+='<ul class="mdlist">';inList=true}html+='<li>'+mdInlineCode(li[1])+'</li>';continue}
+   closeList();
+   if(line.trim()===''){html+='<div class="mdgap"></div>';continue}
+   html+='<div class="mdline">'+mdInlineCode(line)+'</div>'}
+  closeList()}
+ return html||'<div class="mdline"></div>'}
+function renderFinalBody(d,full){
+ const body=d.querySelector('.msg-body');if(!body)return;
+ if(d.classList.contains('sokhi')){body.innerHTML=renderMarkdown(full);body.classList.add('md')}
+ else body.textContent=full;
+ const act=d.querySelector('.msg-actions');
+ if(act){const old=act.querySelector('.foldbtn');if(old)old.remove()}
+ body.classList.remove('folded');
+ if(full&&full.length>700&&act){
+  body.classList.add('folded');
+  const fb=document.createElement('button');fb.type='button';fb.className='foldbtn';fb.textContent='আরও দেখাও';
+  fb.onclick=e=>{e.stopPropagation();const nowFolded=body.classList.toggle('folded');fb.textContent=nowFolded?'আরও দেখাও':'কম দেখাও';if(!nowFolded)scrollChatToBottom()};
+  act.appendChild(fb)}
+ refreshRegenButtons()}
+function startReveal(d,full){
+ finishReveal();
+ const body=d.querySelector('.msg-body');if(!body)return;
+ body.classList.remove('md','folded');body.style.whiteSpace='pre-wrap';body.textContent='';
+ const state={msgEl:d,full:full,pos:0,done:false,raf:0};
+ activeReveal=state;updateStopBtn();
+ const step=()=>{
+  if(state.done)return;
+  const inc=Math.max(3,Math.ceil(full.length/70));
+  state.pos=Math.min(full.length,state.pos+inc);
+  body.textContent=full.slice(0,state.pos);
+  if(chatDistFromBottom()<=180)scrollChatToBottom();
+  if(state.pos<full.length)state.raf=requestAnimationFrame(step);
+  else completeReveal(state)};
+ state.raf=requestAnimationFrame(step)}
+function completeReveal(state){
+ if(!state||state.done)return;
+ state.done=true;cancelAnimationFrame(state.raf);
+ if(activeReveal===state)activeReveal=null;
+ const body=state.msgEl.querySelector('.msg-body');if(body)body.style.whiteSpace='';
+ renderFinalBody(state.msgEl,state.full);
+ updateStopBtn()}
+function finishReveal(){if(activeReveal)completeReveal(activeReveal)}
+async function copyText(txt,btn){
+ let ok=false;
+ try{await navigator.clipboard.writeText(txt);ok=true}
+ catch(e){
+  try{const ta=document.createElement('textarea');ta.value=txt;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();ok=document.execCommand('copy');ta.remove()}catch(e2){}}
+ if(btn){const old=btn.textContent;btn.textContent=ok?'✓ কপি হয়েছে':'কপি হয়নি';setTimeout(()=>{btn.textContent=old},1400)}
+ return ok}
+function mkActBtn(label,title,fn){
+ const b=document.createElement('button');b.type='button';b.textContent=label;if(title)b.title=title;
+ b.onclick=e=>{e.stopPropagation();fn(b)};return b}
+function buildMeActions(d,act){
+ act.appendChild(mkActBtn('📋','কপি করো',b=>copyText(d._full,b)));
+ act.appendChild(mkActBtn('✏️','বদলে আবার পাঠাও',()=>startEdit(d)))}
+function buildSokhiActions(d,act){
+ act.appendChild(mkActBtn('📋','কপি করো',b=>copyText(d._full,b)));
+ act.appendChild(mkActBtn('👍','ভালো লেগেছে',b=>rateMsg(d,'up',b)));
+ act.querySelectorAll('button')[1].classList.add('ratebtn');
+ const dn=mkActBtn('👎','ভালো লাগেনি',b=>rateMsg(d,'down',b));dn.classList.add('ratebtn');act.appendChild(dn);
+ act.appendChild(mkActBtn('📌 নোটে রাখো','নোটে রাখো',b=>saveToNote(d,b)))}
+function refreshRegenButtons(){
+ document.querySelectorAll('#chat .regenbtn').forEach(b=>b.remove());
+ const msgs=[...document.querySelectorAll('#chat .msg.sokhi')].filter(m=>!m.dataset.err);
+ const last=msgs[msgs.length-1];if(!last)return;
+ const act=last.querySelector('.msg-actions');if(!act)return;
+ const b=document.createElement('button');b.type='button';b.className='regenbtn';b.textContent='↻ আবার উত্তর দাও';
+ b.onclick=e=>{e.stopPropagation();regenerate(b)};
+ act.appendChild(b)}
+async function regenerate(btn){
+ const msgs=[...document.querySelectorAll('#chat .msg.sokhi')].filter(m=>!m.dataset.err);
+ const last=msgs[msgs.length-1];if(!last)return;
+ if(btn){btn.disabled=true;btn.textContent='ভাবছি…'}
+ updateStopBtn();
+ try{
+  const j=await api('/api/chat',{regenerate:true});
+  if(j&&typeof j.reply==='string'&&j.reply){
+   last._full=j.reply;
+   const tsEl=last.querySelector('.ts');if(tsEl)tsEl.textContent=fmtTs();
+   if(btn){btn.disabled=false;btn.textContent='↻ আবার উত্তর দাও'}
+   startReveal(last,j.reply);
+   showSuggestions(j.reply)}
+  else{if(btn){btn.disabled=false;btn.textContent='↻ আবার উত্তর দাও'}setStatus('নতুন উত্তর পাইনি — আবার চেষ্টা করো')}}
+ catch(e){if(btn){btn.disabled=false;btn.textContent='↻ আবার উত্তর দাও'}setStatus('নতুন উত্তর আনা গেল না')}
+ updateStopBtn()}
+async function rateMsg(d,rating,btn){
+ try{await api('/api/feedback',{rating:rating,text:d._full})}catch(e){}
+ d.querySelectorAll('.ratebtn').forEach(b=>b.classList.remove('rated'));
+ if(btn)btn.classList.add('rated');
+ setStatus(rating==='up'?'ধন্যবাদ! 👍 তোমার পছন্দ মনে রাখলাম':'ধন্যবাদ 👎 — আরও ভালো উত্তর দেওয়ার চেষ্টা করব')}
+async function saveToNote(d,btn){
+ try{
+  let cur='';
+  try{const j=await apiGet('/api/notes');
+   if(j&&typeof j.text==='string')cur=j.text;
+   else if(Array.isArray(j))cur=j.map(n=>typeof n==='string'?n:(n.text||'')).join('\n');
+   else if(j&&Array.isArray(j.notes))cur=j.notes.map(n=>typeof n==='string'?n:(n.text||'')).join('\n')}catch(e){}
+  const combined=(cur&&cur.trim()?cur.replace(/\s+$/,'')+'\n\n':'')+d._full;
+  await api('/api/notes',{text:combined});
+  if(btn){const old=btn.textContent;btn.textContent='✓ নোটে রাখা হয়েছে';setTimeout(()=>{btn.textContent=old},1500)}
+  const pane=document.getElementById('pane-notes');if(pane&&pane.classList.contains('on'))loadNotes()}
+ catch(e){setStatus('নোটে রাখা গেল না — আবার চেষ্টা করো')}}
+function startEdit(d){
+ const idx=parseInt(d.dataset.idx,10);
+ const el=document.getElementById('text');if(!el)return;
+ el.value=d._full||'';pendingEditIdx=isNaN(idx)?null:idx;
+ autoGrowText();el.focus();
+ setStatus('✏️ বার্তাটা বদলে পাঠাও — পাঠালেই এই জায়গা থেকে নতুন করে কথোপকথন শুরু হবে')}
+function showThinking(){
+ hideThinking();stopRequested=false;setMood('thinking');
+ const c=document.getElementById('chat');if(!c)return;
+ const d=document.createElement('div');d.className='msg sokhi thinking';
+ const av=document.createElement('span');av.className='avatar';av.textContent='স';d.appendChild(av);
+ const main=document.createElement('div');main.className='msg-main';
+ const body=document.createElement('div');body.className='msg-body';
+ body.innerHTML='Sokhi ভাবছি<span class="thinkdots"><span>.</span><span>.</span><span>.</span></span> (<span class="thinksec">০</span> সে.)';
+ main.appendChild(body);d.appendChild(main);
+ thinkingEl=d;c.appendChild(d);scrollChatToBottom();
+ thinkingStart=Date.now();
+ thinkingTimer=setInterval(()=>{
+  if(!thinkingEl)return;
+  const s=Math.floor((Date.now()-thinkingStart)/1000);
+  const sp=thinkingEl.querySelector('.thinksec');if(sp)sp.textContent=bnDigits(s)},500);
+ updateStopBtn()}
+function hideThinking(){
+ if(thinkingTimer){clearInterval(thinkingTimer);thinkingTimer=null}
+ if(thinkingEl){thinkingEl.remove();thinkingEl=null}
+ if(!speakingNow)setMood('calm');
+ updateStopBtn()}
+function anythingActive(){return !!thinkingEl||!!activeReveal||speakingNow}
+function updateStopBtn(){const b=document.getElementById('stopbtn');if(b)b.style.display=anythingActive()?'':'none'}
+function stopAll(){
+ stopRequested=true;finishReveal();
+ try{stopSpeak()}catch(e){}
+ hideThinking();updateStopBtn()}
+function updateScrollBtn(){const b=document.getElementById('scrollbtn');if(b)b.style.display=chatDistFromBottom()>160?'':'none'}
+const SUGG_POOL=['আজকের খবর দাও','আবহাওয়া কেমন?','কী কী মনে রেখেছ?','আমাকে গণিত শেখাও','তোমার স্কিলগুলো কী কী?','প্যাটার্ন বিশ্লেষণ করো','সিস্টেমের অবস্থা দেখাও','তোমার ভার্সন কত?'];
+function showSuggestions(reply){
+ const box=document.getElementById('suggest');if(!box)return;
+ box.innerHTML='';
+ const r=String(reply||'');const picks=[];
+ if(/পরীক্ষা|মক টেস্ট|mock/i.test(r))picks.push('একটা মক টেস্ট দাও');
+ else if(/খবর|সংবাদ/.test(r))picks.push('আরও খবর দাও');
+ else if(/আবহাওয়া|বৃষ্টি|তাপমাত্রা/.test(r))picks.push('আবহাওয়া কেমন?');
+ else if(/গণিত|অঙ্ক|শেখাও|পড়া/.test(r))picks.push('আরেকটা উদাহরণ দাও');
+ else if(/মনে রেখেছ|স্মৃতি/.test(r))picks.push('কী কী মনে রেখেছ?');
+ let guard=0;
+ while(picks.length<3&&guard<24){const cand=SUGG_POOL[suggRotate%SUGG_POOL.length];suggRotate++;guard++;if(!picks.includes(cand))picks.push(cand)}
+ picks.slice(0,3).forEach(p=>{
+  const b=document.createElement('button');b.type='button';b.className='chip';b.textContent=p;
+  b.onclick=()=>quick(p);box.appendChild(b)})}
+function clearSuggestions(){const box=document.getElementById('suggest');if(box)box.innerHTML=''}
+function resolveSpeak(speakIt){
+ if(speakIt!==undefined)return !!speakIt;
+ try{return localStorage.getItem('sokhi_autospeak')==='1'}catch(e){return false}}
+function maybeSpeak(reply,origText,speakIt){
+ if(!resolveSpeak(speakIt))return;
+ if(window.sokhiQuietNow&&window.sokhiQuietNow()){setStatus('🔇 এখন quiet hours — তাই গলায় বললাম না');return}
+ speak(reply,moodRate(origText||''))}
+function addErrorBubble(){
+ const d=add('উত্তর আনতে পারলাম না — নেট বা key-র সমস্যা হতে পারে।','sokhi',{instant:true,err:true});
+ if(d){
+  const act=d.querySelector('.msg-actions');
+  if(act){const b=document.createElement('button');b.type='button';b.textContent='আবার চেষ্টা';
+   b.onclick=async e=>{e.stopPropagation();d.remove();if(lastFailedText)await fetchReply(lastFailedText,undefined)};
+   act.appendChild(b)}}
+ refreshRegenButtons()}
+async function fetchReply(t,speakIt){
+ showThinking();
+ const body={message:t};
+ if(window.pendingImageData){body.image=window.pendingImageData;window.pendingImageData=null}
+ let j=null;
+ try{j=await api('/api/chat',body)}catch(e){j=null}
+ hideThinking();
+ if(!j||typeof j.reply!=='string'){
+  lastFailedText=t;addErrorBubble();return}
+ const reply=j.reply;
+ if(stopRequested){stopRequested=false;add(reply,'sokhi',{instant:true});showSuggestions(reply);return}
+ add(reply,'sokhi',{reveal:true});
+ maybeSpeak(reply,t,speakIt);
+ showSuggestions(reply)}
+function autoGrowText(){
+ const el=document.getElementById('text');if(!el||el.tagName!=='TEXTAREA')return;
+ el.style.height='auto';el.style.height=Math.min(el.scrollHeight,132)+'px'}
+function addReplyInternal(t,ts){return add(t,'sokhi',{ts:ts,reveal:true})}
+window.SokhiChat={
+ clear(){
+  finishReveal();hideThinking();clearSuggestions();
+  const c=document.getElementById('chat');if(c)c.innerHTML='';
+  msgSeq=0;pendingEditIdx=null;lastFailedText=''},
+ loadMessages(msgs){
+  window.SokhiChat.clear();
+  (msgs||[]).forEach((m,i)=>{
+   if(!m)return;
+   const role=m.who||m.role||m.sender||'sokhi';
+   const text=(m.text!=null?m.text:(m.content!=null?m.content:(m.message!=null?m.message:m.reply)));
+   if(text==null)return;
+   const ts=(m.ts!=null?m.ts:(m.timestamp!=null?m.timestamp:(m.time!=null?m.time:m.created_at)));
+   const who=(role==='me'||role==='user')?'me':'sokhi';
+   add(String(text),who,{ts:ts,idx:i,instant:true})});
+  scrollChatToBottom()},
+ addUser(t,ts){return add(t,'me',{ts:ts})},
+ addReply(t,ts){return add(t,'sokhi',{ts:ts,reveal:true})}};
+(function initFe1(){
+ const chatEl=document.getElementById('chat');
+ if(chatEl){
+  chatEl.addEventListener('scroll',updateScrollBtn);
+  chatEl.addEventListener('click',e=>{
+   const cb=e.target.closest('.codecopy');
+   if(cb){e.stopPropagation();const pre=cb.parentElement?cb.parentElement.querySelector('code'):null;if(pre)copyText(pre.textContent,cb)}})}
+ const el=document.getElementById('text');
+ if(el){
+  el.addEventListener('keydown',e=>{
+   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}
+   else if(e.key==='ArrowUp'&&el.value===''&&el.selectionStart===0){
+    const mine=document.querySelectorAll('#chat .msg.me');
+    if(mine.length){e.preventDefault();startEdit(mine[mine.length-1])}}});
+  el.addEventListener('input',autoGrowText)}
+ document.addEventListener('keydown',e=>{
+  if((e.ctrlKey||e.metaKey)&&(e.key==='k'||e.key==='K')){e.preventDefault();const t2=document.getElementById('text');if(t2)t2.focus()}
+  else if(e.key==='Escape'){stopAll()}});
+ setInterval(()=>{updateStopBtn();updateScrollBtn()},600)})();
 function toggleExamForm(){const f=document.getElementById('examform');f.style.display=f.style.display==='block'?'none':'block'}
 async function startExam(){
  const subject=document.getElementById('examsubject').value;
@@ -5167,7 +5793,610 @@ armIdle();
  loadTasks();loadNotes();
  }catch(e){}})();
 speechSynthesis && speechSynthesis.getVoices();
-</script></body></html>"""
+</script>
+<style>
+/* v1.2 fe2 — কথোপকথন-বার, স্মৃতি ট্যাব, আরাম ও সাহায্য (worker-2) */
+:root{--fs:1}
+body{font-size:calc(15px * var(--fs,1))}
+.msg{font-size:calc(15px * var(--fs,1))}
+body[data-theme="soft"]{--accent:#86b8a8;--accent2:#4f7f70;--deep:#1e332d;--bg:#141917;--panel:#1c2320;--panel2:#242e2a;--line:#33423c;--txt:#e7edea;--muted:#a9bab2}
+#convowrap{flex:none;margin-bottom:10px;position:relative}
+#convobar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:8px 10px;box-shadow:var(--shadow)}
+#convobar .ttl{flex:1;min-width:120px;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#convobar button{font-size:12.5px;padding:6px 10px;flex:none}
+#convopanel{margin-top:6px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:10px;box-shadow:var(--shadow);max-height:330px;display:flex;flex-direction:column}
+#convopanel[hidden]{display:none}
+#convosearch{width:100%;flex:none;margin-bottom:8px}
+#convolist{overflow-y:auto;min-height:0}
+.convoitem{display:flex;gap:6px;align-items:center;padding:8px 6px;border-bottom:1px solid var(--line);cursor:pointer;border-radius:6px}
+.convoitem:hover,.convoitem.active{background:var(--panel2)}
+.convoitem .info{flex:1;min-width:0}
+.convoitem .t{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.convoitem .m{font-size:12px;color:var(--muted);white-space:pre-wrap}
+.convoitem button{flex:none;padding:4px 7px;font-size:12px}
+#pane-memory{overflow:hidden}
+#fe2memscroll{overflow-y:auto;min-height:0;flex:1;padding-right:4px}
+.fe2memrow{display:flex;gap:6px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+.fe2memrow span{flex:1;min-width:0;white-space:pre-wrap}
+.fe2memrow button{flex:none;padding:3px 8px;font-size:12px}
+#brainbadge{display:inline-block;margin-top:4px;margin-left:8px;font-size:12px;padding:3px 10px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);vertical-align:middle}
+#focusbtn{position:fixed;top:10px;right:62px;width:42px;height:42px;border-radius:50%;font-size:17px;padding:0;z-index:50;box-shadow:var(--shadow)}
+#focusbtn.on{border-color:var(--accent);background:var(--accent2);color:#fff}
+body.focus #leftcol,body.focus #centercol{display:none!important}
+body.focus #layout{grid-template-columns:minmax(0,1fr);max-width:980px}
+#imgchip{display:flex;gap:8px;align-items:center;width:fit-content;max-width:calc(100% - 32px);margin:0 auto 6px;padding:6px 12px;background:var(--panel2);border:1px solid var(--line);border-radius:999px;font-size:13px}
+#imgchip button{padding:2px 8px;font-size:12px;flex:none}
+#cmdpalette{flex:none;width:100%;max-width:820px;margin:0 auto 6px;padding:6px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);max-height:264px;overflow-y:auto;z-index:45}
+#cmdpalette[hidden]{display:none}
+.cmditem{padding:9px 12px;cursor:pointer;font-size:14px;border-radius:6px}
+.cmditem.sel{background:var(--accent2);color:#fff}
+.fe2modal{display:none;position:fixed;inset:0;background:rgba(2,4,10,.72);z-index:80;overflow:hidden}
+.fe2modal .panel{max-width:480px;max-height:calc(100vh - 48px);overflow-y:auto;min-height:0;margin:24px auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px;box-shadow:var(--shadow)}
+.fe2modal .panel h3{margin:0 0 12px;font-size:16px;font-weight:600}
+.fe2modal hr{border:none;border-top:1px solid var(--line);margin:16px 0}
+.fe2modal ul{margin:6px 0 6px 18px;padding:0;font-size:14px;line-height:1.7}
+#fe2onboard{z-index:120}
+#fe2helpbtn{position:fixed;left:12px;bottom:84px;width:44px;height:44px;border-radius:50%;font-size:18px;font-weight:700;padding:0;z-index:55;box-shadow:var(--shadow)}
+#fe2settings input[type="checkbox"]{flex:none;width:auto;padding:0}
+#fe2settings input[type="time"]{flex:none;width:auto}
+#fe2settings select{max-width:100%}
+#fe2attachbtn{flex:none}
+/* v1.2 fe2 — মোবাইল আরাম (আইডিয়া ৪১) */
+@media (max-width:1080px){
+ .tabs{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;padding-bottom:4px;-webkit-overflow-scrolling:touch}
+ .tabs button{flex:none;min-height:44px;padding:10px 16px}
+ #bar{gap:6px;padding:0 8px 10px}
+ #bar button{min-width:48px;min-height:48px;padding:10px 12px}
+ #bar input{min-height:48px}
+ #convobar button{min-height:44px;padding:10px 14px}
+ .convoitem{padding:12px 8px}
+ .convoitem button{min-width:40px;min-height:40px}
+ #gear,#focusbtn{width:48px;height:48px}
+ #focusbtn{right:70px}
+ #fe2helpbtn{width:48px;height:48px;bottom:76px}
+ .cmditem{padding:13px 12px}
+ .fe2memrow button{min-width:40px;min-height:36px}
+}
+
+</style>
+<script>
+/* v1.2 fe2 — worker-2: কথোপকথন (১৫–২১), স্মৃতি (২২–২৪), আরাম/সাহায্য (২৫–৪১) */
+/* আইডিয়া ৩২: mic() পুনর্সংজ্ঞা — এই appended script-এর ঘোষণা আগেরটিকে বদলে দেয়।
+   interimResults=true: বলতে বলতেই আংশিক লেখা composer-এ দেখা যাবে, final এলে send(true)। */
+function mic(){
+ const R=window.SpeechRecognition||window.webkitSpeechRecognition;
+ if(!R){alert('এই ব্রাউজারে গলা-শোনা নেই — Chrome ব্যবহার করো');return}
+ const r=new R();r.lang='bn-BD';r.interimResults=true;r.continuous=false;
+ const el=document.getElementById('text');
+ r.onresult=function(e){
+  let interim='',finalTxt='';
+  for(let i=0;i<e.results.length;i++){
+   const res=e.results[i];
+   if(res.isFinal)finalTxt+=res[0].transcript;else interim+=res[0].transcript}
+  if(el)el.value=finalTxt||interim;
+  if(finalTxt)send(true)};
+ try{r.start()}catch(err){}}
+(function(){
+'use strict';
+const $=function(id){return document.getElementById(id)};
+window.pendingImageData=window.pendingImageData||null;
+/* ---------- বার্তার আকার বোঝা (BE/FE-1-এর নানা ফরম্যাট সহনশীল) ---------- */
+function msgText(m){
+ if(m==null)return '';
+ if(typeof m==='string')return m;
+ return String(m.t!=null?m.t:(m.text||m.content||m.message||m.reply||''))}
+function msgWho(m){
+ if(m&&typeof m==='object'){
+  const w=String(m.r||m.who||m.role||m.sender||m.type||'');
+  if(w==='me'||w==='user'||w==='human')return 'me'}
+ return 'sokhi'}
+function msgTs(m){
+ if(m&&typeof m==='object'){const v=m.ts!=null?m.ts:(m.time||m.timestamp||m.created||'');return typeof v==='number'?fmtDate(v):String(v)}
+ return ''}
+function normalizeMsgs(msgs){
+ return (msgs||[]).map(function(m){
+  if(typeof m==='string')return {who:'sokhi',text:m};
+  return {who:msgWho(m),text:msgText(m),ts:(m&&typeof m==='object')?(m.ts!=null?m.ts:(m.timestamp!=null?m.timestamp:m.time)):undefined}}).filter(function(m){return m.text})}
+/* FE-1 window.SokhiChat দেবে; না থাকলে add()-ভিত্তিক নিরাপদ fallback (একই আচরণ)। */
+if(!window.SokhiChat){
+ window.SokhiChat={
+  clear:function(){const c=$('chat');if(c)c.innerHTML=''},
+  loadMessages:function(msgs){(msgs||[]).forEach(function(m){const t=msgText(m);if(t&&typeof add==='function')add(t,msgWho(m))})},
+  addUser:function(t){if(typeof add==='function')add(t,'me')},
+  addReply:function(t){if(typeof add==='function')add(t,'sokhi')}}}
+function convoMsgs(j){
+ if(!j)return [];
+ if(Array.isArray(j.messages))return j.messages;
+ if(j.conversation&&Array.isArray(j.conversation.messages))return j.conversation.messages;
+ if(j.convo&&Array.isArray(j.convo.messages))return j.convo.messages;
+ return []}
+function fmtDate(v){
+ if(v==null||v==='')return '';
+ let d=null;
+ if(typeof v==='number')d=new Date(v<1e12?v*1000:v);
+ else{const p=Date.parse(v);if(!isNaN(p))d=new Date(p)}
+ if(d){try{return d.toLocaleDateString('bn-BD')+' '+d.toLocaleTimeString('bn-BD',{hour:'2-digit',minute:'2-digit'})}catch(e){return d.toLocaleString()}}
+ return String(v)}
+/* ================= ১৫–২১: কথোপকথন-বার ================= */
+let activeId=null,activeTitle='';
+function setConvoTitle(t){activeTitle=t||'';const el=$('convotitle');if(el)el.textContent=activeTitle||'নতুন কথোপকথন'}
+async function convoPost(body){return await api('/api/convos',body)}
+function renderConvoList(items){
+ const box=$('convolist');if(!box)return;box.innerHTML='';
+ if(!items||!items.length){const d=document.createElement('div');d.className='small';d.textContent='কোনো কথোপকথন পাওয়া যায়নি।';box.appendChild(d);return}
+ items.forEach(function(raw){
+  const it=raw||{};
+  const id=it.id||it.convo_id||it.conversation_id||'';
+  const title=it.title||it.name||'কথোপকথন';
+  const row=document.createElement('div');row.className='convoitem'+(String(id)===String(activeId)?' active':'');
+  const info=document.createElement('div');info.className='info';
+  const tt=document.createElement('div');tt.className='t';tt.textContent=title;info.appendChild(tt);
+  const meta=document.createElement('div');meta.className='m';
+  const bits=[];
+  if(it.count!=null)bits.push(it.count+'টি বার্তা');
+  else if(it.message_count!=null)bits.push(it.message_count+'টি বার্তা');
+  const dt=fmtDate(it.updated||it.updated_at||it.time);if(dt)bits.push(dt);
+  meta.textContent=bits.join(' • ');info.appendChild(meta);
+  if(it.snippet){const sn=document.createElement('div');sn.className='m';sn.textContent=String(it.snippet);info.appendChild(sn)}
+  row.appendChild(info);
+  const mk=function(label,titleTxt,fn){const b=document.createElement('button');b.textContent=label;b.title=titleTxt;b.addEventListener('click',function(ev){ev.stopPropagation();fn()});return b};
+  row.appendChild(mk('✏️','নাম বদলাও',function(){renameConvo(id,title)}));
+  row.appendChild(mk('⬇','Export (.txt)',function(){exportConvo(id,title)}));
+  row.appendChild(mk('🗑','মোছো',function(){deleteConvo(id,title)}));
+  row.addEventListener('click',function(){switchConvo(id)});
+  box.appendChild(row)})}
+async function refreshConvos(){
+ try{
+  const j=await apiGet('/api/convos');
+  const items=(j&&(j.items||j.convos))||[];
+  let act=(j&&j.active)||null;
+  if(act&&typeof act==='object'){activeId=act.id||activeId;setConvoTitle(act.title||act.name)}
+  else if(act!=null){activeId=act}
+  if(activeId!=null){const found=items.find(function(x){return String(x.id||x.convo_id||'')===String(activeId)});if(found)setConvoTitle(found.title||found.name)}
+  renderConvoList(items);
+  return {j:j,items:items}
+ }catch(e){return {j:null,items:[]}}}
+async function loadActiveIntoChat(){
+ /* বুট-ইতিহাস: FE-1-এর SokhiChat.loadMessages() নিজেই প্রথমে clear() করে,
+    তাই সরাসরি ডাকলে আগে আসা greeting মুছে যেত। পদ্ধতি: ইতিহাস আনার পর,
+    loadMessages ডাকার ঠিক আগে chat-এর বিদ্যমান নোডগুলো (greeting) একটি
+    DocumentFragment-এ তুলে রাখি (একই নোড — listener-সহ অক্ষত), তারপর
+    loadMessages ইতিহাস বসালে সেই নোডগুলো শেষে আবার append করি।
+    ফল: ইতিহাস আগে, greeting শেষে; greeting পরে এলে এমনিতেই শেষে বসে।
+    capture→load অংশটা synchronous, তাই মাঝখানে অন্য add() ঢুকতে পারে না। */
+ const info=await refreshConvos();
+ let msgs=[];
+ try{const g=await convoPost(activeId!=null?{action:'get',id:activeId}:{action:'get'});msgs=convoMsgs(g);
+  if(g&&(g.title||g.name))setConvoTitle(g.title||g.name)}catch(e){}
+ if(!msgs.length)return;
+ const chatEl=$('chat');if(!chatEl)return;
+ const norm=normalizeMsgs(msgs);
+ const holder=document.createDocumentFragment();
+ Array.prototype.slice.call(chatEl.children).forEach(function(n){holder.appendChild(n)});
+ if(window.SokhiChat&&typeof window.SokhiChat.loadMessages==='function')window.SokhiChat.loadMessages(norm);
+ else norm.forEach(function(m){add(m.text,m.who)});
+ if(holder.childNodes.length)chatEl.appendChild(holder);
+ if(typeof scrollChatToBottom==='function')scrollChatToBottom()}
+async function switchConvo(id){
+ if(id==null||id==='')return;
+ try{
+  await convoPost({action:'switch',id:id});
+  activeId=id;
+  const g=await convoPost({action:'get',id:id});
+  const msgs=convoMsgs(g);
+  if(window.SokhiChat){window.SokhiChat.clear();window.SokhiChat.loadMessages(normalizeMsgs(msgs))}
+  if(g&&(g.title||g.name))setConvoTitle(g.title||g.name);
+  const p=$('convopanel');if(p)p.hidden=true;
+  refreshConvos();
+ }catch(e){add('কথোপকথন বদলানো গেল না — আবার চেষ্টা করো।','sokhi')}}
+async function newConvo(){
+ try{
+  const j=await convoPost({action:'create'});
+  if(j&&(j.id||(j.item&&j.item.id))){activeId=j.id||j.item.id;setConvoTitle(j.title||(j.item&&j.item.title)||'নতুন কথোপকথন')}
+  else setConvoTitle('নতুন কথোপকথন');
+  if(window.SokhiChat)window.SokhiChat.clear();
+  const p=$('convopanel');if(p)p.hidden=true;
+  refreshConvos();
+ }catch(e){add('নতুন কথোপকথন তৈরি করা গেল না — আবার চেষ্টা করো।','sokhi')}}
+function renameConvo(id,title){
+ const nt=prompt('কথোপকথনের নতুন নাম লেখো',title||'');
+ if(nt==null||!nt.trim())return;
+ convoPost({action:'rename',id:id,title:nt.trim()}).then(function(){if(String(id)===String(activeId))setConvoTitle(nt.trim());refreshConvos()}).catch(function(){})}
+function deleteConvo(id,title){
+ if(!confirm('"'+(title||'কথোপকথন')+'" মুছে ফেলবে?'))return;
+ const wasActive=String(id)===String(activeId);
+ convoPost({action:'delete',id:id}).then(async function(){
+  if(wasActive){if(window.SokhiChat)window.SokhiChat.clear();activeId=null;setConvoTitle('');await loadActiveIntoChat()}
+  else refreshConvos()}).catch(function(){})}
+async function exportConvo(id,title){
+ try{
+  const g=await convoPost({action:'get',id:id});
+  const msgs=convoMsgs(g);
+  const lines=[(title||g.title||'Sokhi কথোপকথন'),''];
+  msgs.forEach(function(m){const t=msgText(m);if(!t)return;const ts=msgTs(m);lines.push((msgWho(m)==='me'?'আমি':'Sokhi')+(ts?' ('+ts+')':'')+': '+t)});
+  const blob=new Blob([lines.join('\n')],{type:'text/plain;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;
+  a.download=String(title||g.title||'sokhi-chat').replace(/[\\/:*?"<>|]+/g,' ').trim().slice(0,60)+'.txt';
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(function(){URL.revokeObjectURL(url)},2000);
+ }catch(e){alert('Export করা গেল না — আবার চেষ্টা করো।')}}
+let searchTimer=null;
+function onConvoSearch(){
+ const q=($('convosearch')?$('convosearch').value:'').trim();
+ clearTimeout(searchTimer);
+ if(!q){refreshConvos();return}
+ searchTimer=setTimeout(async function(){
+  try{const j=await convoPost({action:'search',q:q});
+   renderConvoList((j&&(j.items||j.results||j.matches))||[])}
+  catch(e){}},260)}
+function buildConvoBar(){
+ const right=$('rightcol');if(!right)return;
+ const wrap=document.createElement('div');wrap.id='convowrap';
+ const bar=document.createElement('div');bar.id='convobar';
+ const ttl=document.createElement('span');ttl.className='ttl';ttl.innerHTML='💬 কথোপকথন: <b id="convotitle">…</b>';bar.appendChild(ttl);
+ const bNew=document.createElement('button');bNew.textContent='নতুন';bNew.addEventListener('click',newConvo);bar.appendChild(bNew);
+ const bList=document.createElement('button');bList.textContent='তালিকা ▾';
+ const panel=document.createElement('div');panel.id='convopanel';panel.hidden=true;
+ bList.addEventListener('click',function(){panel.hidden=!panel.hidden;if(!panel.hidden)refreshConvos()});bar.appendChild(bList);
+ const bClear=document.createElement('button');bClear.textContent='পরিষ্কার';
+ bClear.addEventListener('click',function(){
+  if(!confirm('বর্তমান কথোপকথনের সব বার্তা পরিষ্কার করবে?'))return;
+  convoPost(activeId!=null?{action:'clear',id:activeId}:{action:'clear'}).catch(function(){});
+  if(window.SokhiChat)window.SokhiChat.clear()});bar.appendChild(bClear);
+ wrap.appendChild(bar);
+ const search=document.createElement('input');search.id='convosearch';search.type='text';search.placeholder='কথোপকথন খোঁজো… (শিরোনাম বা বার্তা)';
+ search.addEventListener('input',onConvoSearch);panel.appendChild(search);
+ const list=document.createElement('div');list.id='convolist';panel.appendChild(list);
+ wrap.appendChild(panel);
+ const tabs=right.querySelector('.tabs');
+ if(tabs)right.insertBefore(wrap,tabs);else right.insertBefore(wrap,right.firstChild)}
+/* ================= ২২–২৪: স্মৃতি ট্যাব ================= */
+function memItemText(n){
+ if(typeof n==='string')return n;
+ if(n&&typeof n==='object')return String(n.text||n.fact||n.note||n.value||JSON.stringify(n));
+ return String(n||'')}
+function renderMemList(box,items,kind){
+ if(!box)return;box.innerHTML='';
+ if(!items||!items.length){const d=document.createElement('div');d.className='small';d.textContent='কিছু নেই।';box.appendChild(d);return}
+ items.forEach(function(n,idx){
+  const row=document.createElement('div');row.className='fe2memrow';
+  const s=document.createElement('span');s.textContent=memItemText(n);row.appendChild(s);
+  const b=document.createElement('button');b.textContent='✕';b.title='মোছো';
+  b.addEventListener('click',function(){deleteMemory(kind,idx)});row.appendChild(b);
+  box.appendChild(row)})}
+async function loadMemory(){
+ try{
+  const j=await apiGet('/api/memory');
+  renderMemList($('fe2facts'),(j&&j.facts)||[],'fact');
+  renderMemList($('fe2notes'),(j&&(j.learned_notes||j.learnedNotes))||[],'note');
+  const msg=$('fe2memmsg');if(msg)msg.textContent='';
+ }catch(e){const msg=$('fe2memmsg');if(msg)msg.textContent='স্মৃতি লোড করা গেল না।'}}
+async function deleteMemory(kind,idx){
+ try{await api('/api/memory',kind==='fact'?{action:'delete_fact',index:idx}:{action:'delete_note',index:idx})}catch(e){}
+ loadMemory()}
+function fe2Tab(name){
+ if(name==='memory'){
+  ['chat','agents','notes','tasks'].forEach(function(n){
+   const p=$('pane-'+n);if(p)p.classList.remove('on');
+   const b=$('tabbtn-'+n);if(b)b.classList.remove('on')});
+  const p=$('pane-memory');if(p)p.classList.add('on');
+  const b=$('tabbtn-memory');if(b)b.classList.add('on');
+  loadMemory();return}
+ const p=$('pane-memory');if(p)p.classList.remove('on');
+ const b=$('tabbtn-memory');if(b)b.classList.remove('on');
+ if(typeof showTab==='function')showTab(name)}
+window.fe2Tab=fe2Tab;
+function buildMemoryPane(){
+ const right=$('rightcol');if(!right)return;
+ const tabs=right.querySelector('.tabs');
+ if(tabs){const b=document.createElement('button');b.id='tabbtn-memory';b.textContent='স্মৃতি';b.addEventListener('click',function(){fe2Tab('memory')});tabs.appendChild(b)}
+ ['chat','agents','notes','tasks'].forEach(function(n){
+  const b=$('tabbtn-'+n);if(!b)return;
+  b.addEventListener('click',function(){const p=$('pane-memory');if(p)p.classList.remove('on');const mb=$('tabbtn-memory');if(mb)mb.classList.remove('on')})});
+ const pane=document.createElement('div');pane.className='tabpane';pane.id='pane-memory';
+ const scroll=document.createElement('div');scroll.id='fe2memscroll';
+ const head=document.createElement('div');head.style.cssText='display:flex;gap:6px;align-items:center;margin-bottom:8px';
+ const h=document.createElement('div');h.className='secttl';h.style.flex='1';h.textContent='Sokhi যা মনে রেখেছে';head.appendChild(h);
+ const rb=document.createElement('button');rb.textContent='🔄 রিফ্রেশ';rb.style.fontSize='13px';rb.addEventListener('click',loadMemory);head.appendChild(rb);
+ scroll.appendChild(head);
+ const msg=document.createElement('div');msg.id='fe2memmsg';msg.className='small';scroll.appendChild(msg);
+ const ft=document.createElement('div');ft.className='secttl';ft.textContent='মনে রাখা তথ্য';scroll.appendChild(ft);
+ const facts=document.createElement('div');facts.id='fe2facts';scroll.appendChild(facts);
+ const nt=document.createElement('div');nt.className='secttl';nt.style.marginTop='14px';nt.textContent='শেখা নোট';scroll.appendChild(nt);
+ const notes=document.createElement('div');notes.id='fe2notes';scroll.appendChild(notes);
+ const addRow=document.createElement('div');addRow.style.cssText='display:flex;gap:6px;margin-top:14px';
+ const inp=document.createElement('input');inp.id='fe2newfact';inp.type='text';inp.placeholder='নতুন তথ্য লেখো…';inp.style.flex='1';addRow.appendChild(inp);
+ const ab=document.createElement('button');ab.textContent='যোগ করো';
+ ab.addEventListener('click',async function(){
+  const v=inp.value.trim();if(!v)return;
+  try{await api('/api/memory',{action:'add_fact',text:v});inp.value='';loadMemory()}
+  catch(e){const m=$('fe2memmsg');if(m)m.textContent='তথ্য যোগ করা গেল না।'}});
+ addRow.appendChild(ab);scroll.appendChild(addRow);
+ pane.appendChild(scroll);
+ const chatPane=$('pane-chat');
+ if(chatPane&&chatPane.parentNode===right)right.insertBefore(pane,chatPane.nextSibling);
+ else right.appendChild(pane)}
+/* ================= ২৫, ২৬, ৩৩, ৩৬: সেটিংসের নতুন বিভাগ ================= */
+function applyFont(v,save){
+ const n=Math.min(1.25,Math.max(0.9,parseFloat(v)||1));
+ document.documentElement.style.setProperty('--fs',String(n));
+ const lbl=$('fe2fontval');if(lbl)lbl.textContent=n.toFixed(2)+'×';
+ const sl=$('fe2font');if(sl)sl.value=n;
+ if(save){try{localStorage.setItem('sokhi_fontscale',String(n))}catch(e){}}}
+function quietMirror(){
+ try{return JSON.parse(localStorage.getItem('sokhi_quiet')||'{}')}catch(e){return {}}}
+window.sokhiQuietNow=function(){
+ const q=quietMirror();
+ const en=q.enabled!=null?q.enabled:!!(q.quiet_start&&q.quiet_end);
+ if(!en)return false;
+ const s=q.quiet_start||q.start||'',e=q.quiet_end||q.end||'';
+ if(!s||!e||s===e)return false;
+ const now=new Date(),cur=now.getHours()*60+now.getMinutes();
+ const sm=parseInt(s.split(':')[0],10)*60+(parseInt(s.split(':')[1],10)||0);
+ const em=parseInt(e.split(':')[0],10)*60+(parseInt(e.split(':')[1],10)||0);
+ if(sm<em)return cur>=sm&&cur<em;
+ return cur>=sm||cur<em};
+async function saveQuiet(){
+ const on=$('fe2quieton')?$('fe2quieton').checked:false;
+ const s=on&&$('fe2quietstart')?$('fe2quietstart').value:'';
+ const e=on&&$('fe2quietend')?$('fe2quietend').value:'';
+ const sv=$('fe2quietstart')?$('fe2quietstart').value:'';
+ const ev=$('fe2quietend')?$('fe2quietend').value:'';
+ try{localStorage.setItem('sokhi_quiet',JSON.stringify({enabled:on,quiet_start:sv,quiet_end:ev,start:sv,end:ev}))}catch(err){}
+ try{await api('/api/settings',{quiet_start:s,quiet_end:e})}catch(err){}}
+function buildSettingsExtras(){
+ const panel=document.querySelector('#modal .panel');if(!panel)return;
+ /* ২৭: soft থিম বোতাম — বিদ্যমান themebtns সারিতে */
+ const tb=panel.querySelector('.themebtns');
+ if(tb){const sb=document.createElement('button');sb.textContent='নরম (চোখের আরাম)';sb.addEventListener('click',function(){if(typeof setTheme==='function')setTheme('soft')});tb.appendChild(sb)}
+ const closeBtn=Array.prototype.slice.call(panel.querySelectorAll('button')).find(function(b){return b.textContent.trim()==='বন্ধ করো'});
+ const box=document.createElement('div');box.id='fe2settings';
+ box.innerHTML=
+  '<hr><div class="secttl">উত্তরের ধরন</div>'+
+  '<div style="font-size:13px;margin-top:6px">কতটা লম্বা উত্তর চাও: '+
+  '<select id="fe2replystyle"><option value="সংক্ষেপ">সংক্ষেপ</option><option value="স্বাভাবিক">স্বাভাবিক</option><option value="বিস্তারিত">বিস্তারিত</option></select></div>'+
+  '<hr><div class="secttl">অক্ষরের আকার (চোখের আরাম)</div>'+
+  '<div style="display:flex;align-items:center;gap:8px;margin-top:6px"><span class="small">ছোট</span>'+
+  '<input id="fe2font" type="range" min="0.9" max="1.25" step="0.05" value="1" style="flex:1">'+
+  '<span class="small">বড়</span><span id="fe2fontval" class="small">1.00×</span></div>'+
+  '<hr><div class="secttl">গলায় উত্তর (Auto-speak)</div>'+
+  '<label style="font-size:13px;display:flex;gap:8px;align-items:center;margin-top:6px"><input id="fe2autospeak" type="checkbox"> লিখে পাঠালেও উত্তরের গলা শোনাও</label>'+
+  '<div class="hint">ডিফল্ট বন্ধ — চালু করলে লিখে পাঠানো প্রশ্নের উত্তরও গলায় শুনবে।</div>'+
+  '<hr><div class="secttl">শান্ত সময় (Quiet hours)</div>'+
+  '<label style="font-size:13px;display:flex;gap:8px;align-items:center;margin-top:6px"><input id="fe2quieton" type="checkbox"> শান্ত সময় চালু</label>'+
+  '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:13px">শুরু <input id="fe2quietstart" type="time" value="22:00"> শেষ <input id="fe2quietend" type="time" value="07:00"> <button id="fe2quietsave" type="button">সেভ</button></div>'+
+  '<div class="hint">এই সময়ে Sokhi নিজে থেকে গলায় বলবে না — ঘুম/নামাজের সময় বিঘ্ন হবে না।</div>';
+ if(closeBtn)panel.insertBefore(box,closeBtn);else panel.appendChild(box);
+ const rs=$('fe2replystyle');
+ if(rs)rs.addEventListener('change',function(){api('/api/settings',{reply_style:rs.value}).catch(function(){})});
+ const fs=$('fe2font');
+ if(fs)fs.addEventListener('input',function(){applyFont(fs.value,true)});
+ try{const savedFs=localStorage.getItem('sokhi_fontscale');if(savedFs)applyFont(savedFs,false)}catch(e){}
+ const as=$('fe2autospeak');
+ if(as){try{as.checked=localStorage.getItem('sokhi_autospeak')==='1'}catch(e){}
+  as.addEventListener('change',function(){try{localStorage.setItem('sokhi_autospeak',as.checked?'1':'0')}catch(e){}})}
+ try{const q=quietMirror();
+  if(q&&(q.quiet_start||q.start)){const qi=$('fe2quieton');if(qi)qi.checked=q.enabled!=null?!!q.enabled:true;
+   const qs=$('fe2quietstart');if(qs)qs.value=q.quiet_start||q.start;
+   const qe=$('fe2quietend');if(qe)qe.value=q.quiet_end||q.end||''}
+ }catch(e){}
+ const qb=$('fe2quietsave');if(qb)qb.addEventListener('click',saveQuiet);
+ const qo=$('fe2quieton');if(qo)qo.addEventListener('change',saveQuiet)}
+/* ================= ২৮: Focus মোড ================= */
+function toggleFocus(){
+ const on=document.body.classList.toggle('focus');
+ const b=$('focusbtn');if(b)b.classList.toggle('on',on);
+ try{localStorage.setItem('sokhi_focus',on?'1':'0')}catch(e){}}
+window.fe2ToggleFocus=toggleFocus;
+function buildFocusButton(){
+ const b=document.createElement('button');b.id='focusbtn';b.title='ফোকাস মোড — শুধু চ্যাট বড় করে';b.textContent='⛶';
+ b.addEventListener('click',toggleFocus);document.body.appendChild(b);
+ try{if(localStorage.getItem('sokhi_focus')==='1'){document.body.classList.add('focus');b.classList.add('on')}}catch(e){}}
+/* ================= ৩৫: Brain badge ================= */
+function setBrain(txt){const b=$('brainbadge');if(b)b.textContent=txt}
+async function updateBrain(){
+ if(!navigator.onLine){setBrain('📴 নেট নেই');return}
+ try{
+  const s=await apiGet('/api/status');
+  if(s){
+   if(s.reply_style){const rs=$('fe2replystyle');if(rs&&Array.prototype.slice.call(rs.options).some(function(o){return o.value===s.reply_style}))rs.value=s.reply_style}
+   if(s.quiet_start||s.quiet_end){
+    const qs=$('fe2quietstart');if(qs&&s.quiet_start)qs.value=s.quiet_start;
+    const qe=$('fe2quietend');if(qe&&s.quiet_end)qe.value=s.quiet_end;
+    const qo=$('fe2quieton');if(qo)qo.checked=!!(s.quiet_start&&s.quiet_end);
+    try{localStorage.setItem('sokhi_quiet',JSON.stringify({enabled:!!(s.quiet_start&&s.quiet_end),quiet_start:s.quiet_start||'',quiet_end:s.quiet_end||'',start:s.quiet_start||'',end:s.quiet_end||''}))}catch(e){}}
+   if(s.brain==='smart')setBrain('🧠 স্মার্ট মাথা');
+   else if(s.brain==='offline')setBrain('📴 অফলাইন মাথা');
+   else setBrain(s.key_set?'🧠 স্মার্ট মাথা':'📴 অফলাইন মাথা');
+   return}
+ }catch(e){}
+ setBrain('📴 অফলাইন মাথা')}
+function buildBrainBadge(){
+ const st=$('status');if(!st||!st.parentNode)return;
+ const sp=document.createElement('span');sp.id='brainbadge';sp.textContent='… মাথা';
+ st.parentNode.insertBefore(sp,st.nextSibling);
+ window.addEventListener('online',updateBrain);
+ window.addEventListener('offline',function(){setBrain('📴 নেট নেই')});
+ updateBrain();setInterval(updateBrain,60000)}
+/* ================= ২৯, ৩০: সংযুক্তি (📎 / drag-drop / paste) ================= */
+function clearImage(){
+ window.pendingImageData=null;
+ const c=$('imgchip');if(c)c.remove()}
+window.fe2ClearImage=clearImage;
+function showImageChip(){
+ clearImageChipOnly();
+ const bar=$('bar');if(!bar||!bar.parentNode)return;
+ const chip=document.createElement('div');chip.id='imgchip';
+ const s=document.createElement('span');s.textContent='🖼 ছবি যুক্ত হয়েছে';chip.appendChild(s);
+ const b=document.createElement('button');b.textContent='✕';b.title='ছবি বাতিল';
+ b.addEventListener('click',clearImage);chip.appendChild(b);
+ bar.parentNode.insertBefore(chip,bar)}
+function clearImageChipOnly(){const c=$('imgchip');if(c)c.remove()}
+function handleFile(file){
+ if(!file)return;
+ const name=file.name||'';
+ if(file.type&&file.type.indexOf('image/')===0){
+  const rd=new FileReader();
+  rd.onload=function(){window.pendingImageData=String(rd.result||'');showImageChip()};
+  rd.readAsDataURL(file);return}
+ const isText=/\.(txt|md|csv|json)$/i.test(name)||(file.type&&file.type.indexOf('text/')===0)||file.type==='application/json';
+ if(isText){
+  const rd=new FileReader();
+  rd.onload=function(){
+   let content=String(rd.result||'');
+   if(content.length>4000)content=content.slice(0,4000);
+   const el=$('text');if(el){el.value='[ফাইল: '+name+']\n'+content;el.focus()}};
+  rd.readAsText(file);return}
+ alert('এই ধরনের ফাইল এখন পড়তে পারি না — .txt/.md/.csv/.json লেখা-ফাইল বা ছবি দাও।')}
+function buildAttach(){
+ const bar=$('bar');if(!bar)return;
+ const btn=document.createElement('button');btn.id='fe2attachbtn';btn.type='button';btn.title='ফাইল বা ছবি যোগ করো';btn.textContent='📎';
+ const inp=document.createElement('input');inp.type='file';inp.id='fe2file';inp.accept='.txt,.md,.csv,.json,image/*';inp.style.display='none';
+ btn.addEventListener('click',function(){inp.click()});
+ inp.addEventListener('change',function(){if(inp.files&&inp.files[0])handleFile(inp.files[0]);inp.value=''});
+ bar.insertBefore(btn,bar.firstChild);document.body.appendChild(inp);
+ const chatEl=$('chat');
+ if(chatEl){
+  chatEl.addEventListener('dragover',function(e){e.preventDefault()});
+  chatEl.addEventListener('drop',function(e){e.preventDefault();if(e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0])handleFile(e.dataTransfer.files[0])})}
+ window.addEventListener('paste',function(e){
+  const files=e.clipboardData&&e.clipboardData.files;
+  if(files&&files.length){e.preventDefault();handleFile(files[0])}});
+ /* FE-1 send() পাঠানোর সময় pendingImageData খালি করে দেয় — chip-টাও তখন সরিয়ে দিই */
+ setInterval(function(){if($('imgchip')&&!window.pendingImageData)clearImageChipOnly()},1000)}
+/* ================= ৩১: Command palette ("/") ================= */
+const COMMANDS=[
+ {label:'নতুন কথোপকথন',key:'new chat',run:function(){newConvo()}},
+ {label:'স্মৃতি দেখাও',key:'memory',run:function(){fe2Tab('memory')}},
+ {label:'নিয়ম',key:'rules niyom',run:function(){if(typeof openRules==='function')openRules()}},
+ {label:'মক টেস্ট',key:'mock test exam',run:function(){if(typeof toggleExamForm==='function')toggleExamForm()}},
+ {label:'আপগ্রেড চেক',key:'upgrade check',run:function(){if(typeof quick==='function')quick('আপগ্রেড চেক করো')}},
+ {label:'আবহাওয়া',key:'weather',run:function(){if(typeof quick==='function')quick('আবহাওয়া কেমন?')}},
+ {label:'খবর',key:'news',run:function(){if(typeof quick==='function')quick('আজকের খবর দাও')}},
+ {label:'PC অবস্থা',key:'pc status system',run:function(){if(typeof quick==='function')quick('সিস্টেমের অবস্থা দেখাও')}},
+ {label:'ফোকাস মোড',key:'focus',run:function(){toggleFocus()}},
+ {label:'সাহায্য',key:'help',run:function(){showHelp()}}];
+let palItems=[],palSel=0;
+function hidePalette(){const p=$('cmdpalette');if(p)p.hidden=true;palItems=[]}
+function renderPalette(){
+ const p=$('cmdpalette');if(!p)return;
+ if(!palItems.length){p.hidden=true;return}
+ p.hidden=false;p.innerHTML='';
+ palItems.forEach(function(cmd,idx){
+  const d=document.createElement('div');d.className='cmditem'+(idx===palSel?' sel':'');d.textContent='/ '+cmd.label;
+  d.addEventListener('click',function(){runCommand(idx)});p.appendChild(d)})}
+function runCommand(idx){
+ const cmd=palItems[idx];if(!cmd)return;
+ hidePalette();
+ const el=$('text');if(el)el.value='';
+ try{cmd.run()}catch(e){}}
+function buildPalette(){
+ const bar=$('bar');if(!bar||!bar.parentNode)return;
+ const p=document.createElement('div');p.id='cmdpalette';p.hidden=true;
+ bar.parentNode.insertBefore(p,bar);
+ const el=$('text');if(!el)return;
+ el.addEventListener('input',function(){
+  const v=el.value;
+  if(v.charAt(0)!=='/'){hidePalette();return}
+  const q=v.slice(1).trim().toLowerCase();
+  palItems=COMMANDS.filter(function(c){return !q||c.label.indexOf(q)>=0||c.key.indexOf(q)>=0});
+  palSel=0;renderPalette()});
+ document.addEventListener('keydown',function(e){
+  if(e.target!==el)return;
+  const pal=$('cmdpalette');if(!pal||pal.hidden)return;
+  if(e.key==='ArrowDown'){e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();palSel=Math.min(palItems.length-1,palSel+1);renderPalette()}
+  else if(e.key==='ArrowUp'){e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();palSel=Math.max(0,palSel-1);renderPalette()}
+  else if(e.key==='Enter'){e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();runCommand(palSel)}
+  else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();hidePalette()}},true)}
+/* ================= ৩৭, ৩৮: Onboarding + Help ================= */
+const ONBOARD_STEPS=[
+ {t:'স্বাগতম! আমি Sokhi 👋',b:'আমাকে বাংলায় বা Banglish-এ যা খুশি বলতে পারো। যেমন: "আবহাওয়া কেমন?", "আজকের খবর দাও", "আমাকে গণিত শেখাও", "ইউটিউব খোলো"।'},
+ {t:'গলায় বলো, বা লিখে পাঠাও 🎤',b:'মাইক বোতামে চেপে বললেই আমি শুনে গলায় উত্তর দেব — বলতে বলতেই লেখা ঘরে আংশিক লেখা দেখতে পাবে। "লাইভ" চালু করলে শুধু কথা বললেই হবে। লিখে পাঠালে সাধারণত লিখেই উত্তর দিই।'},
+ {t:'স্মার্ট মাথার জন্য key বসাও ⚙️',b:'ডানদিকের ওপরের ⚙️ সেটিংসে গিয়ে ফ্রি Gemini key বসালে আমার স্মার্ট মাথা চালু হবে (key শুধু এই ল্যাপটপেই থাকে)। সেটিংস থেকেই গলার টোন, থিম, শান্ত সময় — সব বদলাতে পারবে।'}];
+let onboardIdx=0;
+function renderOnboard(){
+ const body=$('fe2onboardbody'),ttl=$('fe2onboardtitle'),btn=$('fe2onboardnext');
+ if(!body||!ONBOARD_STEPS[onboardIdx])return;
+ if(ttl)ttl.textContent='ধাপ '+(onboardIdx+1)+'/'+ONBOARD_STEPS.length+' — '+ONBOARD_STEPS[onboardIdx].t;
+ body.textContent=ONBOARD_STEPS[onboardIdx].b;
+ if(btn)btn.textContent=onboardIdx===ONBOARD_STEPS.length-1?'বুঝেছি, শুরু করি':'পরবর্তী →'}
+function showOnboarding(){
+ onboardIdx=0;renderOnboard();
+ const o=$('fe2onboard');if(o)o.style.display='block'}
+window.fe2ShowOnboarding=showOnboarding;
+function buildOnboarding(){
+ const o=document.createElement('div');o.id='fe2onboard';o.className='fe2modal';
+ o.innerHTML='<div class="panel"><h3 id="fe2onboardtitle">স্বাগতম!</h3><div id="fe2onboardbody" style="font-size:14.5px;line-height:1.7;white-space:pre-wrap"></div><div style="text-align:right;margin-top:16px"><button id="fe2onboardnext" type="button">পরবর্তী →</button></div></div>';
+ document.body.appendChild(o);
+ $('fe2onboardnext').addEventListener('click',function(){
+  if(onboardIdx<ONBOARD_STEPS.length-1){onboardIdx++;renderOnboard()}
+  else{try{localStorage.setItem('sokhi_onboarded','1')}catch(e){}o.style.display='none'}});
+ let seen=false;try{seen=!!localStorage.getItem('sokhi_onboarded')}catch(e){}
+ if(!seen)setTimeout(showOnboarding,700)}
+function showHelp(){const m=$('fe2helpmodal');if(m)m.style.display='block'}
+window.fe2ShowHelp=showHelp;
+function buildHelp(){
+ const btn=document.createElement('button');btn.id='fe2helpbtn';btn.title='সাহায্য';btn.textContent='?';
+ btn.addEventListener('click',showHelp);document.body.appendChild(btn);
+ const m=document.createElement('div');m.id='fe2helpmodal';m.className='fe2modal';
+ m.innerHTML='<div class="panel"><h3>সাহায্য — কী কী বলা যায়</h3>'+
+ '<div class="secttl">বলা যায় এমন বাক্য</div><ul>'+
+ '<li>আবহাওয়া কেমন? / আজকের খবর দাও</li>'+
+ '<li>আমাকে গণিত শেখাও / মক টেস্ট দাও</li>'+
+ '<li>কী কী মনে রেখেছ? / আমার প্যাটার্ন বিশ্লেষণ করো</li>'+
+ '<li>সিস্টেমের অবস্থা দেখাও / ইউটিউব খোলো</li>'+
+ '<li>আপগ্রেড চেক করো / কতদূর হলো?</li></ul><hr>'+
+ '<div class="secttl">Shortcut</div><ul>'+
+ '<li>Enter — বার্তা পাঠানো</li>'+
+ '<li>/ — কমান্ড মেনু (↑ ↓ দিয়ে বেছে Enter)</li>'+
+ '<li>Esc — কমান্ড মেনু বন্ধ</li>'+
+ '<li>📎 বোতাম / ফাইল টেনে চ্যাটে ফেলা / paste — ফাইল বা ছবি যোগ</li>'+
+ '<li>🎤 — গলায় বলা (বলতে বলতেই লেখা উঠবে)</li></ul><hr>'+
+ '<div class="secttl">টিপস</div><ul>'+
+ '<li>স্মৃতি ট্যাবে Sokhi কী মনে রেখেছে দেখতে ও মুছতে পারবে।</li>'+
+ '<li>কথোপকথন-বার থেকে বিষয় ধরে আলাদা চ্যাট রাখা যায়।</li>'+
+ '<li>ফোকাস মোডে (⛶) শুধু চ্যাট বড় হয়ে আসে।</li></ul>'+
+ '<div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap"><button id="fe2help-onboard" type="button">প্রথম-চালুর গাইড আবার দেখাও</button><button id="fe2help-close" type="button">বন্ধ করো</button></div></div>';
+ document.body.appendChild(m);
+ m.addEventListener('click',function(e){if(e.target===m)m.style.display='none'});
+ $('fe2help-close').addEventListener('click',function(){m.style.display='none'});
+ $('fe2help-onboard').addEventListener('click',function(){m.style.display='none';showOnboarding()})}
+/* ================= ৩৯: প্রতিদিনের টিপ কার্ড ================= */
+const TIPS=[
+ 'লেখার ঘরে "/" লিখলেই কমান্ডের তালিকা আসে — সেখান থেকে এক চাপে কাজ চালাতে পারো।',
+ 'text ফাইল বা ছবি টেনে চ্যাটে ফেললেই (drag-drop) Sokhi সেটা পড়ে নেবে; paste করলেও হবে।',
+ 'স্মৃতি ট্যাবে গেলে Sokhi কী কী মনে রেখেছে দেখতে পারবে — ভুল তথ্য ✕ চেপে মুছতেও পারবে।',
+ 'ফোকাস মোড (⛶ বোতাম) চালু করলে পাশের প্যানেল সরে গিয়ে চ্যাট পুরো জায়গা পায় — পড়ার জন্য আরাম।',
+ 'সেটিংসে শান্ত সময় বসালে রাতে Sokhi নিজে থেকে গলায় বলবে না।',
+ 'কথোপকথন-বারের "তালিকা" থেকে পুরোনো চ্যাটে ফিরতে পারো, আবার .txt হিসেবে export-ও করা যায়।',
+ 'সেটিংসের অক্ষরের আকার স্লাইডার দিয়ে চোখের আরাম অনুযায়ী লেখা বড়-ছোট করা যায়।',
+ 'মাইকে বলতে বলতেই লেখা ঘরে আংশিক লেখা দেখা যাবে — শেষ হলেই নিজে পাঠিয়ে দেবে।',
+ 'নরম (চোখের আরাম) থিমটা রাতে চোখের জন্য হালকা — সেটিংসের থিম থেকে বেছে নাও।'];
+function buildTipCard(){
+ const left=$('leftcol');if(!left)return;
+ const card=document.createElement('div');card.className='card';card.id='fe2tipcard';
+ const h=document.createElement('h3');h.textContent='💡 আজকের টিপ';card.appendChild(h);
+ const b=document.createElement('div');b.className='body';
+ const idx=Math.floor(Date.now()/86400000)%TIPS.length;
+ b.textContent=TIPS[idx];card.appendChild(b);
+ left.appendChild(card)}
+/* ================= বুট ================= */
+buildConvoBar();
+buildMemoryPane();
+buildSettingsExtras();
+buildFocusButton();
+buildBrainBadge();
+buildAttach();
+buildPalette();
+buildHelp();
+buildOnboarding();
+buildTipCard();
+try{if(typeof pin==='function'&&pin())loadActiveIntoChat()}catch(e){}
+})();
+
+</script>
+</body></html>"""
 
 
 _panels_cache = {"ts": 0, "weather": "", "news": ""}
@@ -5252,7 +6481,7 @@ class Handler(BaseHTTPRequestHandler):
                                "knowledge": len(load_json(KNOW_FILE, {})),
                                "auto_upgrade": bool(get_config().get("auto_self_upgrade", True)),
                                "voice_engine": tts_engine_status(), "voice_rate": _clamp_voice_rate(get_config().get("voice_rate", 1.0)),
-                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে")})
+                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
         if self.path == "/api/memory":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
@@ -5282,10 +6511,20 @@ class Handler(BaseHTTPRequestHandler):
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
             return self._json({"lines": wb_lines()})
+        if self.path == "/api/convos":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            _store = convos_load()
+            return self._json({"active": _store.get("active"),
+                               "items": [{"id": it.get("id"), "title": it.get("title", ""),
+                                          "updated": it.get("updated", 0),
+                                          "count": len(it.get("messages", []))}
+                                         for it in _store.get("items", [])
+                                         if isinstance(it, dict)]})
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard"):
+        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback"):
             return self._json({"error": "not found"}, 404)
         if not self._pin_ok():
             return self._json({"error": "pin"}, 403)
@@ -5312,6 +6551,22 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body_bytes)
             return
         if self.path == "/api/settings":
+            if "reply_style" in data:
+                _rs = str(data.get("reply_style") or "").strip()
+                if _rs not in ("সংক্ষেপ", "স্বাভাবিক", "বিস্তারিত"):
+                    return self._json({"ok": False, "error": "উত্তরের ধরন হতে হবে: সংক্ষেপ, স্বাভাবিক বা বিস্তারিত।"})
+                cfg = get_config(); cfg["reply_style"] = _rs; save_config(cfg)
+                return self._json({"ok": True, "reply_style": _rs})
+            if "quiet_start" in data or "quiet_end" in data:
+                cfg = get_config()
+                for _qk in ("quiet_start", "quiet_end"):
+                    if _qk in data:
+                        _qv = str(data.get(_qk) or "").strip()
+                        if _qv and not re.match(r"^\d{2}:\d{2}$", _qv):
+                            return self._json({"ok": False, "error": "সময়টা HH:MM আকারে দাও, যেমন 23:00।"})
+                        cfg[_qk] = _qv
+                save_config(cfg)
+                return self._json({"ok": True, "quiet_start": cfg.get("quiet_start", ""), "quiet_end": cfg.get("quiet_end", "")})
             preset = str(data.get("tts_preset") or "")
             presets = {"মিষ্টি": ("-3%", "+4%"), "স্বাভাবিক": ("0%", "+1%"), "প্রাণবন্ত": ("+5%", "+5%")}
             if preset in presets:
@@ -5383,6 +6638,12 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("rule"):
                 return self._json({"ok": True, "message": rules_add(str(data["rule"])), "text": rules_text()})
             return self._json({"ok": True, "text": rules_text()})
+        if self.path == "/api/convos":
+            return self._json(convos_api(data))
+        if self.path == "/api/memory":
+            return self._json(memory_api(data))
+        if self.path == "/api/feedback":
+            return self._json(feedback_api(data))
         if self.path == "/api/whiteboard":
             if data.get("action") == "clear":
                 wb_clear()
@@ -5393,9 +6654,86 @@ class Handler(BaseHTTPRequestHandler):
         # is never blocked waiting for audio.
         _chat_t0 = time.perf_counter()
         _kick_daily_release()
-        _msg = data.get("message", "")
-        reply = apply_call_name(care_suffix(handle_message(_msg)))
-        convo_remember(_msg, reply)
+        _msg = data.get("message", "") or ""
+        _regen = bool(data.get("regenerate"))
+        _image_raw = data.get("image")
+        _extra = {}
+        if _regen:
+            _store = convos_load()
+            _act = _convo_find(_store, _store.get("active")) or convo_active()
+            _msgs = list(_act.get("messages", []))
+            _last_user_idx = -1
+            for _i in range(len(_msgs) - 1, -1, -1):
+                if _msgs[_i].get("r") == "user":
+                    _last_user_idx = _i
+                    break
+            if _last_user_idx < 0:
+                _err = "আগে একটা প্রশ্ন করো, তারপর আবার উত্তর চাইতে পারবে।"
+                return self._json({"ok": False, "error": _err, "reply": _err})
+            _last_user = str(_msgs[_last_user_idx].get("t") or "")
+            # drop the last model message after that user message
+            _kept = []
+            _dropped = False
+            for _i, _m in enumerate(_msgs):
+                if (not _dropped and _i > _last_user_idx
+                        and _m.get("r") == "model" and _i == len(_msgs) - 1):
+                    _dropped = True
+                    continue
+                # also handle model not strictly last: drop first model after user if it is the final pair
+                _kept.append(_m)
+            if not _dropped:
+                # fallback: remove the last model entry overall if it follows the user msg
+                for _i in range(len(_msgs) - 1, _last_user_idx, -1):
+                    if _msgs[_i].get("r") == "model":
+                        _kept = _msgs[:_i] + _msgs[_i + 1:]
+                        _dropped = True
+                        break
+            _act["messages"] = _kept
+            _act["updated"] = int(time.time())
+            _store2 = convos_load()
+            _act2 = _convo_find(_store2, _act.get("id"))
+            if _act2 is not None:
+                _act2["messages"] = _kept
+                _act2["updated"] = int(time.time())
+                convos_save(_store2)
+            _prompt = _last_user
+            if _prompt.startswith("[ছবি] "):
+                _prompt = _prompt[len("[ছবি] "):]
+            reply = apply_call_name(care_suffix(handle_message(_prompt)))
+            convo_remember(_prompt, reply)
+            _store3 = convos_load()
+            _act3 = _convo_find(_store3, _act.get("id")) or convo_active()
+            _act3.setdefault("messages", []).append(
+                {"r": "model", "t": reply, "ts": int(time.time())})
+            _act3["updated"] = int(time.time())
+            convos_save(_store3)
+            _extra = {"regenerated": True, "convo_id": _act3.get("id"),
+                      "title": _act3.get("title", "")}
+        elif _image_raw:
+            _img = _parse_image_data_url(_image_raw)
+            _prompt = str(_msg).strip() or "এই ছবিটা দেখে সহজ বাংলায় বুঝিয়ে বলো।"
+            _saved = "[ছবি] " + str(_msg)
+            if not (get_config().get("gemini_api_key") or "").strip():
+                reply = ("ছবিটা বুঝতে হলে আগে সেটিংসে ফ্রি Gemini key বসাতে হবে। "
+                         "key বসালেই ছবি দেখে উত্তর দিতে পারব।")
+                reply = apply_call_name(reply)
+            elif _img is None:
+                reply = apply_call_name("ছবিটা ঠিকমতো পাইনি — আবার পাঠিয়ে দেখো।")
+            else:
+                _smart = ask_gemini(_prompt, get_memory(), image=_img)
+                if _smart:
+                    reply = apply_call_name(care_suffix(_smart))
+                else:
+                    reply = apply_call_name(
+                        "ছবিটা দেখে এখন উত্তর দিতে পারলাম না — নেট বা ফ্রি লিমিটের সমস্যা হতে পারে, একটু পরে আবার চেষ্টা করো।")
+            convo_remember(_saved, reply)
+            _act = convo_append(_saved, reply)
+            _extra = {"convo_id": _act.get("id"), "title": _act.get("title", "")}
+        else:
+            reply = apply_call_name(care_suffix(handle_message(_msg)))
+            convo_remember(_msg, reply)
+            _act = convo_append(_msg, reply)
+            _extra = {"convo_id": _act.get("id"), "title": _act.get("title", "")}
         _chat_ms = int((time.perf_counter() - _chat_t0) * 1000)
         try:
             with (DATA / "latency.log").open("a", encoding="utf-8") as _lf:
@@ -5405,7 +6743,9 @@ class Handler(BaseHTTPRequestHandler):
                           f"model={LAST_LATENCY.get('model')}\n")
         except Exception:
             pass
-        self._json({"reply": reply, "ms": _chat_ms})
+        _resp = {"reply": reply, "ms": _chat_ms}
+        _resp.update(_extra)
+        self._json(_resp)
 
 
 def local_ip():
@@ -5419,7 +6759,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 def main():
@@ -5449,6 +6789,24 @@ def main():
         register_capability("pc-pack-n8", "N8 দৈনন্দিন PC কমান্ড প্যাক (১২টি)")
         register_capability("rules-n13", "কথা বলে নিয়ম বসানো ও স্কিল-খসড়া অনুমোদন")
         register_capability("fullforms-v11", "F1 world model, F2 আগাম-প্রস্তুতি, F3 GUI computer-use (গেটসহ), F4 প্রকল্প, F6 growth diary, F7 রাতের গবেষণা, F8 prediction, N10 কোডিং এজেন্ট, N11 নথি/রিপোর্ট, bridge (Desktop দিক)")
+        # v1.2.0 migration: conversations store — seed the first
+        # conversation from the old single convo buffer (convo.json).
+        try:
+            if not CONVERSATIONS_FILE.exists():
+                _buf = convo_load()
+                _now_ts = int(time.time())
+                _seed_msgs = [{"r": it.get("r", "user"), "t": it.get("t", ""),
+                               "ts": int(it.get("ts") or _now_ts)}
+                              for it in _buf if isinstance(it, dict)]
+                _seed = {"id": _new_convo_id(), "title": "আগের কথোপকথন",
+                         "created": _now_ts, "updated": _now_ts,
+                         "messages": _seed_msgs}
+                convos_save({"active": _seed["id"], "items": [_seed]})
+                log_change("v1.2.0: পুরোনো কথোপকথন নতুন কথোপকথন-ভান্ডারে আনা হলো")
+        except Exception:
+            pass
+        register_capability("pro-v12", "Professional & Comfortable: একাধিক কথোপকথন, regenerate, স্মৃতি-দর্শক, ছবি-প্রশ্ন, উত্তর-দৈর্ঘ্য পছন্দ")
+        log_change("আপগ্রেড: v1.2.0 — একাধিক কথোপকথন ও খোঁজা/নাম বদল/মোছা, আবার উত্তর (regenerate), বার্তা edit-resend (truncate), স্মৃতি দেখা/মোছা/যোগ, ছবি পাঠিয়ে প্রশ্ন (Gemini vision), উত্তর-দৈর্ঘ্য পছন্দ ও quiet hours সেটিং, উত্তর রেটিং সেভ")
         log_change(f"আপগ্রেড: v{APP_VERSION} — professional UI polish + স্থির গ্রিড/প্যানেল-স্ক্রল/auto-scroll, গলার গতি ঠিক (preset পুনঃসামঞ্জস্য + মোট slowdown cap −12% + গতি স্লাইডার) ও Edge নির্ভরযোগ্যতা, reply দ্রুত (fast-first মডেল + timeout 12s + daily-release background-এ), F1–F8/N10/N11 পূর্ণ রূপ, bridge Desktop প্রোটোকল")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
