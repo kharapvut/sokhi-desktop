@@ -77,6 +77,44 @@ TTS_CACHE = DATA / "tts_cache"
 CHANGELOG = BASE / "CHANGELOG.md"
 PIN_FILE = DATA / "pin.txt"
 PORT = 8765
+TOAST_QUEUE = DATA / "toast_queue"
+EXPENSES_FILE = DATA / "expenses.json"
+
+
+def queue_toast(title, message):
+    """v1.9.3: best-effort toast queue — the desktop launcher reads
+    DATA/toast_queue/*.json and shows a Windows toast. Keeps at most
+    20 files so nothing piles up when no launcher is running."""
+    try:
+        TOAST_QUEUE.mkdir(parents=True, exist_ok=True)
+        try:
+            _old = sorted(TOAST_QUEUE.glob("*.json"))
+            while len(_old) >= 20:
+                try:
+                    _old.pop(0).unlink()
+                except Exception:
+                    break
+        except Exception:
+            pass
+        _name = f"{int(time.time() * 1000)}.json"
+        (TOAST_QUEUE / _name).write_text(
+            json.dumps({"title": str(title), "message": str(message),
+                        "ts": int(time.time())}, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _bn_digits(s):
+    """v1.9.3: Bangla digits -> English digits (reuses _n8_norm_digits)."""
+    try:
+        return _n8_norm_digits(s)
+    except Exception:
+        try:
+            return (s or "").translate(
+                str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789"))
+        except Exception:
+            return s or ""
 
 BANGLA_RULES = (
     "\n\n## বাংলা উত্তরের নিয়ম (v0.4 থেকে)\n"
@@ -784,6 +822,8 @@ def ask_gemini(user_text, mem, quality=False, image=None):
         system += "\nউত্তর Banglish-এ দাও — বাংলা কথা, কিন্তু ল্যাটিন (ইংরেজি) হরফে লেখা; সহজ ও স্বাভাবিক ভঙ্গিতে।"
     elif _lang == "English":
         system += "\nReply in simple, clear English only."
+    if cfg.get("en_practice"):
+        system += "\n[English practice mode] Converse in simple English. Gently correct the user's English mistakes (show the corrected sentence), keep replies short, ask one follow-up question, and add a one-line Bangla tip when you correct something."
     _contents = gemini_contents(user_text)
     if image:
         try:
@@ -9397,6 +9437,24 @@ def daily_release_if_due():
     save_json(VERSION_FILE, ver)
     log_change(f"প্রতি ২৪ ঘণ্টার নতুন ভার্সন লঞ্চ: v{new_v} — {summary}")
     maybe_git_push(f"Sokhi daily version v{new_v} ({today})")
+    try:
+        queue_toast("Sokhi", f"আজকের দৈনিক রিলিজ তৈরি (v{new_v})।")
+    except Exception:
+        pass
+    try:
+        _rain_flag = DATA / "rain-alert-date.txt"
+        _today_s = str(date.today())
+        _rain_done = (_rain_flag.exists() and
+                      _rain_flag.read_text(encoding="utf-8").strip() == _today_s)
+        if not _rain_done:
+            _wx = get_weather(get_config().get("city", "Dhaka") or "Dhaka")
+            _wxl = (_wx or "").lower()
+            if any(_w in _wxl for _w in ("বৃষ্টি", "rain", "shower", "thunder")):
+                queue_toast("আবহাওয়া সতর্কতা 🌧",
+                            "আজ বৃষ্টির সম্ভাবনা আছে — বাইরে বের হলে ছাতা নিয়ে যেও।")
+                _rain_flag.write_text(_today_s, encoding="utf-8")
+    except Exception:
+        pass
     return new_v
 
 
@@ -10992,6 +11050,32 @@ DAILY_PROVERBS = [
 ]
 
 
+_FESTIVAL_FIXED = {
+    (1, 1): "Happy New Year! 🎉 নতুন বছরের শুভেচ্ছা!",
+    (2, 21): "শহীদ দিবস — ভাষা শহীদদের প্রতি শ্রদ্ধা।",
+    (3, 26): "মহান স্বাধীনতা দিবসের শুভেচ্ছা! 🇧🇩",
+    (4, 14): "শুভ নববর্ষ! 🎉 পহেলা বৈশাখের অনেক শুভেচ্ছা!",
+    (12, 16): "মহান বিজয় দিবসের শুভেচ্ছা! 🇧🇩",
+    (12, 25): "বড়দিনের শুভেচ্ছা! 🎄",
+}
+
+_FESTIVAL_EST = {
+    (2026, 3, 20): "ঈদ মোবারক! 🌙 (ঈদুল ফিতর — আনুমানিক তারিখ)",
+    (2026, 5, 27): "ঈদ মোবারক! 🌙 (ঈদুল আজহা — আনুমানিক তারিখ)",
+}
+
+
+def festival_today(d=None):
+    """v1.9.3: fixed festival days + approximate Eid dates. '' if none."""
+    try:
+        d = d or date.today()
+        if (d.year, d.month, d.day) in _FESTIVAL_EST:
+            return _FESTIVAL_EST[(d.year, d.month, d.day)]
+        return _FESTIVAL_FIXED.get((d.month, d.day), "")
+    except Exception:
+        return ""
+
+
 def daily_card(for_date=None):
     """GET /api/dailycard-এর backend (#334 + #324)।
     Deterministic by date ordinal: একই দিনে সারাদিন একই কার্ড, পরদিন নতুন।
@@ -11004,16 +11088,20 @@ def daily_card(for_date=None):
     fact = DAILY_FACTS[ordinal % len(DAILY_FACTS)]
     proverb, meaning = DAILY_PROVERBS[(ordinal * 11 + 5) % len(DAILY_PROVERBS)]
     return {"ok": True, "date": str(d), "fact": fact,
-            "proverb": proverb, "meaning": meaning}
+            "proverb": proverb, "meaning": meaning,
+            "festival": festival_today(d)}
 
 
 def daily_card_text(for_date=None):
     """Chat form of daily_card — 'আজকের তথ্য' কমান্ডের উত্তর।"""
     c = daily_card(for_date)
-    return ("🌞 আজকের তথ্য\n"
+    _txt = ("🌞 আজকের তথ্য\n"
             f"💡 অজানা সত্য: {c['fact']}\n"
             f"📜 প্রবাদ: {c['proverb']}\n"
             f"মানে: {c['meaning']}")
+    if c.get("festival"):
+        _txt += f"\n🎉 {c['festival']}"
+    return _txt
 
 
 # ------------------------------------------------------- #143: শুভেচ্ছা-সঙ্গী
@@ -12475,6 +12563,267 @@ def fullforms_panels():
     return {"projects": projects, "gui_steps": gui_steps,
             "bridge": bridge, "growth": growth}
 
+# ------------------------------------------------------- v1.9.3 app pack
+def _media_key(vk):
+    """Windows media key via keybd_event. (ok, msg) — Windows-only."""
+    if not sys.platform.startswith("win"):
+        return (False, "এটা শুধু Windows-এ চলে ভাইয়া।")
+    try:
+        import ctypes
+        ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(vk, 0, 2, 0)
+        return (True, "")
+    except Exception as e:
+        return (False, f"মিডিয়া কী পাঠাতে সমস্যা হলো: {e}")
+
+
+_EN_COACH_TABLE = [
+    ("i am agree", "I agree"),
+    ("he don't", "he doesn't"),
+    ("she don't", "she doesn't"),
+    ("i am from bangladesh", "I am from Bangladesh"),
+    ("i didn't went", "I didn't go"),
+    ("more better", "better"),
+    ("i am having", "I have (সাধারণত)"),
+]
+
+_EN_COACH_QS = [
+    "What did you eat today?",
+    "What is your dream job?",
+    "Tell me about your village.",
+    "What did you study today?",
+    "What will you do tomorrow?",
+]
+
+
+def _en_coach(text, mem):
+    """Offline English-practice coach: common-mistake table + follow-up.
+    Only used when there is NO Gemini key (Gemini teaches when present)."""
+    low = (text or "").lower()
+    prefix = ""
+    for _wrong, _right in _EN_COACH_TABLE:
+        if _wrong in low:
+            prefix = f"ছোট্ট ঠিক করে দিই: '{_wrong}' → '{_right}'। "
+            break
+    if not prefix:
+        prefix = "Good! 👍 "
+    try:
+        _idx = int((mem or {}).get("interaction_count", 0)) % len(_EN_COACH_QS)
+    except Exception:
+        _idx = 0
+    return prefix + _EN_COACH_QS[_idx]
+
+
+def _v193_try(text, low, mem):
+    """v1.9.3 intents: media keys, screenshot-vision, clipboard explain,
+    expense book, evening summary, English practice. None = not mine."""
+    text = text or ""
+    low = low or ""
+
+    # (ক) মিডিয়া কী ------------------------------------------------
+    def _mk(vk, reply, times=1):
+        for _i in range(times):
+            _ok, _msg = _media_key(vk)
+            if not _ok:
+                return _msg
+        return reply
+
+    if any(w in text for w in ("গান থামাও", "গান বন্ধ করো")) or "pause করো" in text:
+        return _mk(0xB3, "থামিয়ে দিলাম।")
+    if any(w in text for w in ("গান চালাও", "গান বাজাও", "মিউজিক চালাও")) or "play করো" in text:
+        return _mk(0xB3, "বাজিয়ে দিলাম।")
+    if "পরের গান" in text or "পরেরটা বাজাও" in text or "next song" in low:
+        return _mk(0xB0, "পরের গান বাজিয়ে দিলাম।")
+    if "আগের গান" in text or "previous song" in low:
+        return _mk(0xB1, "আগের গান বাজিয়ে দিলাম।")
+    if any(w in text for w in ("শব্দ বাড়াও", "আওয়াজ বাড়াও")) or "volume up" in low:
+        return _mk(0xAF, "শব্দ বাড়িয়ে দিলাম।", times=3)
+    if any(w in text for w in ("শব্দ কমাও", "আওয়াজ কমাও")) or "volume down" in low:
+        return _mk(0xAE, "শব্দ কমিয়ে দিলাম।", times=3)
+    if "শব্দ বন্ধ করো" in text or "mute করো" in text:
+        return _mk(0xAD, "শব্দ বন্ধ করে দিলাম।")
+
+    # (খ) স্ক্রিন দেখো ------------------------------------------------
+    if (any(w in text for w in ("এটা দেখো", "স্ক্রিন দেখো", "স্ক্রিনে কী আছে", "আমার স্ক্রিন"))
+            or "look at my screen" in low):
+        if not (get_config().get("gemini_api_key") or "").strip():
+            return "স্ক্রিন বুঝতে হলে আগে সেটিংসে ফ্রি Gemini key বসাতে হবে ভাইয়া।"
+        _ok, _msg = gui_screenshot()
+        if not _ok:
+            return _msg
+        try:
+            import base64 as _b64
+            import io as _io
+            _path_s = _msg.split("সেভ করলাম:", 1)[-1].strip() if "সেভ করলাম:" in _msg else ""
+            _sp = Path(_path_s) if _path_s else None
+            if _sp is None or not _sp.exists():
+                _shots = sorted(DATA.glob("screenshot-*.bmp"),
+                                key=lambda q: q.stat().st_mtime)
+                _sp = _shots[-1] if _shots else _sp
+            _raw = _sp.read_bytes()
+            _data_url = None
+            try:
+                from PIL import Image as _PILImage
+                _im = _PILImage.open(_io.BytesIO(_raw))
+                _buf = _io.BytesIO()
+                _im.save(_buf, format="PNG")
+                _data_url = ("data:image/png;base64," +
+                             _b64.b64encode(_buf.getvalue()).decode("ascii"))
+            except Exception:
+                _data_url = ("data:image/bmp;base64," +
+                             _b64.b64encode(_raw).decode("ascii"))
+            _ans = ask_gemini(
+                "এই স্ক্রিনশটে কী দেখা যাচ্ছে, সহজ বাংলায় বুঝিয়ে দাও। "
+                "ভুল/সমস্যা/সতর্কতার কিছু দেখলে তাও বলো।",
+                mem, quality=True, image=_data_url)
+            if _ans:
+                return _ans
+        except Exception:
+            pass
+        return "স্ক্রিনটা দেখলাম, কিন্তু বুঝে উঠতে পারিনি ভাইয়া।"
+
+    # (গ) ক্লিপবোর্ড বুঝাও -------------------------------------------
+    if text.strip().startswith("ক্লিপবোর্ড") and any(
+            w in text for w in ("বুঝা", "অনুবাদ", "সারাংশ")):
+        _clip = ""
+        try:
+            _cf = DATA / "clipboard_last.txt"
+            if _cf.exists():
+                _clip = _cf.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            _clip = ""
+        if not _clip:
+            return ("ক্লিপবোর্ডে কোনো লেখা পাইনি ভাইয়া — ডেস্কটপ app-এ "
+                    "ক্লিপবোর্ড-নজর চালু করে আগে কিছু copy করে দেখো।")
+        _clip = _clip[:3000]
+        if (get_config().get("gemini_api_key") or "").strip():
+            try:
+                _ans = ask_gemini(
+                    "নিচের লেখাটা সহজ বাংলায় বুঝিয়ে দাও "
+                    f"(ইংরেজি হলে অনুবাদসহ):\n\n{_clip}", mem)
+                if _ans:
+                    return _ans
+            except Exception:
+                pass
+        return _clip[:400] + "… (Gemini key থাকলে পুরোটা বুঝিয়ে দিতাম)"
+
+    # (ঘ) খরচের খাতা --------------------------------------------------
+    _exp_m = re.search(
+        r"(?:খরচ|expense)[^০-৯0-9]*([০-৯0-9][০-৯0-9,]*)\s*টাকা\s*(.*)",
+        text, re.I)
+    if not _exp_m and "খরচ লিখো" in text:
+        _exp_m = re.search(r"([০-৯0-9][০-৯0-9,]*)\s*টাকা\s*(.*)", text)
+    if _exp_m:
+        try:
+            _amt_s = _bn_digits(_exp_m.group(1)).replace(",", "")
+            _amt = float(_amt_s)
+            _amt = int(_amt) if _amt == int(_amt) else _amt
+        except Exception:
+            _amt = None
+        if _amt is not None:
+            _item = (_exp_m.group(2) or "").strip(" \t।.,—-:") or "সাধারণ খরচ"
+            _items = load_json(EXPENSES_FILE, [])
+            if not isinstance(_items, list):
+                _items = []
+            _items.append({"date": str(date.today()), "item": _item,
+                           "amount": _amt})
+            try:
+                save_json(EXPENSES_FILE, _items[-500:])
+            except Exception:
+                pass
+            _ym = date.today().strftime("%Y-%m")
+            _mtotal = sum(float(it.get("amount") or 0) for it in _items
+                          if isinstance(it, dict)
+                          and str(it.get("date", "")).startswith(_ym))
+            _mtotal = int(_mtotal) if _mtotal == int(_mtotal) else _mtotal
+            return (f"লিখে রাখলাম: {_item} — {_amt} টাকা। "
+                    f"{_mtotal} টাকা এ মাসে মোট খরচ।")
+    if any(w in text for w in ("মাসের খরচ", "খরচের খাতা", "খরচ কত হলো")):
+        _items = load_json(EXPENSES_FILE, [])
+        if not isinstance(_items, list):
+            _items = []
+        _ym = date.today().strftime("%Y-%m")
+        _mine = [it for it in _items if isinstance(it, dict)
+                 and str(it.get("date", "")).startswith(_ym)]
+        if not _mine:
+            return ("এ মাসে কোনো খরচ লেখা নেই ভাইয়া। "
+                    "'খরচ ৫০ টাকা রিকশা' — এভাবে বললেই লিখে রাখব।")
+        _lines = ["🧾 এ মাসের খরচের খাতা:"]
+        _total = 0
+        for _it in _mine:
+            _a = float(_it.get("amount") or 0)
+            _total += _a
+            _a = int(_a) if _a == int(_a) else _a
+            _lines.append(f"• {_it.get('date', '')} — {_it.get('item', 'সাধারণ খরচ')}: {_a} টাকা")
+        _total = int(_total) if _total == int(_total) else _total
+        _lines.append(f"মোট: {_total} টাকা")
+        return "\n".join(_lines)
+
+    # (ঙ) সন্ধ্যার সারাংশ ----------------------------------------------
+    if any(w in text for w in ("সন্ধ্যার সারাংশ", "আজকের সারাংশ", "দিনের সারাংশ")):
+        _lines = [f"🌆 আজকের সারাংশ — {date.today()}",
+                  f"আজ মোট {(mem or {}).get('interaction_count', 0)} বার কথা হয়েছে।"]
+        try:
+            _tasks = away_load()
+            _pend = [t for t in _tasks if isinstance(t, dict)
+                     and str(t.get("status", "অপেক্ষায়")) not in
+                     ("হয়ে গেছে", "সম্পন্ন", "done", "Done")]
+            _lines.append(f"বাকি টাস্ক: {len(_pend)}টা।")
+            for _t in _pend[:3]:
+                _lines.append(f"• {_t.get('text', '')}")
+        except Exception:
+            pass
+        try:
+            from datetime import timedelta as _td
+            _tmr = date.today() + _td(days=1)
+            _wk = {0: "mon", 1: "tue", 2: "wed", 3: "thu",
+                   4: "fri", 5: "sat", 6: "sun"}[_tmr.weekday()]
+            _rems = []
+            for _r in _reminders_load():
+                if not isinstance(_r, dict):
+                    continue
+                if str(_r.get("date", "")) == str(_tmr):
+                    _rems.append(_r)
+                elif str(_r.get("days", "daily")) == "daily" or \
+                        _wk in [d.strip() for d in str(_r.get("days", "")).split(",")]:
+                    _rems.append(_r)
+            if _rems:
+                _lines.append("আগামীকালের রিমাইন্ডার:")
+                for _r in _rems[:3]:
+                    _lines.append(f"• {_r.get('time', '')} — {_r.get('text', '')}")
+        except Exception:
+            pass
+        try:
+            _rev = es_revision_due_text()
+            if _rev:
+                _lines.append("রিভিশন বাকি:")
+                _lines.extend(str(_rev).splitlines()[:3])
+        except Exception:
+            pass
+        return "\n".join(_lines)
+
+    # (চ) ইংরেজি প্র্যাকটিস --------------------------------------------
+    if "ইংরেজি প্র্যাকটিস" in text and ("শুরু" in text or "চালু" in text):
+        _cfg = get_config(); _cfg["en_practice"] = True; save_config(_cfg)
+        return ("English practice mode is ON! 🎯 Let's talk in English — "
+                "I'll gently fix your mistakes. Tell me: how was your day?")
+    if "ইংরেজি প্র্যাকটিস" in text and ("বন্ধ" in text or "শেষ" in text):
+        _cfg = get_config(); _cfg["en_practice"] = False; save_config(_cfg)
+        return ("ইংরেজি প্র্যাকটিস বন্ধ করে দিলাম। আবার শুরু করতে চাইলে "
+                "বলো 'ইংরেজি প্র্যাকটিস শুরু করো'।")
+    try:
+        if get_config().get("en_practice") and not \
+                (get_config().get("gemini_api_key") or "").strip():
+            _letters = [c for c in text if c.isalpha()]
+            if _letters:
+                _latin = sum(1 for c in _letters if c.isascii())
+                if _latin / len(_letters) > 0.6:
+                    return _en_coach(text, mem)
+    except Exception:
+        pass
+    return None
+
+
 def handle_message(text):
     text = (text or "").strip()
     if not text:
@@ -12516,6 +12865,9 @@ def handle_message(text):
         if "নামে ডাকবে না" in text or "কোনো নামে ডাক" in text:
             cfg = get_config(); cfg["call_name"] = ""; save_config(cfg)
             return "ঠিক আছে, আজ থেকে আর কোনো নামে ডাকব না — শুধু তুমি বলেই কথা বলব।"
+
+        _v193 = _v193_try(text, low, mem)
+        if _v193: return _v193
 
         # --- auto self-upgrade commands
         if "অটো আপগ্রেড" in text and ("বন্ধ" in text or "off" in low):
@@ -12826,6 +13178,10 @@ input[type=range]{flex:1;padding:0;accent-color:var(--accent)}
 .quick button{font-size:13px;padding:7px 12px;border-radius:999px}
 #pinbox{max-width:420px;margin:32px auto;background:var(--panel);padding:24px;border-radius:var(--radius);text-align:center;border:1px solid var(--line);box-shadow:var(--shadow)}
 #gear{position:fixed;top:10px;right:10px;width:42px;height:42px;border-radius:50%;font-size:18px;padding:0;z-index:50;box-shadow:var(--shadow)}
+#fsbtn{position:fixed;top:10px;right:114px;width:42px;height:42px;border-radius:50%;font-size:18px;padding:0;z-index:50;box-shadow:var(--shadow)}
+#guestbanner{display:none;position:fixed;top:58px;left:50%;transform:translateX(-50%);z-index:55;background:#8c1d33;color:#fff;padding:6px 16px;border-radius:999px;font-size:13px;box-shadow:var(--shadow)}
+body.guest #guestbanner{display:block}
+body.guest #pane-memory,body.guest #convowrap,body.guest #rightcol{display:none!important}
 #modal{display:none;position:fixed;inset:0;background:rgba(2,4,10,.72);z-index:60;overflow:hidden}
 #modal .panel{max-width:480px;max-height:calc(100vh - 48px);overflow-y:auto;min-height:0;margin:24px auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px;box-shadow:var(--shadow)}
 #modal .panel h3{margin:0 0 12px;font-size:16px;font-weight:600}
@@ -12901,6 +13257,8 @@ input[type=range]{flex:1;padding:0;accent-color:var(--accent)}
 </header>
 
 <button id="gear" title="সেটিংস" onclick="openSettings()">⚙️</button>
+<button id="fsbtn" title="পুরো স্ক্রিন — JARVIS মোড (F11)" onclick="toggleFS()">⛶</button>
+<div id="guestbanner">অতিথি মোড চালু — ব্যক্তিগত জিনিস লুকানো আছে</div>
 <div id="modal" onclick="if(event.target===this)this.style.display='none'">
  <div class="panel">
   <h3>সেটিংস</h3>
@@ -12954,7 +13312,22 @@ input[type=range]{flex:1;padding:0;accent-color:var(--accent)}
   </div>
   <div class="hint">লিংক বসালেই Sokhi GitHub থেকে নিজে নতুন ভার্সন এনে বসাতে পারবে। ধাপগুলো Saba-র গাইডে আছে।</div>
   <hr>
-  <div class="secttl">নিজে নিজে আপগ্রেড</div>
+  <div class="secttl">📱 ফোনে Sokhi খোলো</div>
+   <div id="qrbox" class="statline">QR কোড এখনো দেখানো হয়নি — নিচের বোতাম চাপো।</div>
+   <button onclick="loadQR()">QR কোড দেখাও</button>
+   <div class="hint">ফোনটা একই Wi-Fi-তে রেখে QR স্ক্যান করলেই ফোনে Sokhi খুলবে; PIN লাগবে।</div>
+   <hr>
+   <div class="secttl">🙈 গোপনীয়তা / অতিথি মোড</div>
+   <div id="gueststat" class="statline">অতিথি মোড বন্ধ আছে — সবকিছু দেখা যাচ্ছে।</div>
+   <button onclick="toggleGuest()">অতিথি মোড চালু/বন্ধ করো</button>
+   <div class="hint">অতিথি মোডে স্মৃতি প্যানেল, কথোপকথনের তালিকা আর ডান প্যানেল লুকিয়ে থাকে। বন্ধ করতে PIN লাগবে।</div>
+   <hr>
+   <div class="secttl">🎨 উপস্থিতির রঙ</div>
+   <div style="font-size:13px">orb-এর রঙ:
+    <select id="orbstyle" onchange="saveOrbStyle()"><option value="blue">আসল নীল</option><option value="purple">বেগুনি আভা</option><option value="pink">গোলাপি আভা</option><option value="gold">সোনালি আভা</option></select>
+   </div>
+   <hr>
+   <div class="secttl">নিজে নিজে আপগ্রেড</div>
   <div id="autostat" class="statline">…</div>
   <button onclick="document.getElementById('modal').style.display='none';quick('আপগ্রেড চেক করো')">এখনই স্ব-আপগ্রেড চেক করো</button>
   <hr>
@@ -13613,6 +13986,37 @@ async function saveUrl(){
  const v=document.getElementById('updateurl').value.trim();
  const j=await api('/api/settings',{update_url:v});
  document.getElementById('ghstat').textContent=j.update_url_set?'✅ ঠিকানা বসানো আছে — এখন চ্যাটে "আপগ্রেড চেক করো" বললেই GitHub থেকে যাচাই হবে':'ঠিকানা মোছা হয়েছে';}
+async function loadQR(){
+ const box=document.getElementById('qrbox');if(!box)return;
+ try{const j=await apiGet('/api/phone_qr');
+  if(j.ok){box.innerHTML=j.svg+'<div>'+j.url+'</div>'}
+  else{box.textContent=(j.url||'')+' — '+(j.error||'QR পাওয়া যায়নি')}}
+ catch(e){box.textContent='QR আনতে পারিনি — আবার চেষ্টা করো।'}}
+function applyOrb(v){
+ const cv=document.getElementById('pcanvas');if(!cv)return;
+ cv.style.filter={blue:'',purple:'hue-rotate(35deg)',pink:'hue-rotate(295deg) saturate(1.25)',gold:'hue-rotate(-30deg) sepia(0.35) saturate(1.3)'}[v]||''}
+async function saveOrbStyle(){
+ const el=document.getElementById('orbstyle');if(!el)return;const v=el.value;
+ applyOrb(v);try{await api('/api/settings',{orb_style:v})}catch(e){}}
+function applyGuest(on){
+ document.body.classList.toggle('guest',!!on);
+ const gs=document.getElementById('gueststat');if(gs)gs.textContent=on?'✅ অতিথি মোড চালু আছে — ব্যক্তিগত জিনিস লুকানো।':'অতিথি মোড বন্ধ আছে — সবকিছু দেখা যাচ্ছে।'}
+async function toggleGuest(){
+ if(!document.body.classList.contains('guest')){
+  try{await api('/api/settings',{guest_mode:true})}catch(e){}
+  applyGuest(true);return}
+ const v=prompt('PIN দাও');if(v==null)return;
+ try{const r=await fetch('/api/status',{headers:{'X-PIN':v}});
+  if(r.status===200){await api('/api/settings',{guest_mode:false});applyGuest(false)}
+  else alert('PIN মেলেনি')}
+ catch(e){alert('PIN মেলেনি')}}
+function toggleFS(){
+ if(window.pywebview&&window.pywebview.api&&window.pywebview.api.toggle_fullscreen){window.pywebview.api.toggle_fullscreen();return}
+ if(document.fullscreenElement){document.exitFullscreen()}
+ else{document.documentElement.requestFullscreen()}}
+document.addEventListener('keydown',function(e){
+ if(e.key==='F11'){e.preventDefault();toggleFS()}
+ if(e.key==='Escape'&&window.pywebview&&window.pywebview.api&&window.pywebview.api.exit_fullscreen){window.pywebview.api.exit_fullscreen()}});
 async function clearKey(){
  if(!confirm('key মুছে ফেলবে?'))return;
  const j=await api('/api/settings',{clear_key:true});
@@ -13799,6 +14203,8 @@ armIdle();
  document.getElementById('callname').value=s.call_name||'';
  document.getElementById('tonepreset').value=s.tts_preset||'মিষ্টি';
  if(s.update_url)document.getElementById('updateurl').value=s.update_url;
+  try{loadQR()}catch(e){}
+  try{applyGuest(!!s.guest_mode);applyOrb(s.orb_style||'blue');document.getElementById('orbstyle').value=s.orb_style||'blue'}catch(e){}
  document.getElementById('ghstat').textContent=s.update_url_set?'✅ GitHub ঠিকানা বসানো আছে':'❌ এখনো বসানো হয়নি — Saba-র গাইড দেখে বসাও';
  document.getElementById('orb').onclick=()=>{if(speakingNow)stopSpeak()};
  document.getElementById('autostat').textContent=(s.auto_upgrade?'✅ চালু আছে':'❌ বন্ধ আছে')+' • শেখা উত্তর: '+s.knowledge+'টা • প্রতিদিন নিজে নিজে একটু করে ভালো হয়';
@@ -13879,8 +14285,9 @@ body.focus #layout{grid-template-columns:minmax(0,1fr);max-width:980px}
  #convobar button{min-height:44px;padding:10px 14px}
  .convoitem{padding:12px 8px}
  .convoitem button{min-width:40px;min-height:40px}
- #gear,#focusbtn{width:48px;height:48px}
+ #gear,#focusbtn,#fsbtn{width:48px;height:48px}
  #focusbtn{right:70px}
+ #fsbtn{right:128px}
  #fe2helpbtn{width:48px;height:48px;bottom:76px}
  .cmditem{padding:13px 12px}
  .fe2memrow button{min-width:40px;min-height:36px}
@@ -15519,6 +15926,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": f"{_NO_DATA} — চার্ট আঁকার মতো ডেটা পাইনি।"})
             _svg = svg_line_chart(_series) if _kind == "coverage" else svg_bar_chart(_series)
             return self._json({"ok": True, "kind": _kind, "title": _series.get("title", ""), "svg": _svg})
+        if _parsed.path == "/api/phone_qr":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            _purl = f"http://{local_ip()}:{PORT}"
+            try:
+                import segno as _segno
+                _svg = _segno.make(_purl, error="m").svg_inline(scale=5)
+                return self._json({"ok": True, "svg": _svg, "url": _purl})
+            except ImportError:
+                return self._json({"ok": False, "url": _purl, "error": "QR টুল (segno) এখনো বসেনি — ঠিকানাটা ফোনের browser-এ লিখলেই Sokhi খুলবে"})
+            except Exception as _qe:
+                return self._json({"ok": False, "url": _purl, "error": f"QR বানাতে সমস্যা হলো: {_qe}"})
         if self.path in ("/", "/index.html"):
             body = HTML.encode("utf-8")
             self.send_response(200)
@@ -15541,7 +15960,7 @@ class Handler(BaseHTTPRequestHandler):
                                "knowledge": len(load_json(KNOW_FILE, {})),
                                "auto_upgrade": bool(get_config().get("auto_self_upgrade", True)),
                                "voice_engine": tts_engine_status(), "voice_rate": _clamp_voice_rate(get_config().get("voice_rate", 1.0)),
-                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "tts_engine": get_config().get("tts_engine", "edge"), "gemini_voice": get_config().get("gemini_voice", "Aoede"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "echo_guard": bool(get_config().get("echo_guard", True)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
+                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "tts_engine": get_config().get("tts_engine", "edge"), "gemini_voice": get_config().get("gemini_voice", "Aoede"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "echo_guard": bool(get_config().get("echo_guard", True)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "guest_mode": bool(get_config().get("guest_mode")), "orb_style": get_config().get("orb_style", "blue"), "en_practice": bool(get_config().get("en_practice")), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
         if self.path == "/api/memory":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
@@ -15671,6 +16090,18 @@ class Handler(BaseHTTPRequestHandler):
             if "wake_word" in data:
                 cfg = get_config(); cfg["wake_word"] = bool(data.get("wake_word")); save_config(cfg)
                 return self._json({"ok": True, "wake_word": cfg["wake_word"]})
+            if "guest_mode" in data:
+                cfg = get_config(); cfg["guest_mode"] = bool(data.get("guest_mode")); save_config(cfg)
+                return self._json({"ok": True, "guest_mode": cfg["guest_mode"]})
+            if "en_practice" in data:
+                cfg = get_config(); cfg["en_practice"] = bool(data.get("en_practice")); save_config(cfg)
+                return self._json({"ok": True, "en_practice": cfg["en_practice"]})
+            if "orb_style" in data:
+                _os = str(data.get("orb_style") or "").strip()
+                if _os not in ("blue", "purple", "pink", "gold"):
+                    return self._json({"ok": False, "error": "orb-এর রঙ হতে হবে: blue, purple, pink বা gold।"})
+                cfg = get_config(); cfg["orb_style"] = _os; save_config(cfg)
+                return self._json({"ok": True, "orb_style": _os})
             if "echo_guard" in data:
                 cfg = get_config(); cfg["echo_guard"] = bool(data.get("echo_guard")); save_config(cfg)
                 return self._json({"ok": True, "echo_guard": cfg["echo_guard"]})
@@ -15940,7 +16371,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 
 
 def main():
@@ -15999,6 +16430,8 @@ def main():
         log_change("আপগ্রেড: v1.9.1 — বাগ-ফিক্স: লাইভ মোডে Sokhi নিজের বলা কথা স্পিকার→মাইক echo-তে শুনে নিজেকেই উত্তর দিত; echo guard যোগ হলো — speak()-এ বলা কথা মনে রেখে recognition-ইনপুট মিলিয়ে ফেলে দেয় (বলা চলাকালে + শেষের ৮০০ms), barge-in অক্ষত; সেটিংসে 'নিজের কণ্ঠ চেনা (echo guard)' টগল")
         register_capability("v192-voice", "কণ্ঠের ইঞ্জিন বাছাই (Gemini/Edge/ব্রাউজার) + Gemini গলা বাছাই (ডিফল্ট Aoede) + Edge-এ তানিশা গলা; কোন ইঞ্জিন+গলা বলল status/ডাক্তারে পরিষ্কার; Gemini ফলব্যাকে সৎ নোট")
         log_change("আপগ্রেড: v1.9.2 — কণ্ঠের মান: Settings-এ TTS ইঞ্জিন বাছাই (Gemini = সবচেয়ে প্রাণবন্ত, একই ফ্রি key; ব্যর্থ হলে Edge→Google ফলব্যাক + status/ডাক্তারে নোট), Gemini গলা বাছাই (Aoede/Kore/Leda/Callirrhoe/Puck), Edge গলায় তানিশা যোগ, /api/tts এখন WAV-ও দেয় আর ব্যর্থতায় HTTP 500 (পেজের ব্রাউজার-গলা ফলব্যাক সত্যিই চলে)")
+        register_capability("v193-app", "Windows app সঙ্গী: toast-সারি, ফোন-জোড়া QR, অতিথি/গোপনীয়তা মোড, উপস্থিতির রঙ, মিডিয়া-নিয়ন্ত্রণ, স্ক্রিন দেখে সাহায্য, ক্লিপবোর্ড বুঝাও, খরচের খাতা, সন্ধ্যার সারাংশ, ইংরেজি প্র্যাকটিস, উৎসবের ছোঁয়া")
+        log_change("আপগ্রেড: v1.9.3 — Windows app সংস্করণ: toast queue, /api/phone_qr, guest mode, orb style, media keys, screenshot-vision, clipboard explain, expense book, evening summary, English practice, festival touch")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
