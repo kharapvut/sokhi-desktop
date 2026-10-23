@@ -1751,6 +1751,653 @@ def study_progress_text():
     return "\n".join(lines)
 
 
+# -*- coding: utf-8 -*-
+"""
+Desktop Sokhi v1.5.0 — Study Feature Pack (WAVE-2, study cluster)
+=================================================================
+Self-contained snippets for integration into sokhi.py (v1.5.0).
+Coordinator: paste this whole file at top level in sokhi.py AFTER
+OFFLINE_BANK / OFFLINE_LESSONS are defined and AFTER _bn_num /
+load_json / _STUDY_PROGRESS_FILE / _WRONG_BOOK_FILE exist
+(i.e. anywhere after the teacher/exam section, before handle_message),
+then wire the dispatch block described in INTEGRATION-STUDY.md.
+
+Features:
+  #654 question_mining_text()      প্রশ্ন-খনন রিপোর্ট
+  #655 coverage_text()             সিলেবাস-কভারেজ
+  #725 wrong_analysis_text()       ভুল-বিশ্লেষণ
+  #759 xray_text()                 জ্ঞানের এক্স-রে (lite, অনুমান)
+  #697 mastery_questions() /
+       mastery_grade()             অধ্যায়-মাস্টারি যাচাই
+  #721 bedtime_revision_text()     ঘুমের আগের রিভিশন
+  #748 lesson_summaries_text()     অধ্যায়ের এক-লাইন সার
+  #664 concept_map_text(subject)   ধারণা-মানচিত্র (text)
+
+House rules honoured:
+  * 100% free, offline-only — reads ONLY OFFLINE_BANK, OFFLINE_LESSONS,
+    study-progress.json and study-wrong-book.json. No web, no Gemini.
+  * Never fabricates exam data — every number is a count of what
+    actually exists in those banks/files. Empty data -> a friendly
+    "এখনো ডেটা নেই" Bangla line, never invented numbers.
+  * Pure-ish functions: data can be injected via parameters (used by
+    test_study_pack.py). When a parameter is None, the function falls
+    back to the module globals of the host sokhi.py with the EXACT
+    existing names: OFFLINE_BANK, OFFLINE_LESSONS, load_json,
+    _STUDY_PROGRESS_FILE, _WRONG_BOOK_FILE.
+  * Bangla digits via a LOCAL _bn() helper (self-contained mirror of
+    the host's _bn_num at ~line 689 in build-v14/app/sokhi.py), so the
+    pack works standalone in tests; integration may delete _bn and
+    alias _bn = _bn_num if preferred.
+
+Verified data shapes (build-v14/app/sokhi.py):
+  study-progress.json:
+    {subject: {sessions:int, mock_tests:int, total_steps:int,
+               weak:[str], last_topic:str, last_date:"YYYY-MM-DD"}}
+    (_update_progress ~line 802; study_progress_text ~line 1678)
+  study-wrong-book.json: list of dicts written by exam_answer /
+    exam_finish (~lines 1546-1605), each entry:
+    {"q": str, "options": [str x4], "correct": str (correct option TEXT),
+     "your_answer": str (picked option TEXT), "subject": str,
+     "topic": str, "date": "YYYY-MM-DD"}
+  OFFLINE_BANK (~line 1291):
+    {subject: [{"q": str, "options": [str x4], "answer": int (0-3),
+                "topic": str}]}
+  OFFLINE_LESSONS (~line 830+):
+    {subject: [{"topic": str, "text": str, "check_q": str,
+                "check_answers": [str], "alt": str}]}
+"""
+
+from collections import Counter
+from datetime import date
+
+# ------------------------------------------------------------------ digits
+
+_BN_DIGITS_MAP = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+
+
+def _bn(x):
+    """Local mirror of host _bn_num(): English digits -> Bangla digits."""
+    return str(x).translate(_BN_DIGITS_MAP)
+
+
+_NO_DATA = "এখনো ডেটা নেই"
+
+# ------------------------------------------------------- global fallbacks
+# These helpers deliberately look names up in globals() at CALL time, so
+# (a) the pack works when pasted into sokhi.py (host globals win), and
+# (b) tests can stub study_pack.OFFLINE_BANK etc. or pass data directly.
+
+
+def _resolve_bank(bank=None):
+    if bank is not None:
+        return bank if isinstance(bank, dict) else {}
+    g = globals().get("OFFLINE_BANK")
+    return g if isinstance(g, dict) else {}
+
+
+def _resolve_lessons(lessons=None):
+    if lessons is not None:
+        return lessons if isinstance(lessons, dict) else {}
+    g = globals().get("OFFLINE_LESSONS")
+    return g if isinstance(g, dict) else {}
+
+
+def _load_via_host(path, default):
+    fn = globals().get("load_json")
+    if callable(fn) and path is not None:
+        try:
+            return fn(path, default)
+        except Exception:
+            return default
+    return default
+
+
+def _resolve_progress(progress=None):
+    if progress is not None:
+        return progress if isinstance(progress, dict) else {}
+    path = globals().get("_STUDY_PROGRESS_FILE")
+    data = _load_via_host(path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_wrong(wrong=None):
+    if wrong is not None:
+        return wrong if isinstance(wrong, list) else []
+    path = globals().get("_WRONG_BOOK_FILE")
+    data = _load_via_host(path, [])
+    return data if isinstance(data, list) else []
+
+
+def _wrong_counts_by_subject(wrong):
+    c = Counter()
+    for w in wrong or []:
+        if isinstance(w, dict):
+            c[str(w.get("subject") or "অজানা বিষয়")] += 1
+    return c
+
+
+def _wrong_counts_by_topic(wrong):
+    c = Counter()
+    for w in wrong or []:
+        if isinstance(w, dict):
+            c[str(w.get("topic") or "সাধারণ")] += 1
+    return c
+
+
+# =====================================================================
+#  #654 প্রশ্ন-খনন রিপোর্ট
+# =====================================================================
+
+def question_mining_text(bank=None, wrong=None):
+    """OFFLINE_BANK (সব বিষয়) + wrong-book থেকে:
+    বিষয়ভিত্তিক প্রশ্ন-সংখ্যা, টপিকভিত্তিক ফ্রিকোয়েন্সির শীর্ষ তালিকা,
+    আর ভুলের খাতায় কোন টপিকে বেশি ভুল জমেছে — Bangla রিপোর্ট।
+    শুধু ব্যাংক/খাতায় যা আছে তাই গোনা হয়; কিছু বানানো হয় না।"""
+    bank = _resolve_bank(bank)
+    wrong = _resolve_wrong(wrong)
+    total_q = sum(len(v or []) for v in bank.values())
+    if total_q == 0 and not wrong:
+        return (f"{_NO_DATA} — প্রশ্ন-ব্যাংকেও কোনো প্রশ্ন পাইনি, ভুলের "
+                "খাতাও খালি। মক টেস্ট দিলে বা অফলাইন ব্যাংকে প্রশ্ন থাকলে "
+                "এখানে বিশ্লেষণ দেখা যাবে।")
+
+    lines = ["🔍 প্রশ্ন-খনন রিপোর্ট — কোন টপিক থেকে প্রশ্ন বেশি আসে",
+             "(শুধু অফলাইন প্রশ্ন-ব্যাংক আর তোমার ভুলের খাতা গুনে বলছি; "
+             "বাইরের কোনো তথ্য যোগ করিনি।)"]
+
+    if bank:
+        lines.append("")
+        lines.append("বিষয়ভিত্তিক প্রশ্ন (অফলাইন ব্যাংকে):")
+        for subj in sorted(bank.keys()):
+            lines.append(f"• {subj}: {_bn(len(bank[subj] or []))}টি প্রশ্ন")
+        lines.append(f"মোট: {_bn(total_q)}টি প্রশ্ন")
+
+        topic_counter = Counter()
+        for subj, qs in bank.items():
+            for q in qs or []:
+                if isinstance(q, dict):
+                    topic_counter[str(q.get("topic") or "সাধারণ")] += 1
+        if topic_counter:
+            lines.append("")
+            lines.append("ব্যাংকে সবচেয়ে বেশি প্রশ্ন আছে যেসব টপিকে (শীর্ষ ১০):")
+            for topic, cnt in topic_counter.most_common(10):
+                lines.append(f"• {topic} — {_bn(cnt)}টি প্রশ্ন")
+
+    if wrong:
+        wc = _wrong_counts_by_topic(wrong)
+        lines.append("")
+        lines.append("ভুলের খাতায় যেসব টপিকে বেশি ভুল জমেছে (শীর্ষ ১০):")
+        for topic, cnt in wc.most_common(10):
+            lines.append(f"• {topic} — {_bn(cnt)}বার ভুল")
+        lines.append("মানে: ব্যাংকে যে টপিকে প্রশ্ন বেশি, আর তুমি যেখানে "
+                     "বেশি ভুল করেছ — দুটো মিললে সেটাই আগে পড়া জরুরি।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #655 সিলেবাস-কভারেজ
+# =====================================================================
+
+def coverage_text(progress=None, lessons=None):
+    """study-progress.json + OFFLINE_LESSONS থেকে বিষয়ভিত্তিক কভারেজ।
+    প্রতি বিষয়ে: মোট পাঠ (lessons) বনাম ছোঁয়া টপিক।
+    'ছোঁয়া টপিক' = যেসব টপিকের প্রমাণ progress-এ আছে: last_topic এবং
+    weak[]-এর যেসব টপিক lesson তালিকায় আছে। এটা সীমিত প্রমাণভিত্তিক
+    হিসাব — রিপোর্টে তা বলেও দেওয়া হয়; সেশন-সংখ্যাও পাশে দেখানো হয়।"""
+    progress = _resolve_progress(progress)
+    lessons = _resolve_lessons(lessons)
+    if not lessons and not progress:
+        return (f"{_NO_DATA} — কোনো পাঠের তালিকা বা পড়ার রেকর্ড পাইনি। "
+                "'শেখাও' বলে পড়া শুরু করলেই কভারেজ হিসাব শুরু হবে।")
+
+    subjects = list(lessons.keys())
+    for s in progress.keys():
+        if s not in subjects:
+            subjects.append(s)
+    if not subjects:
+        return f"{_NO_DATA} — কোনো বিষয়ের রেকর্ড পাইনি।"
+
+    lines = ["📊 সিলেবাস-কভারেজ",
+             "(কভারেজ = অফলাইন পাঠের তালিকার মধ্যে যতগুলো টপিক ছোঁয়ার "
+             "প্রমাণ পড়ার রেকর্ডে আছে — last_topic ও দুর্বল তালিকা থেকে।)"]
+    for subj in subjects:
+        total = len(lessons.get(subj) or [])
+        ent = progress.get(subj) or {}
+        lesson_topics = [str(x.get("topic") or "")
+                         for x in (lessons.get(subj) or [])
+                         if isinstance(x, dict)]
+        touched = set()
+        lt = str(ent.get("last_topic") or "").strip()
+        if lt and lt in lesson_topics:
+            touched.add(lt)
+        elif lt and total == 0:
+            touched.add(lt)
+        for w in ent.get("weak", []) or []:
+            if str(w) in lesson_topics:
+                touched.add(str(w))
+        sessions = int(ent.get("sessions", 0) or 0)
+        weak = [str(w) for w in (ent.get("weak", []) or [])]
+        if total > 0:
+            pct = round(len(touched) * 100 / total)
+            lines.append(
+                f"• {subj}: পাঠ {_bn(len(touched))}/{_bn(total)}টি ছোঁয়া "
+                f"({_bn(pct)}%), সেশন {_bn(sessions)}টি, "
+                f"শেষ টপিক: {lt or '—'}")
+        else:
+            lines.append(
+                f"• {subj}: এই বিষয়ের অফলাইন পাঠের তালিকা নেই, "
+                f"সেশন {_bn(sessions)}টি, শেষ টপিক: {lt or '—'}")
+        if weak:
+            lines.append(f"  দুর্বল টপিক: {', '.join(weak[-5:])}")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #725 ভুল-বিশ্লেষণ
+# =====================================================================
+
+def wrong_analysis_text(wrong=None):
+    """Wrong-book-কে বিষয় ও টপিক ধরে গুনে সাজানো বিশ্লেষণ;
+    সবচেয়ে বেশি পুনরাবৃত্ত দুর্বল জায়গা শীর্ষ-৫। সহজ বাংলা।"""
+    wrong = _resolve_wrong(wrong)
+    if not wrong:
+        return (f"{_NO_DATA} — ভুলের খাতা খালি। এখনো কোনো মক টেস্টে ভুল "
+                "জমা হয়নি। মক টেস্ট দিলে ভুলগুলো এখানে জমবে, তখন বিশ্লেষণ "
+                "দেখতে পাবে।")
+
+    by_subject = Counter()
+    by_pair = Counter()  # (subject, topic)
+    for w in wrong:
+        if not isinstance(w, dict):
+            continue
+        subj = str(w.get("subject") or "অজানা বিষয়")
+        topic = str(w.get("topic") or "সাধারণ")
+        by_subject[subj] += 1
+        by_pair[(subj, topic)] += 1
+
+    lines = ["📕 ভুল-বিশ্লেষণ",
+             f"ভুলের খাতায় মোট ভুল: {_bn(sum(by_subject.values()))}টি।"]
+    if by_subject:
+        lines.append("")
+        lines.append("বিষয় ধরে ভুল:")
+        for subj, cnt in by_subject.most_common():
+            lines.append(f"• {subj} — {_bn(cnt)}টি ভুল")
+    if by_pair:
+        lines.append("")
+        lines.append("সবচেয়ে বেশি ভুল হয়েছে যেখানে (শীর্ষ ৫):")
+        for (subj, topic), cnt in by_pair.most_common(5):
+            lines.append(f"• {subj} / {topic} — {_bn(cnt)}বার")
+        lines.append("")
+        lines.append("পরামর্শ: শীর্ষের টপিকটা শিক্ষক মোডে একবার ধাপে ধাপে "
+                     "শিখে নাও, তারপর আবার মক টেস্ট দাও — ভুল কমবেই।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #759 জ্ঞানের এক্স-রে (lite) — সৎ অনুমান, লেবেলসহ
+# =====================================================================
+
+def xray_text(progress=None, wrong=None, lessons=None, bank=None):
+    """Progress + wrong-book + OFFLINE_LESSONS মিলিয়ে বিষয়ভিত্তিক
+    শক্তির ছবি। হিউরিস্টিক (স্পষ্ট করে 'অনুমান' বলা হয়েছে):
+      activity = sessions + mock_tests
+      wrong_n  = ওই বিষয়ে wrong-book এন্ট্রির সংখ্যা
+      activity >= 3 এবং wrong_n <= 2          -> শক্তিশালী
+      activity >= 1 এবং wrong_n <= activity+2 -> মাঝারি
+      wrong_n > activity + 2                  -> দুর্বল
+      activity == 0                           -> এখনো শুরু হয়নি
+    """
+    progress = _resolve_progress(progress)
+    wrong = _resolve_wrong(wrong)
+    lessons = _resolve_lessons(lessons)
+    bank = _resolve_bank(bank)
+    if not progress and not wrong and not lessons and not bank:
+        return (f"{_NO_DATA} — পড়ার রেকর্ড, ভুলের খাতা, পাঠ — কিছুই "
+                "পাইনি। পড়া শুরু করলেই এক্স-রে তৈরি হবে।")
+
+    subjects = []
+    for src in (lessons, bank, progress):
+        for s in (src or {}).keys():
+            if s not in subjects:
+                subjects.append(s)
+    for subj, _cnt in _wrong_counts_by_subject(wrong).most_common():
+        if subj not in subjects:
+            subjects.append(subj)
+    if not subjects:
+        return f"{_NO_DATA} — কোনো বিষয়ের তথ্য পাইনি।"
+
+    wrong_by_subj = _wrong_counts_by_subject(wrong)
+    lines = ["🩻 জ্ঞানের এক্স-রে (lite)",
+             "সতর্কতা: এটা একটা অনুমান — সেশনের সংখ্যা আর ভুলের সংখ্যা "
+             "মিলিয়ে আন্দাজ করছি, আসল পরীক্ষা নয়।"]
+    for subj in subjects:
+        ent = progress.get(subj) or {}
+        activity = int(ent.get("sessions", 0) or 0) + \
+            int(ent.get("mock_tests", 0) or 0)
+        wrong_n = int(wrong_by_subj.get(subj, 0))
+        if activity == 0 and wrong_n == 0:
+            level = "এখনো শুরু হয়নি"
+        elif activity >= 3 and wrong_n <= 2:
+            level = "শক্তিশালী"
+        elif wrong_n > activity + 2:
+            level = "দুর্বল"
+        else:
+            level = "মাঝারি"
+        weak = [str(w) for w in (ent.get("weak", []) or [])]
+        line = (f"• {subj}: {level} "
+                f"(সেশন+টেস্ট {_bn(activity)}টি, ভুল {_bn(wrong_n)}টি")
+        if weak:
+            line += f", দুর্বল টপিক: {', '.join(weak[-3:])}"
+        line += ")"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #697 অধ্যায়-মাস্টারি যাচাই — ডেটা + গ্রেডিং (ইন্টার‌্যাক্টিভ ফ্লো
+#  ইন্টিগ্রেটরের কাজ; এখানে শুধু প্রশ্ন বাছাই আর রায়)
+# =====================================================================
+
+def mastery_questions(subject, topic=None, bank=None, lessons=None):
+    """Mastery check-এর জন্য সর্বোচ্চ ৫টি প্রশ্ন ফেরত দেয় (list of dict)।
+    বাছাইয়ের ক্রম (preference):
+      1. OFFLINE_BANK-এ ওই বিষয়ের, topic দিলে ওই topic-এর প্রশ্ন
+      2. OFFLINE_LESSONS-এ মিলে যাওয়া topic-এর check_q (lesson check)
+      3. জায়গা বাকি থাকলে ওই বিষয়ের বাকি bank প্রশ্ন (অন্য topic)
+    প্রতিটা আইটেম:
+      {"q": str, "options": [str] (bank হলে ৪টা, lesson হলে []),
+       "answer": int (bank: সঠিক index) বা str (lesson: প্রথম check_answer),
+       "topic": str, "subject": str, "source": "bank"|"lesson_check"}
+    বিষয়/ডেটা না থাকলে [] ফেরত দেয় — কিছু বানানো হয় না।"""
+    bank = _resolve_bank(bank)
+    lessons = _resolve_lessons(lessons)
+    subject = str(subject or "").strip()
+    if not subject:
+        return []
+    topic = str(topic or "").strip()
+    out = []
+    seen_q = set()
+
+    def _add(qtext, options, answer, qtopic, source):
+        if len(out) >= 5 or not qtext or qtext in seen_q:
+            return
+        seen_q.add(qtext)
+        out.append({"q": qtext, "options": list(options or []),
+                    "answer": answer, "topic": qtopic or "সাধারণ",
+                    "subject": subject, "source": source})
+
+    bank_qs = [q for q in (bank.get(subject) or []) if isinstance(q, dict)]
+    # 1) topic মিলে যাওয়া bank প্রশ্ন আগে
+    if topic:
+        for q in bank_qs:
+            if str(q.get("topic") or "") == topic:
+                _add(str(q.get("q") or ""), q.get("options") or [],
+                     int(q.get("answer", 0) or 0),
+                     str(q.get("topic") or topic), "bank")
+    else:
+        for q in bank_qs:
+            _add(str(q.get("q") or ""), q.get("options") or [],
+                 int(q.get("answer", 0) or 0),
+                 str(q.get("topic") or "সাধারণ"), "bank")
+    # 2) lesson check_q (topic দিলে শুধু মিলে যাওয়া topic)
+    for step in (lessons.get(subject) or []):
+        if not isinstance(step, dict):
+            continue
+        st = str(step.get("topic") or "")
+        if topic and st != topic:
+            continue
+        answers = step.get("check_answers") or []
+        _add(str(step.get("check_q") or ""), [],
+             str(answers[0]) if answers else "", st, "lesson_check")
+    # 3) বাকি bank প্রশ্ন দিয়ে পূরণ (topic নির্দিষ্ট থাকলেও, প্রশ্ন কম হলে)
+    if topic:
+        for q in bank_qs:
+            _add(str(q.get("q") or ""), q.get("options") or [],
+                 int(q.get("answer", 0) or 0),
+                 str(q.get("topic") or "সাধারণ"), "bank")
+    return out[:5]
+
+
+def mastery_questions_text(subject, topic=None, bank=None, lessons=None):
+    """mastery_questions()-এর পাঠযোগ্য Bangla রূপ (চ্যাটে দেখানোর জন্য)।"""
+    qs = mastery_questions(subject, topic=topic, bank=bank, lessons=lessons)
+    if not qs:
+        return (f"{_NO_DATA} — এই বিষয়/টপিকের কোনো প্রশ্ন ব্যাংক বা পাঠে "
+                "পাইনি, তাই মাস্টারি টেস্ট সাজাতে পারলাম না।")
+    head = f"🎯 মাস্টারি টেস্ট — {subject}" + (f" / {topic}" if topic else "")
+    lines = [head, f"মোট প্রশ্ন: {_bn(len(qs))}টি। একটা একটা করে উত্তর দাও।"]
+    letters = ["ক", "খ", "গ", "ঘ"]
+    for i, q in enumerate(qs, 1):
+        lines.append("")
+        lines.append(f"প্রশ্ন {_bn(i)}: {q['q']}")
+        for j, op in enumerate(q.get("options") or []):
+            if j < len(letters):
+                lines.append(f"{letters[j]}) {op}")
+    return "\n".join(lines)
+
+
+def mastery_grade(answers_correct, total):
+    """Mastery রায়: শতকরা হিসাব, >= ৮০% হলে 'মাস্টার'।"""
+    try:
+        total = int(total)
+        correct = int(answers_correct)
+    except Exception:
+        total, correct = 0, 0
+    if total <= 0:
+        return f"{_NO_DATA} — কোনো প্রশ্নের উত্তরই দেওয়া হয়নি।"
+    correct = max(0, min(correct, total))
+    pct = round(correct * 100 / total)
+    head = (f"ফলাফল: {_bn(correct)}/{_bn(total)} ঠিক ({_bn(pct)}%)। ")
+    if pct >= 80:
+        return head + "🏆 মাস্টার! এই অধ্যায়টা তুমি ভালোভাবে আয়ত্ত করেছ।"
+    if pct >= 60:
+        return head + "ভালো — প্রায় হয়ে এসেছে। ভুলগুলো একবার ঝালিয়ে নিলেই মাস্টারি আসবে।"
+    if pct >= 40:
+        return head + "মাঝারি — অধ্যায়টা শিক্ষক মোডে আরেকবার ধাপে ধাপে পড়ে নাও।"
+    return head + "এখনো দুর্বল — চিন্তা নেই, শিক্ষক মোডে এই অধ্যায়টা বেসিক থেকে আবার শুরু করো।"
+
+
+# =====================================================================
+#  #721 ঘুমের আগের রিভিশন
+# =====================================================================
+
+def bedtime_revision_text(progress=None, wrong=None, today=None):
+    """২ মিনিটে পড়া যায় এমন রাতের রিভিশন:
+    আজ ছোঁয়া টপিক (progress last_date == আজ) + সাম্প্রতিক সর্বোচ্চ ৫টি
+    ভুল প্রশ্নের সঠিক উত্তর। today প্যারামিটার টেস্টের জন্য (date বা
+    'YYYY-MM-DD' str); না দিলে আজকের তারিখ।"""
+    progress = _resolve_progress(progress)
+    wrong = _resolve_wrong(wrong)
+    if today is None:
+        today_s = str(date.today())
+    elif isinstance(today, str):
+        today_s = today
+    else:
+        today_s = str(today)
+
+    todays = []
+    for subj, ent in (progress or {}).items():
+        if not isinstance(ent, dict):
+            continue
+        if str(ent.get("last_date") or "") == today_s and \
+                str(ent.get("last_topic") or "").strip():
+            todays.append((str(subj), str(ent.get("last_topic"))))
+    recent_wrong = [w for w in (wrong or []) if isinstance(w, dict)][-5:]
+
+    if not todays and not recent_wrong:
+        return (f"{_NO_DATA} — আজকের পড়ার রেকর্ড বা ভুলের খাতায় কিছু "
+                "পাইনি। কাল পড়া শেষে আবার চাইলে রিভিশন সাজিয়ে দেব। "
+                "এখন ঘুমিয়ে পড়ো, ঘুমটাও পড়ারই অংশ। 🌙")
+
+    lines = ["🌙 ঘুমের আগের রিভিশন (২ মিনিটে পড়ে ফেলো)"]
+    if todays:
+        lines.append("")
+        lines.append("আজ যা পড়েছ:")
+        for subj, topic in todays:
+            lines.append(f"• {subj} — {topic}")
+    if recent_wrong:
+        lines.append("")
+        lines.append("সাম্প্রতিক ভুলগুলোর সঠিক উত্তর (মনে গেঁথে নাও):")
+        for w in reversed(recent_wrong):
+            lines.append(f"• প্রশ্ন: {w.get('q', '')}")
+            lines.append(f"  সঠিক উত্তর: {w.get('correct', '')}")
+    lines.append("")
+    lines.append("এইটুকুই। এবার ফোন রেখে ঘুম — কাল আবার একসাথে পড়ব।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #748 অধ্যায়ের এক-লাইন সার
+# =====================================================================
+
+def lesson_summaries_text(subject=None, lessons=None):
+    """OFFLINE_LESSONS-এর প্রতি টপিকের এক-লাইন সার:
+    text-এর প্রথম বাক্য ('।' দিয়ে ভাগ), সর্বোচ্চ ১২০ অক্ষর।
+    subject দিলে শুধু ওই বিষয়; না দিলে সব বিষয়।"""
+    lessons = _resolve_lessons(lessons)
+    if not lessons:
+        return f"{_NO_DATA} — অফলাইন পাঠের তালিকাই খালি, সার বানানোর কিছু নেই।"
+    if subject:
+        subject = str(subject).strip()
+        if subject not in lessons or not lessons.get(subject):
+            return (f"{_NO_DATA} — '{subject}' বিষয়ের কোনো পাঠ পাইনি। "
+                    "যেসব বিষয়ে পাঠ আছে: " + ", ".join(lessons.keys()) + "।")
+        subjects = [subject]
+    else:
+        subjects = list(lessons.keys())
+
+    lines = ["📑 অধ্যায়ের এক-লাইন সার"]
+    any_row = False
+    for subj in subjects:
+        rows = []
+        for step in lessons.get(subj) or []:
+            if not isinstance(step, dict):
+                continue
+            text = str(step.get("text") or "").strip()
+            if not text:
+                continue
+            first = text.split("।")[0].strip()
+            if len(first) > 120:
+                first = first[:120].rstrip() + "…"
+            rows.append(f"• {step.get('topic', 'সাধারণ')}: {first}।")
+        if rows:
+            any_row = True
+            lines.append("")
+            lines.append(f"{subj}:")
+            lines.extend(rows)
+    if not any_row:
+        return f"{_NO_DATA} — পাঠের তালিকা থাকলেও ভিতরে লেখা পাইনি।"
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  #664 ধারণা-মানচিত্র (text)
+# =====================================================================
+
+def concept_map_text(subject, progress=None, lessons=None):
+    """এক বিষয়ের lesson টপিকগুলোর শৃঙ্খল (তীর দিয়ে), দুর্বল টপিকগুলো
+    progress-এর weak[] থেকে ⚠ চিহ্ন দিয়ে আলাদা করে দেখানো।"""
+    lessons = _resolve_lessons(lessons)
+    progress = _resolve_progress(progress)
+    subject = str(subject or "").strip()
+    if not subject:
+        return ("কোন বিষয়ের ধারণা-মানচিত্র চাও? বিষয়ের নাম বলো — যেমন: "
+                "'গণিত ধারণা মানচিত্র'।")
+    steps = [s for s in (lessons.get(subject) or []) if isinstance(s, dict)]
+    if not steps:
+        return (f"{_NO_DATA} — '{subject}' বিষয়ের অফলাইন পাঠের তালিকা "
+                "পাইনি, তাই মানচিত্র আঁকা যাচ্ছে না।")
+
+    ent = progress.get(subject) or {}
+    weak = [str(w) for w in (ent.get("weak", []) or [])]
+    weak_set = set(weak)
+    topics = [str(s.get("topic") or "সাধারণ") for s in steps]
+    chain_parts = []
+    for t in topics:
+        chain_parts.append(t + " ⚠" if t in weak_set else t)
+    lines = [f"🗺️ ধারণা-মানচিত্র — {subject}",
+             "পাঠের ক্রম:",
+             " → ".join(chain_parts)]
+    marked = [t for t in topics if t in weak_set]
+    if marked:
+        lines.append("")
+        lines.append("⚠ দুর্বল টপিক (রেকর্ডে আছে): " + ", ".join(marked)
+                     + " — এগুলো আগে ঝালিয়ে নাও।")
+    elif weak:
+        lines.append("")
+        lines.append("দুর্বল হিসেবে রেকর্ডে আছে: " + ", ".join(weak[-5:])
+                     + " (এই পাঠ-তালিকার টপিকের সঙ্গে সরাসরি মেলেনি)।")
+    else:
+        lines.append("")
+        lines.append("এই বিষয়ে এখনো কোনো দুর্বল টপিক রেকর্ডে নেই।")
+    lines.append(f"মোট ধাপ: {_bn(len(topics))}টি পাঠ।")
+    return "\n".join(lines)
+
+
+# =====================================================================
+#  ঐচ্ছিক ডিসপ্যাচ হেল্পার (ইন্টিগ্রেটর চাইলে ব্যবহার করবে;
+#  বিস্তারিত INTEGRATION-STUDY.md-তে)
+# =====================================================================
+
+STUDY_PACK_TRIGGERS = (
+    "প্রশ্ন বিশ্লেষণ", "প্রশ্ন খনন", "কভারেজ", "ভুল বিশ্লেষণ",
+    "এক্স-রে", "আমার অবস্থা", "মাস্টারি টেস্ট",
+    "ঘুমের আগের রিভিশন", "অধ্যায়ের সার", "ধারণা মানচিত্র",
+    "ধারণা-মানচিত্র",
+)
+
+
+def _subject_in_text(text, bank, lessons):
+    for subj in list((bank or {}).keys()) + \
+            [s for s in (lessons or {}).keys() if s not in (bank or {})]:
+        if subj and subj in str(text or ""):
+            return subj
+    fn = globals().get("_detect_subject")
+    if callable(fn):
+        try:
+            return fn(str(text or ""))
+        except Exception:
+            return None
+    return None
+
+
+def study_pack_handle(text, low=None):
+    """Trigger মিললে সংশ্লিষ্ট রিপোর্টের টেক্সট, না মিললে None ফেরত দেয়।
+    Mastery-র ইন্টার‌্যাক্টিভ ফ্লো ইন্টিগ্রেটরের — এখানে শুধু প্রশ্নের
+    তালিকা দেখানো হয় (mastery_questions_text)।"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    bank = _resolve_bank()
+    lessons = _resolve_lessons()
+    if "প্রশ্ন বিশ্লেষণ" in text or "প্রশ্ন খনন" in text:
+        return question_mining_text(bank=bank)
+    if "ভুল বিশ্লেষণ" in text:
+        return wrong_analysis_text()
+    if "কভারেজ" in text:
+        return coverage_text(lessons=lessons)
+    if "এক্স-রে" in text or "আমার অবস্থা" in text:
+        return xray_text(lessons=lessons, bank=bank)
+    if "ঘুমের আগের রিভিশন" in text:
+        return bedtime_revision_text()
+    if "অধ্যায়ের সার" in text:
+        return lesson_summaries_text(
+            subject=_subject_in_text(text, bank, lessons), lessons=lessons)
+    if "ধারণা মানচিত্র" in text or "ধারণা-মানচিত্র" in text:
+        subj = _subject_in_text(text, bank, lessons)
+        if not subj:
+            return ("কোন বিষয়ের ধারণা-মানচিত্র চাও? বিষয়ের নামসহ বলো — "
+                    "যেমন: 'গণিত ধারণা মানচিত্র'।")
+        return concept_map_text(subj, lessons=lessons)
+    if "মাস্টারি টেস্ট" in text:
+        subj = _subject_in_text(text, bank, lessons)
+        if not subj:
+            return ("কোন বিষয়ের মাস্টারি টেস্ট দেবে? বিষয়ের নামসহ বলো — "
+                    "যেমন: 'গণিত মাস্টারি টেস্ট'।")
+        return mastery_questions_text(subj, bank=bank, lessons=lessons)
+    return None
+
+
 # ------------------------------------------------------------- TTS voice
 # Best free Bangla female voice: Microsoft Edge TTS, bn-BD-NabanitaNeural
 # (natural female). Needs the free `edge-tts` tool on Bhaiya's laptop —
@@ -4106,6 +4753,538 @@ def tasks_api(data):
     return {"tasks": away_load()}
 
 
+# -*- coding: utf-8 -*-
+# =============================================================================
+#  Desktop Sokhi v1.5.0 — WAVE-3 daily-life pack (SELF-CONTAINED snippets)
+#  Features: #212 বাজার-তালিকা · #334 আজকের অজানা সত্য + #324 প্রবাদ ·
+#            #143 শুভেচ্ছা-সঙ্গী · #740 প্রেরণা-ব্যাংক + #573 ছোট জয়ের হিসাব ·
+#            #450 দিনের শেষ লাইন + #572 লক্ষ্যের দৃশ্য
+# -----------------------------------------------------------------------------
+#  HOW TO INTEGRATE: paste this whole block into sokhi.py (see
+#  INTEGRATION-DAILY.md for the exact anchor). It uses ONLY names that
+#  already exist in sokhi.py:  DATA, load_json, save_json, now_str,
+#  re, time, date, datetime.  No new imports, no network, 100% offline.
+#  File paths are resolved lazily (DATA / ...) inside helpers, so this
+#  block can sit anywhere after the utilities section.
+#  Data files (created on first use, inside DATA = data/ folder):
+#      bazaar.json = [{id, item, qty, est_price, bought, ts}]
+#      wins.json   = [{id, text, date, ts}]
+# =============================================================================
+
+
+def _dl_bn(s):
+    """ASCII digits -> Bangla digits (local copy; pack stays self-contained)."""
+    return str(s).translate(str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯"))
+
+
+def _dl_money(v):
+    """Format a price: 300.0 -> '৩০০', 12.5 -> '১২.৫'."""
+    try:
+        f = float(v)
+    except Exception:
+        return "০"
+    s = str(int(f)) if f == int(f) else str(f)
+    return _dl_bn(s)
+
+
+def _dl_next_id(items):
+    mx = 0
+    for it in items:
+        try:
+            mx = max(mx, int(it.get("id", 0)))
+        except Exception:
+            pass
+    return mx + 1
+
+
+# ------------------------------------------------------------ #212: বাজার
+def _bazaar_load():
+    items = load_json(DATA / "bazaar.json", [])
+    if not isinstance(items, list):
+        return []
+    return [it for it in items if isinstance(it, dict)]
+
+
+def _bazaar_save(items):
+    save_json(DATA / "bazaar.json", items[-200:])
+
+
+def _bazaar_totals(items):
+    total = sum(float(it.get("est_price") or 0) for it in items)
+    bought = sum(float(it.get("est_price") or 0) for it in items if it.get("bought"))
+    return total, bought, total - bought
+
+
+def bazaar_api(data):
+    """POST /api/bazaar handler — house pattern (cf. tasks_api/memory_api).
+
+    Actions:
+      (none)/list -> {ok, items, total, bought_total, pending_total}
+      add    {item, qty, est_price}   est_price = ওই আইটেমের আনুমানিক মোট দাম
+      toggle {id}                     bought ফ্লিপ করে
+      delete {id}
+      clear_bought                    কেনা হয়ে যাওয়া আইটেম মুছে দেয়
+    """
+    data = data or {}
+    action = str(data.get("action") or "list").strip()
+    items = _bazaar_load()
+    if action == "add":
+        item = str(data.get("item") or "").strip()
+        if not item:
+            return {"ok": False, "error": "কী কিনতে হবে, সেটা লিখে দাও।"}
+        try:
+            price = float(data.get("est_price") or 0)
+        except Exception:
+            price = 0.0
+        items.append({
+            "id": _dl_next_id(items),
+            "item": item[:120],
+            "qty": str(data.get("qty") or "").strip()[:40],
+            "est_price": max(0.0, price),
+            "bought": False,
+            "ts": now_str(),
+        })
+        _bazaar_save(items)
+    elif action == "toggle":
+        try:
+            want = int(data.get("id"))
+        except Exception:
+            return {"ok": False, "error": "আইটেমের নম্বরটা ঠিক করে পাঠাও।"}
+        hit = False
+        for it in items:
+            if it.get("id") == want:
+                it["bought"] = not bool(it.get("bought"))
+                hit = True
+        if not hit:
+            return {"ok": False, "error": "এই নম্বরের কোনো আইটেম পাইনি।"}
+        _bazaar_save(items)
+    elif action == "delete":
+        try:
+            want = int(data.get("id"))
+        except Exception:
+            return {"ok": False, "error": "আইটেমের নম্বরটা ঠিক করে পাঠাও।"}
+        new = [it for it in items if it.get("id") != want]
+        if len(new) == len(items):
+            return {"ok": False, "error": "এই নম্বরের কোনো আইটেম পাইনি।"}
+        items = new
+        _bazaar_save(items)
+    elif action == "clear_bought":
+        items = [it for it in items if not it.get("bought")]
+        _bazaar_save(items)
+    elif action != "list":
+        return {"ok": False, "error": "কী করতে হবে বুঝতে পারিনি — action ঠিক করে পাঠাও।"}
+    total, bought_total, pending_total = _bazaar_totals(items)
+    return {"ok": True, "items": items, "total": total,
+            "bought_total": bought_total, "pending_total": pending_total}
+
+
+def bazaar_text():
+    """Chat summary for the 'বাজার' command (#212)."""
+    items = _bazaar_load()
+    if not items:
+        return ("🛒 তোমার বাজারের তালিকা এখন খালি। যোগ করতে বলো: "
+                "'বাজারে যোগ করো চাল' — অথবা টাস্ক ট্যাবের বাজার অংশে "
+                "নিজে লিখে যোগ করতে পারো।")
+    total, bought_total, pending_total = _bazaar_totals(items)
+    lines = ["🛒 তোমার বাজারের তালিকা:"]
+    for it in items:
+        mark = "✅" if it.get("bought") else "⬜"
+        qty = f" ({it['qty']})" if it.get("qty") else ""
+        price = f" — আনুমানিক {_dl_money(it.get('est_price') or 0)} টাকা" \
+            if float(it.get("est_price") or 0) > 0 else ""
+        lines.append(f"{mark} {it.get('item', '')}{qty}{price}")
+    lines.append(f"আনুমানিক মোট খরচ: {_dl_money(total)} টাকা "
+                 f"(কেনা হয়েছে {_dl_money(bought_total)} টাকার, "
+                 f"বাকি {_dl_money(pending_total)} টাকা)")
+    return "\n".join(lines)
+
+
+def bazaar_parse_add(text):
+    """'বাজারে যোগ করো X' পার্স করে bazaar_api(add) চালায়।
+    ঐচ্ছিক রূপ: 'বাজারে যোগ করো চাল, পরিমাণ ৫ কেজি, দাম ৩০০'
+    (দাম = ওই আইটেমের আনুমানিক মোট দাম)। কোনোটা না মিললে পুরোটাই item।"""
+    m = re.search(r"বাজারে যোগ করো[:\- ]+(.+)", text or "")
+    if not m:
+        return None
+    rest = m.group(1).strip().rstrip("।")
+    if not rest:
+        return "কী যোগ করব বাজারে? যেমন বলো: 'বাজারে যোগ করো চাল'।"
+    qty, price = "", 0.0
+    mq = re.search(r"পরিমাণ[:\- ]*([^,।]+)", rest)
+    if mq:
+        qty = mq.group(1).strip()
+    mp = re.search(r"দাম[:\- ]*([০-৯0-9.]+)", rest)
+    if mp:
+        try:
+            price = float(mp.group(1).translate(
+                str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")))
+        except Exception:
+            price = 0.0
+    item = re.split(r"[,،]", rest)[0].strip()
+    item = re.sub(r"পরিমাণ[:\- ]*.+$", "", item).strip() or rest
+    r = bazaar_api({"action": "add", "item": item, "qty": qty,
+                    "est_price": price})
+    if not r.get("ok"):
+        return r.get("error", "যোগ করা গেল না।")
+    extra = f" ({qty})" if qty else ""
+    extra += f" — আনুমানিক {_dl_money(price)} টাকা" if price > 0 else ""
+    return (f"🛒 বাজারের তালিকায় যোগ করলাম: {item}{extra}। "
+            "পুরো তালিকা দেখতে বলো: 'বাজার'।")
+
+
+# ------------------------------------------- #334 আজকের সত্য + #324 প্রবাদ
+# Static, curated, well-known content only — no invented statistics.
+# (আলোর গতি জাতীয় সংখ্যায় 'প্রায়' বলা হয়েছে।)
+DAILY_FACTS = [
+    "বাংলাদেশের জাতীয় ফল কাঁঠাল।",
+    "বাংলাদেশের জাতীয় মাছ ইলিশ।",
+    "বাংলাদেশের জাতীয় পাখি দোয়েল।",
+    "বাংলাদেশের জাতীয় ফুল শাপলা।",
+    "বাংলাদেশের জাতীয় গাছ আম গাছ।",
+    "বাংলাদেশের জাতীয় কবি কাজী নজরুল ইসলাম।",
+    "বাংলাদেশের জাতীয় সংগীতের রচয়িতা বিশ্বকবি রবীন্দ্রনাথ ঠাকুর।",
+    "১৯৫২ সালের ২১ ফেব্রুয়ারি ভাষা শহীদ দিবস — দিনটি এখন আন্তর্জাতিক মাতৃভাষা দিবস হিসেবে বিশ্বজুড়ে পালিত হয়।",
+    "১৯৭১ সালের ১৬ ডিসেম্বর বাংলাদেশের বিজয় দিবস।",
+    "২৬ মার্চ বাংলাদেশের স্বাধীনতা দিবস।",
+    "ঢাকা বাংলাদেশের রাজধানী ও সবচেয়ে বড় শহর।",
+    "বাংলা বাংলাদেশের রাষ্ট্রভাষা।",
+    "বঙ্গবন্ধু শেখ মুজিবুর রহমান বাংলাদেশের জাতির পিতা।",
+    "জাতীয় সংসদ ভবন ঢাকার শেরেবাংলা নগরে অবস্থিত।",
+    "পদ্মা, মেঘনা ও যমুনা বাংলাদেশের প্রধান নদীগুলোর অন্যতম।",
+    "ধান বাংলাদেশের প্রধান খাদ্যশস্য।",
+    "বাংলাদেশে বছরে ছয়টি ঋতু — গ্রীষ্ম, বর্ষা, শরৎ, হেমন্ত, শীত ও বসন্ত।",
+    "সুন্দরবন বিশ্বের বৃহত্তম ম্যানগ্রোভ বনগুলোর একটি এবং রয়েল বেঙ্গল টাইগারের আবাসস্থল।",
+    "চাঁদ পৃথিবীর একমাত্র প্রাকৃতিক উপগ্রহ।",
+    "সৌরজগতে মোট আটটি গ্রহ আছে।",
+    "সূর্যের সবচেয়ে কাছের গ্রহ বুধ।",
+    "পৃথিবীর সবচেয়ে বড় মহাসাগর প্রশান্ত মহাসাগর।",
+    "মাউন্ট এভারেস্ট পৃথিবীর সর্বোচ্চ পর্বতশৃঙ্গ।",
+    "নীল তিমি পৃথিবীর সবচেয়ে বড় প্রাণী।",
+    "পানির রাসায়নিক সংকেত H2O।",
+    "অক্সিজেনের রাসায়নিক প্রতীক O এবং সোনার প্রতীক Au।",
+    "প্রাপ্তবয়স্ক মানুষের শরীরে ২০৬টি হাড় থাকে।",
+    "মানুষের হৃদপিণ্ডে চারটি প্রকোষ্ঠ থাকে।",
+    "আলো শূন্যস্থানে প্রতি সেকেন্ডে প্রায় ৩ লক্ষ কিলোমিটার বেগে চলে।",
+    "মৌমাছি নাচের মাধ্যমে অন্য মৌমাছিদের ফুলের দিক্‌নির্দেশনা দেয় — একে 'ওয়াগল নাচ' বলে।",
+]
+
+DAILY_PROVERBS = [
+    ("অতি চালাকের গলায় দড়ি", "অতিরিক্ত চালাকি শেষে নিজেরই বিপদ ডেকে আনে।"),
+    ("অধিক সন্ন্যাসীতে গাজন নষ্ট", "কর্তা বেশি হলে কাজের বারোটা বাজে।"),
+    ("অল্প বিদ্যা ভয়ংকরী", "অল্প জ্ঞান নিয়ে অহংকার করা বিপজ্জনক।"),
+    ("আপন ভালো তো জগৎ ভালো", "নিজে ভালো হলে চারপাশকেও ভালো মনে হয়।"),
+    ("ইচ্ছা থাকলে উপায় হয়", "মন থেকে চাইলে পথ একটা বের হবেই।"),
+    ("উঠতি মূলো পত্তনেই চেনা যায়", "শুরুর লক্ষণ দেখেই ভবিষ্যৎ বোঝা যায়।"),
+    ("এক মাঘে শীত যায় না", "একবারের ঘটনাতেই সব শেষ হয়ে যায় না।"),
+    ("এক ঢিলে দুই পাখি", "এক কাজে দুটি ফল পাওয়া।"),
+    ("কষ্ট বিনা কেষ্ট মেলে না", "কষ্ট ছাড়া সাফল্য বা প্রিয় জিনিস মেলে না।"),
+    ("কানা ছেলের নাম পদ্মলোচন", "অযোগ্য জিনিসকে বাড়তি নাম-সম্মান দেওয়া।"),
+    ("কুমিরের কান্না", "লোক দেখানো, ভান করা দুঃখ।"),
+    ("খাল কেটে কুমির আনা", "নিজের বিপদ নিজেই ডেকে আনা।"),
+    ("গাছে কাঁঠাল, গোঁফে তেল", "ফল পাওয়ার আগেই ভোগের আয়োজন করা।"),
+    ("ঘোড়া ডিঙিয়ে ঘাস খাওয়া", "নিয়ম বা ঊর্ধ্বতনকে পাশ কাটিয়ে কাজ করা।"),
+    ("চোরের মন পুলিশ পুলিশ", "অপরাধীর মনে সবসময় ধরা পড়ার ভয় থাকে।"),
+    ("জলে কুমির ডাঙায় বাঘ", "যেদিকেই যাও, বিপদ — উভয় সংকট।"),
+    ("তিলকে তাল করা", "ছোট ঘটনাকে ফুলিয়ে-ফাঁপিয়ে বড় করা।"),
+    ("দশে মিলি করি কাজ, হারি জিতি নাহি লাজ", "সবাই মিলে কাজ করলে হার-জিতে লজ্জা নেই।"),
+    ("ধরি মাছ না ছুঁই পানি", "কষ্ট বা ঝুঁকি ছাড়াই লাভ চাওয়া।"),
+    ("নাচতে না জানলে উঠোন বাঁকা", "নিজের অযোগ্যতা ঢাকতে অন্যের দোষ দেওয়া।"),
+    ("পিপীলিকার পাখা ওঠে মরিবার তরে", "অহংকার বেড়ে যাওয়া পতনের লক্ষণ।"),
+    ("বামন হয়ে চাঁদে হাত", "সাধ্যের বাইরে বড় আকাঙ্ক্ষা করা।"),
+    ("ভাবিয়া করিও কাজ, করিয়া ভাবিও না", "কাজ শুরুর আগে ভাবো; শুরু করে আফসোস কোরো না।"),
+    ("মরা হাতি লাখ টাকা", "বড় জিনিস ক্ষয়ে গেলেও তার মূল্য থেকে যায়।"),
+    ("রতনে রতন চেনে", "যোগ্য লোকই অন্যের যোগ্যতা বুঝতে পারে।"),
+    ("লোভে পাপ, পাপে মৃত্যু", "লোভ মানুষকে অন্যায়ে ঠেলে ধ্বংস ডাকে।"),
+    ("সবুরে মেওয়া ফলে", "ধৈর্য ধরে অপেক্ষা করলে ভালো ফল আসে।"),
+    ("হাতি ঘোড়া গেল তল, মশা বলে কত জল", "ক্ষমতাহীনের বড় বড় কথা বলা।"),
+    ("অতি লোভে তাঁতি নষ্ট", "অতিরিক্ত লোভে যা ছিল, তাও হারাতে হয়।"),
+    ("কাঁটা দিয়ে কাঁটা তোলা", "সমস্যা বা প্রতিপক্ষ দিয়েই সমস্যার সমাধান করা।"),
+]
+
+
+def daily_card(for_date=None):
+    """GET /api/dailycard-এর backend (#334 + #324)।
+    Deterministic by date ordinal: একই দিনে সারাদিন একই কার্ড, পরদিন নতুন।
+    for_date: datetime.date (না দিলে আজ)। Returns JSON-able dict."""
+    d = for_date or date.today()
+    try:
+        ordinal = d.toordinal()
+    except Exception:
+        ordinal = 0
+    fact = DAILY_FACTS[ordinal % len(DAILY_FACTS)]
+    proverb, meaning = DAILY_PROVERBS[(ordinal * 11 + 5) % len(DAILY_PROVERBS)]
+    return {"ok": True, "date": str(d), "fact": fact,
+            "proverb": proverb, "meaning": meaning}
+
+
+def daily_card_text(for_date=None):
+    """Chat form of daily_card — 'আজকের তথ্য' কমান্ডের উত্তর।"""
+    c = daily_card(for_date)
+    return ("🌞 আজকের তথ্য\n"
+            f"💡 অজানা সত্য: {c['fact']}\n"
+            f"📜 প্রবাদ: {c['proverb']}\n"
+            f"মানে: {c['meaning']}")
+
+
+# ------------------------------------------------------- #143: শুভেচ্ছা-সঙ্গী
+GREETING_OCCASIONS = ("জন্মদিন", "ঈদ", "বিয়ে", "নতুন চাকরি", "পরীক্ষা", "সাধারণ")
+
+_GREETING_TEMPLATES = {
+    "জন্মদিন": [
+        "শুভ জন্মদিন, {name}! 🎂 তোমার নতুন বছরটা সুস্থতা, সাফল্য আর হাসিতে ভরে উঠুক। অনেক অনেক শুভকামনা রইল।",
+        "{name}, জন্মদিনের অনেক অনেক শুভেচ্ছা! তোমার সব স্বপ্ন একে একে পূরণ হোক — এটাই কামনা করি।",
+        "আজ তোমার বিশেষ দিন, {name}! শুভ জন্মদিন — আগামী দিনগুলো হোক আরও উজ্জ্বল ও আনন্দময়।",
+    ],
+    "ঈদ": [
+        "ঈদ মোবারক, {name}! 🌙 তোমার ও তোমার পরিবারের জন্য রইল সুখ, শান্তি আর সমৃদ্ধির শুভকামনা।",
+        "{name}, ঈদের শুভেচ্ছা নাও! এই ঈদ তোমার জীবনে নিয়ে আসুক আনন্দ আর কাছের মানুষদের ভালোবাসা।",
+        "চাঁদ রাতের শুভেচ্ছা, {name}! ঈদ মোবারক — দিনটা কাটুক প্রিয়জনদের সঙ্গে হাসি-আনন্দে।",
+    ],
+    "বিয়ে": [
+        "অভিনন্দন, {name}! 💐 তোমাদের নতুন জীবন হোক ভালোবাসা, বোঝাপড়া আর সুখে ভরপুর। শুভ বিবাহ!",
+        "{name}, বিয়ের অনেক অনেক শুভেচ্ছা! দুজনের যৌথ যাত্রা হোক আজীবন সুন্দর ও শান্তিময়।",
+        "শুভ বিবাহ, {name}! তোমাদের সংসার জীবনে বরকত ও আনন্দ চিরস্থায়ী হোক — এই দোয়া রইল।",
+    ],
+    "নতুন চাকরি": [
+        "অভিনন্দন, {name}! 🎉 নতুন চাকরিতে যোগদানের জন্য অনেক শুভকামনা — তোমার পরিশ্রমের ফল এটা। নতুন যাত্রা শুভ হোক!",
+        "{name}, নতুন চাকরির খবরে খুব খুশি হলাম! কর্মজীবনে তুমি আরও অনেক দূর এগিয়ে যাও — এই কামনা রইল।",
+        "শুভকামনা, {name}! নতুন কর্মস্থলে প্রথম দিন থেকে সবকিছু ভালো যাক — তুমি পারবে, এই বিশ্বাস আছে।",
+    ],
+    "পরীক্ষা": [
+        "পরীক্ষার জন্য অনেক শুভকামনা, {name}! 📚 শান্ত মাথায় দাও — প্রস্তুতি অনুযায়ী ফল ভালোই হবে, ইনশাআল্লাহ।",
+        "{name}, পরীক্ষার আগের দুশ্চিন্তা স্বাভাবিক — তুমি তোমার সেরাটা দাও, ফল নিয়ে ভেবো না। শুভকামনা রইল!",
+        "Best of luck, {name}! মনোযোগ দিয়ে লেখো, সময়ের হিসাব রেখো — তোমার সাফল্য কামনা করি।",
+    ],
+    "সাধারণ": [
+        "অনেক অনেক শুভেচ্ছা, {name}! তোমার দিনটা ভালো কাটুক, মনটা থাকুক হালকা আর খুশি। 🌼",
+        "{name}, তোমার জন্য রইল আন্তরিক শুভকামনা — যা করছ, তাতে সাফল্য পাও, সুস্থ থাকো।",
+        "শুভেচ্ছা রইল, {name}! ছোট এই বার্তাটা তোমার মুখে একটু হাসি ফোটালেই আমার সার্থক।",
+    ],
+}
+
+
+def greeting_text(name, occasion="সাধারণ", for_date=None):
+    """#143: warm Bangla greeting draft. 2-3 variants per occasion,
+    rotated deterministically by day-of-year (same day = same draft).
+    এটা খসড়া (template) — পাঠানোর আগে নিজের মতো বদলে নেওয়া যায়।"""
+    name = str(name or "").strip()[:60] or "বন্ধু"
+    occasion = str(occasion or "সাধারণ").strip()
+    if occasion not in _GREETING_TEMPLATES:
+        occasion = "সাধারণ"
+    variants = _GREETING_TEMPLATES[occasion]
+    d = for_date or date.today()
+    try:
+        idx = d.timetuple().tm_yday % len(variants)
+    except Exception:
+        idx = 0
+    return variants[idx].format(name=name)
+
+
+def greeting_parse(text):
+    """'শুভেচ্ছা <নাম> <উপলক্ষ>' পার্স করে। উপলক্ষ চেনা না গেলে পুরো
+    বাকি অংশটাই নাম ধরা হয় এবং উপলক্ষ হয় 'সাধারণ'।
+    Returns (name, occasion) or None."""
+    m = re.search(r"শুভেচ্ছা(?:\s+জানাও|\s+দাও)?[:\- ]+(.+)", text or "")
+    if not m:
+        return None
+    rest = m.group(1).strip().rstrip("।").strip()
+    if not rest:
+        return None
+    # উপলক্ষ সাধারণত শেষে থাকে: 'শুভেচ্ছা রহিম জন্মদিন'
+    for occ in GREETING_OCCASIONS:
+        if occ != "সাধারণ" and rest.endswith(occ):
+            name = rest[: -len(occ)].strip(" ,-")
+            if name:
+                return name, occ
+    # অথবা শুরুতে: 'শুভেচ্ছা জন্মদিনের রহিম' জাতীয় রূপ না মিললে সাধারণ
+    return rest, "সাধারণ"
+
+
+# ------------------------------------------- #740 প্রেরণা-ব্যাংক + #573 জয়
+def _wins_load():
+    items = load_json(DATA / "wins.json", [])
+    if not isinstance(items, list):
+        return []
+    return [it for it in items if isinstance(it, dict)]
+
+
+def wins_api(data):
+    """POST /api/wins handler (#740)। Actions: list / add {text} /
+    delete {id} (বোনাস — spec-এর বাইরে হলেও UI-পরিষ্কারের জন্য দরকারি)।"""
+    data = data or {}
+    action = str(data.get("action") or "list").strip()
+    items = _wins_load()
+    if action == "add":
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "জয়ের কথাটা লিখে দাও।"}
+        items.append({"id": _dl_next_id(items), "text": text[:300],
+                      "date": str(date.today()), "ts": now_str()})
+        save_json(DATA / "wins.json", items[-500:])
+    elif action == "delete":
+        try:
+            want = int(data.get("id"))
+        except Exception:
+            return {"ok": False, "error": "জয়ের নম্বরটা ঠিক করে পাঠাও।"}
+        items = [it for it in items if it.get("id") != want]
+        save_json(DATA / "wins.json", items)
+    elif action != "list":
+        return {"ok": False, "error": "কী করতে হবে বুঝতে পারিনি — action ঠিক করে পাঠাও।"}
+    return {"ok": True, "items": items, "count": len(items)}
+
+
+def _dl_progress_line(progress):
+    """progress: None | str | int/float | dict — যেভাবেই আসুক, এক লাইন।
+    dict-এ সম্ভাব্য key: sessions/সেশন, minutes/মিনিট, percent/শতাংশ, text।"""
+    if progress is None or progress == "":
+        return ""
+    if isinstance(progress, str):
+        return progress.strip()
+    if isinstance(progress, (int, float)):
+        return f"এ পর্যন্ত {_dl_bn(progress)} বার পড়ার সেশন হয়েছে।"
+    if isinstance(progress, dict):
+        txt = str(progress.get("text") or "").strip()
+        if txt:
+            return txt
+        parts = []
+        for key, label in (("sessions", "পড়ার সেশন"), ("minutes", "মিনিট পড়া"),
+                           ("percent", "সিলেবাস শেষ (%)"), ("mcq", "MCQ অনুশীলন")):
+            if progress.get(key) not in (None, ""):
+                parts.append(f"{label}: {_dl_bn(progress[key])}")
+        return " · ".join(parts)
+    return str(progress).strip()
+
+
+def wins_text(progress=None):
+    """#573 ছোট জয়ের হিসাব: জমা জয় + (দিলে) পড়ার অগ্রগতি মিলিয়ে
+    উৎসাহমূলক হিসাব। progress integrator চাইলে study_progress_text()
+    বা তার dict রূপ পাঠাবে — না দিলে শুধু জয়ের তালিকাই আসে (সৎভাবে,
+    কোনো সংখ্যা বানানো হয় না)।"""
+    items = _wins_load()
+    lines = ["🏆 ছোট জয়ের হিসাব"]
+    if not items:
+        lines.append("এখনো কোনো জয় জমা হয়নি। ছোট্ট একটা ভালো কাজ হলেই "
+                     "বলো: 'জয় যোগ করো আজ ২ ঘণ্টা পড়েছি' — আমি জমিয়ে রাখব।")
+    else:
+        lines.append(f"মোট জমা জয়: {_dl_bn(len(items))}টা। সাম্প্রতিকগুলো:")
+        for it in items[-10:]:
+            lines.append(f"• [{it.get('date', '')}] {it.get('text', '')}")
+        lines.append("এই ছোট ছোট জয়গুলোই একদিন বড় সাফল্য হবে — চালিয়ে যাও! 💪")
+    pline = _dl_progress_line(progress)
+    if pline:
+        lines.append("📚 পড়ার অগ্রগতি: " + pline)
+    return "\n".join(lines)
+
+
+# ------------------------------------- #450 দিনের শেষ লাইন + #572 লক্ষ্যের দৃশ্য
+def day_end_text(interactions=None, wins_today=None, studied=None,
+                 for_date=None):
+    """#450: দিনের শেষ লাইন — শুধু যেসব সংখ্যা প্যারামিটার হিসেবে এসেছে
+    সেগুলোই ব্যবহার করে (কিছু না দিলে সাধারণ, সৎ লাইন; সংখ্যা বানায় না)।
+    interactions: আজ মোট কথা/কাজের সংখ্যা · wins_today: আজকের জয় সংখ্যা ·
+    studied: True/False/str (পড়া হয়েছে কিনা / কতক্ষণ)।"""
+    d = for_date or date.today()
+    try:
+        pick = d.toordinal() % 3
+    except Exception:
+        pick = 0
+    facts = []
+    if isinstance(interactions, (int, float)) and interactions > 0:
+        facts.append(f"আজ আমরা {_dl_bn(int(interactions))} বার কথা বলেছি/কাজ করেছি")
+    if isinstance(wins_today, (int, float)) and wins_today > 0:
+        facts.append(f"আজ {_dl_bn(int(wins_today))}টা ছোট জয় জমা হয়েছে")
+    if isinstance(studied, str) and studied.strip():
+        facts.append(f"পড়া: {studied.strip()}")
+    elif studied is True:
+        facts.append("আজ পড়াশোনাও হয়েছে")
+    closers = [
+        "আজকের দিনটা এখানেই গুটিয়ে নাও — কাল আবার নতুন করে শুরু হবে। 🌙",
+        "ভালো হোক বা মোটামুটি, দিনটা তুমি পার করেছ — এটাই অগ্রগতি। বিশ্রাম নাও। 🌙",
+        "আজ যা হয়েছে যথেষ্ট; বাকিটা কালকের জন্য থাক। শুভরাত্রি! 🌙",
+    ]
+    if facts:
+        return "🌙 দিনের শেষ লাইন: " + "; ".join(facts) + "। " + closers[pick]
+    return "🌙 দিনের শেষ লাইন: " + closers[pick]
+
+
+def goal_vision_text(goal=None):
+    """#572 লক্ষ্যের দৃশ্য: goal-স্ট্রিং বসিয়ে একটি ছোট visualization
+    অনুচ্ছেদ (template — কোনো ভবিষ্যদ্বাণী বা মিথ্যা প্রতিশ্রুতি নয়)।"""
+    goal = str(goal or "").strip()[:120] or "সরকারি চাকরি"
+    return (
+        f"🎯 তোমার লক্ষ্যের দৃশ্য — {goal}\n"
+        f"এক মিনিট চোখ বন্ধ করে ভাবো: সকালবেলা ঘুম থেকে উঠেছ, হাতে সেই চিঠিটা — "
+        f"তোমার '{goal}' পাওয়ার খবর। বাসার সবার মুখে হাসি, এতদিনের কষ্টের "
+        "মুখে একটা শান্ত বিজয়ের অনুভূতি। আজকের এই পড়ার টেবিল, এই রাতজাগা — "
+        "সেই সকালটার দিকেই যাচ্ছে। প্রতিটা ছোট দিন সেই ছবিটাকে এক ধাপ "
+        "কাছে টানে। এবার চোখ খোলো — আজকের ধাপটা নেওয়া যাক। 💪"
+    )
+
+
+# ------------------------------------------------------- chat dispatch
+def daily_handle(text, low=None, progress=None):
+    """handle_message-এ বসানোর জন্য একটাই entry point (rules_handle /
+    fullforms_handle-এর ধাঁচ)। মিল না পেলে None ফেরত দেয়।
+    progress: wins_text-এর জন্য integrator চাইলে পড়ার অগ্রগতি পাঠাবে।"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        # #212 — বাজার (সঠিক/ছোট রূপগুলোই ধরা হয়, যাতে 'বাজারের খবর'
+        # জাতীয় অন্য বাক্য ছিনতাই না হয়)
+        stripped = text.rstrip("।!? ")
+        if stripped in ("বাজার", "বাজার দেখাও", "বাজারের তালিকা",
+                        "বাজার তালিকা", "আমার বাজার", "বাজার তালিকা দেখাও"):
+            return bazaar_text()
+        _bz = bazaar_parse_add(text)
+        if _bz:
+            return _bz
+        # #334 + #324 — আজকের তথ্য
+        if "আজকের তথ্য" in text or "আজকের কার্ড" in text or \
+                "আজকের প্রবাদ" in text or "অজানা সত্য" in text:
+            return daily_card_text()
+        # #143 — শুভেচ্ছা
+        if text.startswith("শুভেচ্ছা"):
+            parsed = greeting_parse(text)
+            if not parsed:
+                return ("কার জন্য শুভেচ্ছা বানাব? এভাবে বলো: "
+                        "'শুভেচ্ছা রহিম জন্মদিন' — উপলক্ষ হতে পারে: "
+                        "জন্মদিন, ঈদ, বিয়ে, নতুন চাকরি, পরীক্ষা, সাধারণ।")
+            name, occ = parsed
+            draft = greeting_text(name, occ)
+            return (f"✉️ {name}-এর জন্য {occ} উপলক্ষে শুভেচ্ছার খসড়া "
+                    f"(পাঠানোর আগে নিজের মতো সাজিয়ে নিতে পারো):\n{draft}")
+        # #740 — জয় যোগ
+        m = re.search(r"জয় যোগ করো[:\- ]+(.+)", text)
+        if m:
+            r = wins_api({"action": "add", "text": m.group(1).strip()})
+            if r.get("ok"):
+                return ("🏆 জয়টা জমা রাখলাম! এই ছোট জয়গুলোই তোমার "
+                        "প্রেরণা-ব্যাংক। সব দেখতে বলো: 'আমার জয়গুলো'।")
+            return r.get("error", "জয় যোগ করা গেল না।")
+        # #573 — জয়ের হিসাব
+        if "আমার জয়গুলো" in text or "ছোট জয়ের হিসাব" in text or \
+                "জয়ের হিসাব" in text or "প্রেরণা ব্যাংক" in text:
+            return wins_text(progress)
+        # #450 — দিনশেষ ('আমার লক্ষ্য:' সেট করার রূপটা fullforms আগে
+        # ধরে — এখানে শুধু দেখার রূপগুলো)
+        if stripped in ("দিনশেষ", "দিনের শেষ", "দিনের শেষ লাইন",
+                        "আজকের দিন শেষ"):
+            _wins_today = sum(1 for it in _wins_load()
+                              if it.get("date") == str(date.today()))
+            return day_end_text(wins_today=_wins_today)
+        # #572 — লক্ষ্যের দৃশ্য
+        if stripped in ("আমার লক্ষ্য", "আমার লক্ষ্য দেখাও", "লক্ষ্য দেখাও",
+                        "লক্ষ্যের দৃশ্য", "আমার স্বপ্ন", "লক্ষ্য"):
+            return goal_vision_text()
+        m = re.search(r"লক্ষ্যের দৃশ্য[:\- ]+(.+)", text)
+        if m:
+            return goal_vision_text(m.group(1).strip())
+        return None
+    except Exception:
+        return None
+
+
 # ------------------------------------------- foundation (F3 / F5 / N14) — v1.1.0 full-forms
 # Bridge protocol (N14/F5, Desktop side):
 #   Desktop -> outside : data/bridge/outbox/<timestamp>.json
@@ -5417,6 +6596,10 @@ def handle_message(text):
         _ff = fullforms_handle(text, low)
         if _ff:
             return _ff
+        # --- v1.5.0 daily-life pack (#212/#334/#324/#143/#740/#573/#450/#572)
+        _dl = daily_handle(text, low, progress=(study_progress_text() if ("জয়" in text or "প্রেরণা" in text) else None))
+        if _dl:
+            return _dl
 
         # --- PC commands (allow-list)
         if any(w in low for w in ("খোলো", "খুলে দাও", "open ", "open")) and len(low) < 60:
@@ -5454,7 +6637,7 @@ def handle_message(text):
         if "ভার্সন" in text or "version" in low:
             ver = get_version()
             return f"ভাইয়া, আমার বর্তমান ভার্সন v{ver['version']}। প্রতিদিন একবার করে আমি শেখা জিনিস নিয়ে নতুন দৈনিক ভার্সন বের করি — আজকেরটা {'হয়ে গেছে' if ver['last_daily_release'] == str(date.today()) else 'এখনো বাকি'}।"
-        if "প্যাটার্ন" in text or "বিশ্লেষণ" in text or "insight" in low:
+        if ("প্যাটার্ন" in text or "বিশ্লেষণ" in text or "insight" in low) and "ভুল বিশ্লেষণ" not in text and "প্রশ্ন বিশ্লেষণ" not in text:
             return insights_text(mem)
         if "কী কী মনে" in text or "কি মনে রেখেছ" in text or "what do you remember" in low:
             facts = mem["facts"]
@@ -5486,6 +6669,10 @@ def handle_message(text):
             return exam_status_text()
         if "পড়ার অগ্রগতি" in text:
             return study_progress_text()
+        # --- v1.5.0 study pack (Wave-2: #654/#655/#664/#697/#721/#725/#748/#759)
+        _sp = study_pack_handle(text, low)
+        if _sp:
+            return _sp
         if ("সাপ্তাহিক রিপোর্ট" in text or "বোর্ড সভা" in text
                 or "সাপ্তাহিক বোর্ড" in text):
             return board_text()
@@ -7334,6 +8521,222 @@ function buildFe3Engines(){
  setInterval(applyDim,30000);
  setInterval(function(){if(wakeOn&&!wakeRec&&!fe3LiveOn()&&!fe3Speaking())startWake()},5000);
  if(wakeOn)setTimeout(startWake,1500)}
+/* =====================================================================
+   Desktop Sokhi v1.5.0 — WAVE-3 daily-life UI (#212 বাজার + #334/#324
+   আজকের কার্ড). ONE <script> block's contents — integrator pastes this
+   INSIDE the final fe2/fe3 <script> block (or a new <script> right
+   before </body>), AFTER the main script so api/apiGet/add/$ exist,
+   and adds buildDailyUI() to the boot call list (next to buildTipCard()).
+   House style followed: DOM built dynamically, no innerHTML templates
+   for user data (textContent only), ids prefixed daily* to avoid clashes.
+   ===================================================================== */
+(function(){
+'use strict';
+var d$ = function(id){ return document.getElementById(id); };
+var _dailyBooted = false;
+
+/* ---------------- #334 + #324: আজকের কার্ড (chat pane, first load) ------ */
+async function loadDailyCard(){
+  var box = d$('dailycardbody'); if(!box) return;
+  try{
+    var j = await apiGet('/api/dailycard');
+    if(!j || !j.fact){ box.textContent = 'আজকের কার্ড আনা গেল না।'; return; }
+    box.innerHTML = '';
+    var f = document.createElement('div');
+    f.textContent = '💡 অজানা সত্য: ' + j.fact;
+    box.appendChild(f);
+    var p = document.createElement('div');
+    p.style.marginTop = '6px';
+    p.textContent = '📜 প্রবাদ: ' + (j.proverb || '');
+    box.appendChild(p);
+    var m = document.createElement('div');
+    m.className = 'small';
+    m.textContent = 'মানে: ' + (j.meaning || '');
+    box.appendChild(m);
+  }catch(e){ box.textContent = 'আজকের কার্ড আনা গেল না।'; }
+}
+
+function buildDailyCard(){
+  /* Card lives at the top of the chat pane (#pane-chat), above #chat,
+     so it is seen on first load without disturbing the message flow. */
+  var pane = d$('pane-chat'); if(!pane || d$('dailycard')) return;
+  var card = document.createElement('div');
+  card.id = 'dailycard';
+  card.className = 'card';
+  card.style.cssText = 'margin:0 0 8px;padding:10px 12px;flex:none';
+  var head = document.createElement('div');
+  head.style.cssText = 'display:flex;gap:6px;align-items:center';
+  var h = document.createElement('div');
+  h.className = 'secttl'; h.style.flex = '1'; h.textContent = '🌞 আজকের কার্ড';
+  head.appendChild(h);
+  var rb = document.createElement('button');
+  rb.textContent = '🔄'; rb.title = 'আবার লোড করো'; rb.style.fontSize = '12px';
+  rb.addEventListener('click', loadDailyCard);
+  head.appendChild(rb);
+  var hide = document.createElement('button');
+  hide.textContent = '✕'; hide.title = 'আজকের জন্য লুকাও'; hide.style.fontSize = '12px';
+  hide.addEventListener('click', function(){ card.style.display = 'none'; });
+  head.appendChild(hide);
+  card.appendChild(head);
+  var body = document.createElement('div');
+  body.id = 'dailycardbody';
+  body.style.cssText = 'font-size:13.5px;line-height:1.6;margin-top:4px';
+  body.textContent = 'লোড হচ্ছে…';
+  card.appendChild(body);
+  var chat = d$('chat');
+  if(chat && chat.parentNode === pane) pane.insertBefore(card, chat);
+  else pane.appendChild(card);
+  loadDailyCard();
+}
+
+/* ---------------- #212: বাজার-তালিকা (Tasks pane-এর ভিতরে) ------------- */
+function dailyMoney(v){
+  var n = parseFloat(v) || 0;
+  var s = (n === Math.floor(n)) ? String(Math.floor(n)) : String(n);
+  return s.replace(/[0-9]/g, function(c){ return '০১২৩৪৫৬৭৮৯'[+c]; });
+}
+
+async function loadBazaar(){
+  var list = d$('dailybazaarlist'); if(!list) return;
+  var tot = d$('dailybazaartotal');
+  try{
+    var j = await apiGet('/api/bazaar');
+    var items = (j && j.items) || [];
+    list.innerHTML = '';
+    if(!items.length){
+      var d = document.createElement('div');
+      d.className = 'small';
+      d.textContent = 'তালিকা খালি — নিচে লিখে যোগ করো, বা চ্যাটে বলো: "বাজারে যোগ করো চাল"।';
+      list.appendChild(d);
+    }
+    items.forEach(function(it){
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:6px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line);font-size:14px';
+      var cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = !!it.bought; cb.title = 'কেনা হয়েছে';
+      cb.style.cssText = 'flex:none;width:auto';
+      cb.addEventListener('change', async function(){
+        try{ await api('/api/bazaar', {action:'toggle', id:it.id}); }catch(e){}
+        loadBazaar();
+      });
+      row.appendChild(cb);
+      var tx = document.createElement('span');
+      tx.style.flex = '1';
+      if(it.bought) tx.style.cssText = 'flex:1;text-decoration:line-through;color:var(--muted)';
+      var label = String(it.item || '');
+      if(it.qty) label += ' (' + it.qty + ')';
+      if(parseFloat(it.est_price) > 0) label += ' — আনুমানিক ' + dailyMoney(it.est_price) + ' টাকা';
+      tx.textContent = label;
+      row.appendChild(tx);
+      var del = document.createElement('button');
+      del.textContent = '✕'; del.title = 'মোছো'; del.style.fontSize = '12px';
+      del.addEventListener('click', async function(){
+        try{ await api('/api/bazaar', {action:'delete', id:it.id}); }catch(e){}
+        loadBazaar();
+      });
+      row.appendChild(del);
+      list.appendChild(row);
+    });
+    if(tot){
+      tot.textContent = items.length
+        ? ('আনুমানিক মোট খরচ: ' + dailyMoney(j.total) + ' টাকা (কেনা ' +
+           dailyMoney(j.bought_total) + ' টাকা, বাকি ' + dailyMoney(j.pending_total) + ' টাকা)')
+        : '';
+    }
+  }catch(e){
+    list.innerHTML = '';
+    var d2 = document.createElement('div');
+    d2.className = 'small'; d2.textContent = 'বাজারের তালিকা লোড করা গেল না।';
+    list.appendChild(d2);
+  }
+}
+
+async function addBazaarItem(){
+  var itemEl = d$('dailybazaaritem'), qtyEl = d$('dailybazaarqty'),
+      priceEl = d$('dailybazaarprice'), msg = d$('dailybazaarmsg');
+  var item = itemEl ? itemEl.value.trim() : '';
+  if(!item){ if(msg) msg.textContent = 'আগে জিনিসের নামটা লেখো।'; return; }
+  var body = { action:'add', item:item,
+               qty: qtyEl ? qtyEl.value.trim() : '',
+               est_price: priceEl ? (parseFloat(priceEl.value) || 0) : 0 };
+  try{
+    var j = await api('/api/bazaar', body);
+    if(j && j.ok === false){ if(msg) msg.textContent = j.error || 'যোগ করা গেল না।'; return; }
+    if(itemEl) itemEl.value = '';
+    if(qtyEl) qtyEl.value = '';
+    if(priceEl) priceEl.value = '';
+    if(msg) msg.textContent = '';
+    loadBazaar();
+  }catch(e){ if(msg) msg.textContent = 'যোগ করা গেল না — আবার চেষ্টা করো।'; }
+}
+
+function buildBazaarSection(){
+  var pane = d$('pane-tasks'); if(!pane || d$('dailybazaar')) return;
+  var wrap = document.createElement('div');
+  wrap.id = 'dailybazaar';
+  wrap.style.cssText = 'margin-top:16px;border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;min-height:0';
+  var h = document.createElement('div');
+  h.className = 'secttl'; h.textContent = '🛒 বাজারের তালিকা';
+  wrap.appendChild(h);
+  var tot = document.createElement('div');
+  tot.id = 'dailybazaartotal'; tot.className = 'statline';
+  wrap.appendChild(tot);
+  var list = document.createElement('div');
+  list.id = 'dailybazaarlist';
+  list.style.cssText = 'overflow-y:auto;min-height:0';
+  wrap.appendChild(list);
+  var row1 = document.createElement('div');
+  row1.style.cssText = 'display:flex;gap:6px;margin-top:8px';
+  var item = document.createElement('input');
+  item.id = 'dailybazaaritem'; item.type = 'text';
+  item.placeholder = 'জিনিসের নাম…'; item.style.flex = '1';
+  row1.appendChild(item);
+  var qty = document.createElement('input');
+  qty.id = 'dailybazaarqty'; qty.type = 'text';
+  qty.placeholder = 'পরিমাণ (৫ কেজি)'; qty.style.cssText = 'flex:0 0 96px;width:96px';
+  row1.appendChild(qty);
+  wrap.appendChild(row1);
+  var row2 = document.createElement('div');
+  row2.style.cssText = 'display:flex;gap:6px;margin-top:6px';
+  var price = document.createElement('input');
+  price.id = 'dailybazaarprice'; price.type = 'number'; price.min = '0';
+  price.placeholder = 'আনুমানিক দাম (টাকা)'; price.style.flex = '1';
+  row2.appendChild(price);
+  var addBtn = document.createElement('button');
+  addBtn.textContent = 'যোগ করো';
+  addBtn.addEventListener('click', addBazaarItem);
+  row2.appendChild(addBtn);
+  var clearBtn = document.createElement('button');
+  clearBtn.textContent = 'কেনাগুলো মোছো'; clearBtn.style.fontSize = '13px';
+  clearBtn.addEventListener('click', async function(){
+    try{ await api('/api/bazaar', {action:'clear_bought'}); }catch(e){}
+    loadBazaar();
+  });
+  row2.appendChild(clearBtn);
+  wrap.appendChild(row2);
+  var msg = document.createElement('div');
+  msg.id = 'dailybazaarmsg'; msg.className = 'small'; msg.style.marginTop = '4px';
+  wrap.appendChild(msg);
+  item.addEventListener('keydown', function(e){ if(e.key === 'Enter') addBazaarItem(); });
+  pane.appendChild(wrap);
+  /* Tasks tab খুললেই তালিকা টাটকা থাকুক — বিদ্যমান tab বোতামে হুক */
+  var tb = d$('tabbtn-tasks');
+  if(tb) tb.addEventListener('click', loadBazaar);
+  loadBazaar();
+}
+
+/* ---------------- boot (integrator calls this once) -------------------- */
+function buildDailyUI(){
+  if(_dailyBooted) return;
+  _dailyBooted = true;
+  buildDailyCard();
+  buildBazaarSection();
+}
+window.buildDailyUI = buildDailyUI;
+window.dailyLoadBazaar = loadBazaar;
+window.dailyLoadCard = loadDailyCard;
+})();
+
 /* ================= বুট ================= */
 buildConvoBar();
 buildMemoryPane();
@@ -7346,6 +8749,7 @@ buildPalette();
 buildHelp();
 buildOnboarding();
 buildTipCard();
+buildDailyUI();
 buildFe3Engines();
 try{if(typeof pin==='function'&&pin())loadActiveIntoChat()}catch(e){}
 })();
@@ -7851,10 +9255,22 @@ class Handler(BaseHTTPRequestHandler):
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
             return self._json(doctor_report())
+        if self.path == "/api/dailycard":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            return self._json(daily_card())
+        if self.path == "/api/bazaar":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            return self._json(bazaar_api(None))
+        if self.path == "/api/wins":
+            if not self._pin_ok():
+                return self._json({"error": "pin"}, 403)
+            return self._json(wins_api(None))
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback", "/api/pins", "/api/backup", "/api/dailyq", "/api/reminders"):
+        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback", "/api/pins", "/api/backup", "/api/dailyq", "/api/reminders", "/api/bazaar", "/api/wins"):
             return self._json({"error": "not found"}, 404)
         if not self._pin_ok():
             return self._json({"error": "pin"}, 403)
@@ -7998,6 +9414,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         if self.path == "/api/tasks":
             return self._json(tasks_api(data))
+        if self.path == "/api/bazaar":
+            return self._json(bazaar_api(data))
+        if self.path == "/api/wins":
+            return self._json(wins_api(data))
         if self.path == "/api/rules":
             if data.get("rule"):
                 return self._json({"ok": True, "message": rules_add(str(data["rule"])), "text": rules_text()})
@@ -8131,7 +9551,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 
 def main():
