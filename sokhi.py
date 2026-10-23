@@ -160,6 +160,11 @@ def get_config():
     cfg.setdefault("reply_style", "স্বাভাবিক")
     cfg.setdefault("quiet_start", "")
     cfg.setdefault("quiet_end", "")
+    cfg.setdefault("reply_language", "বাংলা")
+    cfg.setdefault("wake_word", False)
+    cfg.setdefault("dim_start", "")
+    cfg.setdefault("dim_end", "")
+    cfg.setdefault("dim_level", 0.6)
     if not CONFIG_FILE.exists():
         save_json(CONFIG_FILE, cfg)
     return cfg
@@ -563,6 +568,11 @@ def ask_gemini(user_text, mem, quality=False, image=None):
         system += "\nউত্তর খুব সংক্ষেপে, ১-৩ বাক্যে দাও।"
     elif _style == "বিস্তারিত":
         system += "\nউত্তর বিস্তারিতভাবে, ধাপে ধাপে দাও।"
+    _lang = (cfg.get("reply_language") or "বাংলা").strip()
+    if _lang == "Banglish":
+        system += "\nউত্তর Banglish-এ দাও — বাংলা কথা, কিন্তু ল্যাটিন (ইংরেজি) হরফে লেখা; সহজ ও স্বাভাবিক ভঙ্গিতে।"
+    elif _lang == "English":
+        system += "\nReply in simple, clear English only."
     _contents = gemini_contents(user_text)
     if image:
         try:
@@ -2799,6 +2809,7 @@ def gemini_contents(user_text):
 # DATA/"conversations.json": {"active": id, "items":[{id,title,created,
 # updated,messages:[{r,t,ts}]}]} — multiple titled chats (ideas 15-21).
 CONVERSATIONS_FILE = DATA / "conversations.json"
+PINS_FILE = DATA / "pins.json"
 FEEDBACK_FILE = DATA / "feedback.json"
 _DEFAULT_CONVO_TITLE = "নতুন কথোপকথন"
 
@@ -2834,6 +2845,20 @@ def _convo_find(data, cid):
         if isinstance(it, dict) and it.get("id") == cid:
             return it
     return None
+
+
+def pins_load():
+    """Load the pins store; always returns a sane list."""
+    items = load_json(PINS_FILE, [])
+    return items if isinstance(items, list) else []
+
+
+def pins_save(items):
+    try:
+        save_json(PINS_FILE, items if isinstance(items, list) else [])
+    except Exception:
+        pass
+    return items
 
 
 def convo_new(title=None):
@@ -2927,6 +2952,14 @@ def convos_api(data):
         item["updated"] = int(time.time())
         convos_save(store)
         return {"ok": True, "id": cid, "title": title}
+    if action == "pin":
+        cid = str(data.get("id") or "")
+        item = _convo_find(store, cid)
+        if item is None:
+            return {"ok": False, "error": "এই কথোপকথনটা খুঁজে পাইনি।"}
+        item["pinned"] = bool(data.get("pinned"))
+        convos_save(store)
+        return {"ok": True, "id": cid, "pinned": item["pinned"]}
     if action == "delete":
         cid = str(data.get("id") or "")
         if _convo_find(store, cid) is None:
@@ -2934,6 +2967,13 @@ def convos_api(data):
         was_active = store.get("active") == cid
         store["items"] = [it for it in store.get("items", [])
                           if not (isinstance(it, dict) and it.get("id") == cid)]
+        try:
+            _pins = pins_load()
+            _pins_filtered = [p for p in _pins if not (isinstance(p, dict) and p.get("convo_id") == cid)]
+            if len(_pins_filtered) != len(_pins):
+                pins_save(_pins_filtered)
+        except Exception:
+            pass
         if not store["items"]:
             convos_save(store)
             item = convo_new()
@@ -2990,6 +3030,146 @@ def convos_api(data):
         item["updated"] = int(time.time())
         convos_save(store)
         return {"ok": True, "id": cid, "count": len(item["messages"])}
+    return {"ok": False, "error": "কী করতে হবে বুঝতে পারিনি — action ঠিক করে পাঠাও।"}
+
+
+def pins_api(data):
+    """POST /api/pins handler (idea 43): pinned messages."""
+    data = data or {}
+    action = str(data.get("action") or "").strip()
+    if action == "list":
+        store = convos_load()
+        titles = {}
+        for it in store.get("items", []):
+            if isinstance(it, dict):
+                titles[it.get("id")] = it.get("title", "")
+        pins = []
+        for pin in pins_load():
+            if not isinstance(pin, dict):
+                continue
+            item = dict(pin)
+            if item.get("convo_id") in titles:
+                item["convo_title"] = titles[item.get("convo_id")]
+            pins.append(item)
+        return {"ok": True, "pins": pins}
+    if action == "add":
+        convo_id = str(data.get("convo_id") or "")
+        store = convos_load()
+        if _convo_find(store, convo_id) is None:
+            return {"ok": False, "error": "এই কথোপকথনটা খুঁজে পাইনি।"}
+        try:
+            idx = int(data.get("idx"))
+        except Exception:
+            idx = -1
+        pins = pins_load()
+        for pin in pins:
+            if isinstance(pin, dict) and pin.get("convo_id") == convo_id and pin.get("idx") == idx:
+                return {"ok": True, "pin": pin, "dupe": True}
+        who = str(data.get("who") or "")
+        if who not in ("me", "sokhi"):
+            who = "sokhi"
+        pin = {"id": "p" + str(int(time.time() * 1000)) + secrets.token_hex(3),
+               "convo_id": convo_id, "idx": idx, "who": who,
+               "text": str(data.get("text") or "")[:2000],
+               "ts": int(time.time())}
+        pins.append(pin)
+        pins_save(pins)
+        return {"ok": True, "pin": pin}
+    if action == "remove":
+        pid = str(data.get("id") or "")
+        pins = [pin for pin in pins_load()
+                if not (isinstance(pin, dict) and pin.get("id") == pid)]
+        pins_save(pins)
+        return {"ok": True}
+    return {"ok": False, "error": "কী করতে হবে বুঝতে পারিনি — action ঠিক করে পাঠাও।"}
+
+
+# Whitelist of config keys safe to export / restore in a backup or sync
+# bundle (ideas 44 + 48). gemini_api_key is NEVER in this list.
+_BACKUP_CONFIG_KEYS = ("city", "tts_voice", "tts_preset", "tts_rate",
+                       "tts_pitch", "voice_rate", "call_name", "reply_style",
+                       "reply_language", "quiet_start", "quiet_end",
+                       "dim_start", "dim_end", "dim_level", "wake_word",
+                       "update_url", "auto_self_upgrade", "bridge_enabled",
+                       "computer_use_enabled", "away_mode", "gemini_model")
+
+
+def backup_api(data):
+    """POST /api/backup handler (ideas 44 + 48): export / import a
+    backup or sync bundle. The Gemini key is never exported, and an
+    import never overwrites the key already on this device."""
+    data = data or {}
+    action = str(data.get("action") or "").strip()
+    if action == "export":
+        kind = str(data.get("kind") or "")
+        if kind not in ("backup", "sync"):
+            kind = "backup"
+        cfg = get_config()
+        _notes_file = DATA / "notes.txt"
+        try:
+            _notes = _notes_file.read_text(encoding="utf-8") if _notes_file.exists() else ""
+        except Exception:
+            _notes = ""
+        bundle = {"app": "sokhi-desktop", "kind": kind,
+                  "version": APP_VERSION,
+                  "exported_at": datetime.now().isoformat(),
+                  "config": {k: cfg.get(k) for k in _BACKUP_CONFIG_KEYS if k in cfg},
+                  "memory": get_memory(),
+                  "conversations": convos_load(),
+                  "pins": pins_load(),
+                  "notes": _notes,
+                  "tasks": load_json(AWAY_FILE, []) if AWAY_FILE.exists() else []}
+        _fname = f"sokhi-{kind}-{datetime.now().strftime('%Y%m%d')}.json"
+        return {"ok": True, "filename": _fname, "bundle": bundle}
+    if action == "import":
+        bundle = data.get("bundle")
+        if not isinstance(bundle, dict) or bundle.get("app") != "sokhi-desktop" or bundle.get("kind") not in ("backup", "sync"):
+            return {"ok": False, "error": "এটা Sokhi-র ব্যাকআপ ফাইল বলে মনে হচ্ছে না।"}
+        # FIRST snapshot everything that exists, so a restore can be undone.
+        _stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        _snap = BACKUPS / ("pre-restore-" + _stamp)
+        try:
+            _snap.mkdir(parents=True, exist_ok=True)
+            for _src in (CONFIG_FILE, MEMORY_FILE, CONVERSATIONS_FILE,
+                         PINS_FILE, DATA / "notes.txt", AWAY_FILE):
+                try:
+                    if _src.exists():
+                        shutil.copy2(_src, _snap / _src.name)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        restored = {"conversations": 0, "pins": 0, "facts": 0}
+        _bcfg = bundle.get("config")
+        if isinstance(_bcfg, dict):
+            cfg = get_config()
+            for _k in _BACKUP_CONFIG_KEYS:
+                if _k in _bcfg:
+                    cfg[_k] = _bcfg[_k]
+            save_config(cfg)
+        _bmem = bundle.get("memory")
+        if isinstance(_bmem, dict):
+            save_json(MEMORY_FILE, _bmem)
+            _facts = _bmem.get("facts")
+            restored["facts"] = len(_facts) if isinstance(_facts, list) else 0
+        _bconvos = bundle.get("conversations")
+        if isinstance(_bconvos, dict) and isinstance(_bconvos.get("items"), list):
+            convos_save(_bconvos)
+            restored["conversations"] = len(_bconvos.get("items") or [])
+        _bpins = bundle.get("pins")
+        if isinstance(_bpins, list):
+            pins_save(_bpins)
+            restored["pins"] = len(_bpins)
+        _bnotes = bundle.get("notes")
+        if isinstance(_bnotes, str):
+            try:
+                (DATA / "notes.txt").write_text(_bnotes[:20000], encoding="utf-8")
+            except Exception:
+                pass
+        _btasks = bundle.get("tasks")
+        if isinstance(_btasks, list):
+            save_json(AWAY_FILE, _btasks[-50:])
+        return {"ok": True, "snapshot": _snap.name, "restored": restored}
     return {"ok": False, "error": "কী করতে হবে বুঝতে পারিনি — action ঠিক করে পাঠাও।"}
 
 
@@ -5369,13 +5549,15 @@ function mkActBtn(label,title,fn){
  b.onclick=e=>{e.stopPropagation();fn(b)};return b}
 function buildMeActions(d,act){
  act.appendChild(mkActBtn('📋','কপি করো',b=>copyText(d._full,b)));
- act.appendChild(mkActBtn('✏️','বদলে আবার পাঠাও',()=>startEdit(d)))}
+ act.appendChild(mkActBtn('✏️','বদলে আবার পাঠাও',()=>startEdit(d)));
+ act.appendChild(mkActBtn('📌','Pin করো',b=>{if(window.fe3PinMessage)window.fe3PinMessage(d,b)}))}
 function buildSokhiActions(d,act){
  act.appendChild(mkActBtn('📋','কপি করো',b=>copyText(d._full,b)));
  act.appendChild(mkActBtn('👍','ভালো লেগেছে',b=>rateMsg(d,'up',b)));
  act.querySelectorAll('button')[1].classList.add('ratebtn');
  const dn=mkActBtn('👎','ভালো লাগেনি',b=>rateMsg(d,'down',b));dn.classList.add('ratebtn');act.appendChild(dn);
- act.appendChild(mkActBtn('📌 নোটে রাখো','নোটে রাখো',b=>saveToNote(d,b)))}
+ act.appendChild(mkActBtn('📌 নোটে রাখো','নোটে রাখো',b=>saveToNote(d,b)));
+ act.appendChild(mkActBtn('📌','Pin করো',b=>{if(window.fe3PinMessage)window.fe3PinMessage(d,b)}))}
 function refreshRegenButtons(){
  document.querySelectorAll('#chat .regenbtn').forEach(b=>b.remove());
  const msgs=[...document.querySelectorAll('#chat .msg.sokhi')].filter(m=>!m.dataset.err);
@@ -5841,6 +6023,15 @@ body.focus #layout{grid-template-columns:minmax(0,1fr);max-width:980px}
 #fe2settings input[type="time"]{flex:none;width:auto}
 #fe2settings select{max-width:100%}
 #fe2attachbtn{flex:none}
+/* v1.3 fe3 — পিন ট্যাব, সেটিংসের বাড়তি ঘর */
+#pane-pins{overflow:hidden}
+#fe3pinscroll{overflow-y:auto;min-height:0;flex:1;padding-right:4px}
+.fe3pinrow{display:flex;gap:6px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+.fe3pinrow .tx{flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}
+.fe3pinrow .tx .m{font-size:12px;color:var(--muted);margin-top:2px;white-space:pre-wrap}
+.fe3pinrow button{flex:none;padding:3px 8px;font-size:12px}
+#fe2settings input[type="checkbox"]{flex:none}
+.fe3filelabel{cursor:pointer;border:1px solid var(--line);background:var(--panel2);border-radius:8px;padding:6px 10px;font-size:13px;display:inline-flex;align-items:center}
 /* v1.2 fe2 — মোবাইল আরাম (আইডিয়া ৪১) */
 @media (max-width:1080px){
  .tabs{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;padding-bottom:4px;-webkit-overflow-scrolling:touch}
@@ -5924,13 +6115,14 @@ async function convoPost(body){return await api('/api/convos',body)}
 function renderConvoList(items){
  const box=$('convolist');if(!box)return;box.innerHTML='';
  if(!items||!items.length){const d=document.createElement('div');d.className='small';d.textContent='কোনো কথোপকথন পাওয়া যায়নি।';box.appendChild(d);return}
+ items=items.slice().sort(function(a,b){return ((b&&b.pinned)?1:0)-((a&&a.pinned)?1:0)});
  items.forEach(function(raw){
   const it=raw||{};
   const id=it.id||it.convo_id||it.conversation_id||'';
   const title=it.title||it.name||'কথোপকথন';
   const row=document.createElement('div');row.className='convoitem'+(String(id)===String(activeId)?' active':'');
   const info=document.createElement('div');info.className='info';
-  const tt=document.createElement('div');tt.className='t';tt.textContent=title;info.appendChild(tt);
+  const tt=document.createElement('div');tt.className='t';tt.textContent=(it.pinned?'📌 ':'')+title;info.appendChild(tt);
   const meta=document.createElement('div');meta.className='m';
   const bits=[];
   if(it.count!=null)bits.push(it.count+'টি বার্তা');
@@ -5940,6 +6132,7 @@ function renderConvoList(items){
   if(it.snippet){const sn=document.createElement('div');sn.className='m';sn.textContent=String(it.snippet);info.appendChild(sn)}
   row.appendChild(info);
   const mk=function(label,titleTxt,fn){const b=document.createElement('button');b.textContent=label;b.title=titleTxt;b.addEventListener('click',function(ev){ev.stopPropagation();fn()});return b};
+  row.appendChild(mk('📌',it.pinned?'Pin তোলো':'Pin করো',function(){api('/api/convos',{action:'pin',id:id,pinned:!it.pinned}).then(function(){refreshConvos()}).catch(function(){})}));
   row.appendChild(mk('✏️','নাম বদলাও',function(){renameConvo(id,title)}));
   row.appendChild(mk('⬇','Export (.txt)',function(){exportConvo(id,title)}));
   row.appendChild(mk('🗑','মোছো',function(){deleteConvo(id,title)}));
@@ -6076,15 +6269,28 @@ async function deleteMemory(kind,idx){
  try{await api('/api/memory',kind==='fact'?{action:'delete_fact',index:idx}:{action:'delete_note',index:idx})}catch(e){}
  loadMemory()}
 function fe2Tab(name){
+ if(name==='pins'){
+  ['chat','agents','notes','tasks'].forEach(function(n){
+   const p=$('pane-'+n);if(p)p.classList.remove('on');
+   const b=$('tabbtn-'+n);if(b)b.classList.remove('on')});
+  const mp=$('pane-memory');if(mp)mp.classList.remove('on');
+  const mb=$('tabbtn-memory');if(mb)mb.classList.remove('on');
+  const p=$('pane-pins');if(p)p.classList.add('on');
+  const b=$('tabbtn-pins');if(b)b.classList.add('on');
+  loadPins();return}
  if(name==='memory'){
   ['chat','agents','notes','tasks'].forEach(function(n){
    const p=$('pane-'+n);if(p)p.classList.remove('on');
    const b=$('tabbtn-'+n);if(b)b.classList.remove('on')});
+  const pp=$('pane-pins');if(pp)pp.classList.remove('on');
+  const pb=$('tabbtn-pins');if(pb)pb.classList.remove('on');
   const p=$('pane-memory');if(p)p.classList.add('on');
   const b=$('tabbtn-memory');if(b)b.classList.add('on');
   loadMemory();return}
  const p=$('pane-memory');if(p)p.classList.remove('on');
  const b=$('tabbtn-memory');if(b)b.classList.remove('on');
+ const pp=$('pane-pins');if(pp)pp.classList.remove('on');
+ const pb=$('tabbtn-pins');if(pb)pb.classList.remove('on');
  if(typeof showTab==='function')showTab(name)}
 window.fe2Tab=fe2Tab;
 function buildMemoryPane(){
@@ -6166,7 +6372,29 @@ function buildSettingsExtras(){
   '<hr><div class="secttl">শান্ত সময় (Quiet hours)</div>'+
   '<label style="font-size:13px;display:flex;gap:8px;align-items:center;margin-top:6px"><input id="fe2quieton" type="checkbox"> শান্ত সময় চালু</label>'+
   '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:13px">শুরু <input id="fe2quietstart" type="time" value="22:00"> শেষ <input id="fe2quietend" type="time" value="07:00"> <button id="fe2quietsave" type="button">সেভ</button></div>'+
-  '<div class="hint">এই সময়ে Sokhi নিজে থেকে গলায় বলবে না — ঘুম/নামাজের সময় বিঘ্ন হবে না।</div>';
+  '<div class="hint">এই সময়ে Sokhi নিজে থেকে গলায় বলবে না — ঘুম/নামাজের সময় বিঘ্ন হবে না।</div>'+
+  '<hr><div class="secttl">উত্তরের ভাষা</div>'+
+  '<div style="font-size:13px;margin-top:6px">উত্তরের ভাষা: '+
+  '<select id="fe3lang"><option value="বাংলা">বাংলা</option><option value="Banglish">Banglish</option><option value="English">English</option></select></div>'+
+  '<div class="hint">Smart (Gemini) উত্তরের ভাষা বদলাবে; অফলাইন উত্তর আপাতত বাংলাতেই থাকে।</div>'+
+  '<hr><div class="secttl">Wake word</div>'+
+  '<label style="font-size:13px;display:flex;gap:8px;align-items:center;margin-top:6px"><input id="fe3wake" type="checkbox"> নাম ধরে ডাকলে জাগবে ("সখি" / "Sokhi")</label>'+
+  '<div class="hint">Chrome-এ মাইকের অনুমতি লাগবে, ট্যাব খোলা থাকতে হবে; শুনতে পেলেই লাইভ মোড চালু হবে।</div>'+
+  '<hr><div class="secttl">রাতের Auto-dim</div>'+
+  '<label style="font-size:13px;display:flex;gap:8px;align-items:center;margin-top:6px"><input id="fe3dimon" type="checkbox"> রাতে স্ক্রিন নিজে থেকে ম্লান হবে</label>'+
+  '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:13px">শুরু <input id="fe3dimstart" type="time" value="21:00"> শেষ <input id="fe3dimend" type="time" value="06:00"></div>'+
+  '<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><span class="small">ম্লান</span>'+
+  '<input id="fe3dimlevel" type="range" min="0.3" max="1" step="0.05" value="0.6" style="flex:1">'+
+  '<span class="small">উজ্জ্বল</span><span id="fe3dimlevelval" class="small">৬০%</span></div>'+
+  '<div style="margin-top:8px"><button id="fe3dimsave" type="button">সেভ</button></div>'+
+  '<div class="hint">বসানো সময়ে স্ক্রিনের উজ্জ্বলতা নিজে থেকে কমে যাবে — রাতে চোখের আরাম।</div>'+
+  '<hr><div class="secttl">ব্যাকআপ / রিস্টোর / Sync</div>'+
+  '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center"><button id="fe3backupdl" type="button">⬇ ব্যাকআপ নাও (.json)</button>'+
+  '<button id="fe3syncdl" type="button">🔄 Sync ফাইল নাও</button>'+
+  '<label class="fe3filelabel" for="fe3restorefile">⬆ রিস্টোর করো</label>'+
+  '<input id="fe3restorefile" type="file" accept=".json,application/json" style="display:none"></div>'+
+  '<div id="fe3backupmsg" class="small" style="margin-top:6px"></div>'+
+  '<div class="hint">ব্যাকআপ ফাইলে Gemini key থাকে না। Sync ফাইল একই — অন্য ডিভাইসে (ফোন/ল্যাপটপ) এই ফাইল রিস্টোর করলেই কথোপকথন ও স্মৃতি মিলে যাবে; cloud-এ নিজে থেকে sync হয় না। একই Wi-Fi-তে ফোন থেকে খুললে এমনিতেই একই তথ্য দেখা যায়।</div>';
  if(closeBtn)panel.insertBefore(box,closeBtn);else panel.appendChild(box);
  const rs=$('fe2replystyle');
  if(rs)rs.addEventListener('change',function(){api('/api/settings',{reply_style:rs.value}).catch(function(){})});
@@ -6182,7 +6410,26 @@ function buildSettingsExtras(){
    const qe=$('fe2quietend');if(qe)qe.value=q.quiet_end||q.end||''}
  }catch(e){}
  const qb=$('fe2quietsave');if(qb)qb.addEventListener('click',saveQuiet);
- const qo=$('fe2quieton');if(qo)qo.addEventListener('change',saveQuiet)}
+ const qo=$('fe2quieton');if(qo)qo.addEventListener('change',saveQuiet);
+ /* v1.3 fe3: ভাষা / wake word / auto-dim / ব্যাকআপের তারজোড় */
+ const lg=$('fe3lang');
+ if(lg)lg.addEventListener('change',function(){api('/api/settings',{reply_language:lg.value}).catch(function(){})});
+ const wk=$('fe3wake');
+ if(wk){try{wk.checked=localStorage.getItem('sokhi_wake')==='1'}catch(e){}
+  wk.addEventListener('change',function(){fe3SetWake(wk.checked)})}
+ try{const dm=fe3DimMirror();
+  if(dm&&(dm.start||dm.end||dm.level!=null||dm.enabled!=null)){
+   const don=$('fe3dimon');if(don)don.checked=!!dm.enabled;
+   const ds=$('fe3dimstart');if(ds&&dm.start)ds.value=dm.start;
+   const de=$('fe3dimend');if(de&&dm.end)de.value=dm.end;
+   const dl=$('fe3dimlevel');if(dl&&dm.level!=null)dl.value=dm.level}
+ }catch(e){}
+ fe3DimLevelLabel();
+ const dlv=$('fe3dimlevel');if(dlv)dlv.addEventListener('input',fe3DimLevelLabel);
+ const dsv=$('fe3dimsave');if(dsv)dsv.addEventListener('click',saveDim);
+ const bk=$('fe3backupdl');if(bk)bk.addEventListener('click',function(){fe3ExportBackup('backup')});
+ const sy=$('fe3syncdl');if(sy)sy.addEventListener('click',function(){fe3ExportBackup('sync')});
+ const rf=$('fe3restorefile');if(rf)rf.addEventListener('change',function(){if(rf.files&&rf.files[0])fe3ImportBackup(rf.files[0]);rf.value=''})}
 /* ================= ২৮: Focus মোড ================= */
 function toggleFocus(){
  const on=document.body.classList.toggle('focus');
@@ -6206,6 +6453,16 @@ async function updateBrain(){
     const qe=$('fe2quietend');if(qe&&s.quiet_end)qe.value=s.quiet_end;
     const qo=$('fe2quieton');if(qo)qo.checked=!!(s.quiet_start&&s.quiet_end);
     try{localStorage.setItem('sokhi_quiet',JSON.stringify({enabled:!!(s.quiet_start&&s.quiet_end),quiet_start:s.quiet_start||'',quiet_end:s.quiet_end||'',start:s.quiet_start||'',end:s.quiet_end||''}))}catch(e){}}
+   if(s.reply_language){const lg=$('fe3lang');if(lg&&Array.prototype.slice.call(lg.options).some(function(o){return o.value===s.reply_language}))lg.value=s.reply_language}
+   if(s.wake_word!=null){const wk2=$('fe3wake');if(wk2)wk2.checked=!!s.wake_word;wakeOn=!!s.wake_word;try{localStorage.setItem('sokhi_wake',wakeOn?'1':'0')}catch(e){}if(wakeOn)setTimeout(startWake,1200)}
+   if(s.dim_start||s.dim_end||s.dim_level!=null){
+    const dm2={enabled:!!(s.dim_start&&s.dim_end),start:s.dim_start||'21:00',end:s.dim_end||'06:00',level:s.dim_level!=null?parseFloat(s.dim_level):0.6};
+    try{localStorage.setItem('sokhi_dim',JSON.stringify(dm2))}catch(e){}
+    const don=$('fe3dimon');if(don)don.checked=dm2.enabled;
+    const ds=$('fe3dimstart');if(ds&&s.dim_start)ds.value=s.dim_start;
+    const de=$('fe3dimend');if(de&&s.dim_end)de.value=s.dim_end;
+    const dl=$('fe3dimlevel');if(dl&&s.dim_level!=null)dl.value=s.dim_level;
+    fe3DimLevelLabel();applyDim()}
    if(s.brain==='smart')setBrain('🧠 স্মার্ট মাথা');
    else if(s.brain==='offline')setBrain('📴 অফলাইন মাথা');
    else setBrain(s.key_set?'🧠 স্মার্ট মাথা':'📴 অফলাইন মাথা');
@@ -6356,7 +6613,9 @@ function buildHelp(){
  '<div class="secttl">টিপস</div><ul>'+
  '<li>স্মৃতি ট্যাবে Sokhi কী মনে রেখেছে দেখতে ও মুছতে পারবে।</li>'+
  '<li>কথোপকথন-বার থেকে বিষয় ধরে আলাদা চ্যাট রাখা যায়।</li>'+
- '<li>ফোকাস মোডে (⛶) শুধু চ্যাট বড় হয়ে আসে।</li></ul>'+
+ '<li>ফোকাস মোডে (⛶) শুধু চ্যাট বড় হয়ে আসে।</li>'+
+ '<li>যেকোনো বার্তার নিচের 📌 চাপ দিলে বার্তাটা পিন ট্যাবে জমা থাকবে; কথোপকথন-তালিকায় 📌 দিয়ে কথোপকথন pin করে ওপরে রাখা যায়।</li>'+
+ '<li>সেটিংস থেকে ব্যাকআপ/রিস্টোর ও Sync ফাইল নেওয়া যায়; Wake word চালু করলে "সখি" বলে ডাকলেই Sokhi জাগবে, আর রাতের Auto-dim চোখ বাঁচাবে।</li></ul>'+
  '<div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap"><button id="fe2help-onboard" type="button">প্রথম-চালুর গাইড আবার দেখাও</button><button id="fe2help-close" type="button">বন্ধ করো</button></div></div>';
  document.body.appendChild(m);
  m.addEventListener('click',function(e){if(e.target===m)m.style.display='none'});
@@ -6372,7 +6631,8 @@ const TIPS=[
  'কথোপকথন-বারের "তালিকা" থেকে পুরোনো চ্যাটে ফিরতে পারো, আবার .txt হিসেবে export-ও করা যায়।',
  'সেটিংসের অক্ষরের আকার স্লাইডার দিয়ে চোখের আরাম অনুযায়ী লেখা বড়-ছোট করা যায়।',
  'মাইকে বলতে বলতেই লেখা ঘরে আংশিক লেখা দেখা যাবে — শেষ হলেই নিজে পাঠিয়ে দেবে।',
- 'নরম (চোখের আরাম) থিমটা রাতে চোখের জন্য হালকা — সেটিংসের থিম থেকে বেছে নাও।'];
+ 'নরম (চোখের আরাম) থিমটা রাতে চোখের জন্য হালকা — সেটিংসের থিম থেকে বেছে নাও।',
+ 'বার্তার নিচের 📌 চাপ দিলে সেটা পিন ট্যাবে জমা থাকে — দরকারি উত্তর হারাবে না। সেটিংস থেকে মাঝে মাঝে ব্যাকআপ নিয়ে রাখো।'];
 function buildTipCard(){
  const left=$('leftcol');if(!left)return;
  const card=document.createElement('div');card.className='card';card.id='fe2tipcard';
@@ -6381,9 +6641,189 @@ function buildTipCard(){
  const idx=Math.floor(Date.now()/86400000)%TIPS.length;
  b.textContent=TIPS[idx];card.appendChild(b);
  left.appendChild(card)}
+/* ================= v1.3 fe3: পিন, Wake word, Auto-dim, ব্যাকআপ ================= */
+/* ---------- B: বার্তা pin করা (script-1-এর 📌 বোতাম এখানে ডাকে) ---------- */
+window.fe3PinMessage=async function(d,btn){
+ if(!d)return;
+ const who=d.classList.contains('me')?'me':'sokhi';
+ let idx=parseInt(d.dataset.idx,10);if(isNaN(idx))idx=-1;
+ const text=d._full||'';
+ try{
+  const j=await api('/api/pins',{action:'add',convo_id:(typeof activeId!=='undefined'?activeId:null),idx:idx,who:who,text:text});
+  if(j&&j.ok===false)throw 'bad';
+  if(btn){const old=btn.textContent;btn.textContent='✓ Pin হয়েছে';setTimeout(function(){btn.textContent=old},1400)}
+ }catch(e){setStatus('Pin করা গেল না — আবার চেষ্টা করো')}};
+/* ---------- C: পিন ট্যাব ---------- */
+async function loadPins(){
+ const box=$('fe3pinlist');if(!box)return;
+ try{
+  const j=await api('/api/pins',{action:'list'});
+  const pins=(j&&j.pins)||[];
+  box.innerHTML='';
+  if(!pins.length){const d=document.createElement('div');d.className='small';d.textContent='এখনো কোনো বার্তা pin করোনি — বার্তার নিচের 📌 চাপ দিলে এখানে জমা থাকবে।';box.appendChild(d);return}
+  pins.forEach(function(pin){
+   const row=document.createElement('div');row.className='fe3pinrow';
+   const tx=document.createElement('div');tx.className='tx';
+   const full=String((pin&&pin.text)||'');
+   tx.textContent=full.length>160?full.slice(0,160)+'…':full;
+   const meta=document.createElement('div');meta.className='m';
+   const bits=[];
+   if(pin.title)bits.push(String(pin.title));
+   else if(pin.convo_id)bits.push('কথোপকথন');
+   const dt=fmtDate(pin.ts);if(dt)bits.push(dt);
+   meta.textContent=bits.join(' • ');tx.appendChild(meta);
+   row.appendChild(tx);
+   const open=document.createElement('button');open.textContent='খোলো';open.title='কথোপকথন খোলো';
+   open.addEventListener('click',function(){if(pin.convo_id)switchConvo(pin.convo_id)});
+   row.appendChild(open);
+   const del=document.createElement('button');del.textContent='✕';del.title='Pin তোলো';
+   del.addEventListener('click',async function(){
+    try{await api('/api/pins',{action:'remove',id:pin.id})}catch(e){}
+    loadPins()});
+   row.appendChild(del);
+   box.appendChild(row)})
+ }catch(e){box.innerHTML='';const d=document.createElement('div');d.className='small';d.textContent='Pin তালিকা লোড করা গেল না।';box.appendChild(d)}}
+function buildPinsPane(){
+ const right=$('rightcol');if(!right)return;
+ const tabs=right.querySelector('.tabs');
+ if(tabs){const b=document.createElement('button');b.id='tabbtn-pins';b.textContent='পিন';b.addEventListener('click',function(){fe2Tab('pins')});tabs.appendChild(b)}
+ ['chat','agents','notes','tasks','memory'].forEach(function(n){
+  const b=$('tabbtn-'+n);if(!b)return;
+  b.addEventListener('click',function(){const p=$('pane-pins');if(p)p.classList.remove('on');const pb=$('tabbtn-pins');if(pb)pb.classList.remove('on')})});
+ const pane=document.createElement('div');pane.className='tabpane';pane.id='pane-pins';
+ const scroll=document.createElement('div');scroll.id='fe3pinscroll';
+ const head=document.createElement('div');head.style.cssText='display:flex;gap:6px;align-items:center;margin-bottom:8px';
+ const h=document.createElement('div');h.className='secttl';h.style.flex='1';h.textContent='📌 Pin করা বার্তা';head.appendChild(h);
+ const rb=document.createElement('button');rb.textContent='🔄 রিফ্রেশ';rb.style.fontSize='13px';rb.addEventListener('click',loadPins);head.appendChild(rb);
+ scroll.appendChild(head);
+ const list=document.createElement('div');list.id='fe3pinlist';scroll.appendChild(list);
+ pane.appendChild(scroll);
+ const memPane=$('pane-memory');
+ if(memPane&&memPane.parentNode===right)right.insertBefore(pane,memPane.nextSibling);
+ else{const chatPane=$('pane-chat');if(chatPane&&chatPane.parentNode===right)right.insertBefore(pane,chatPane.nextSibling);else right.appendChild(pane)}}
+/* ---------- F: রাতের Auto-dim ইঞ্জিন ---------- */
+function fe3DimMirror(){
+ try{return JSON.parse(localStorage.getItem('sokhi_dim')||'{}')}catch(e){return {}}}
+window.sokhiDimNow=function(){
+ const dm=fe3DimMirror();
+ if(!dm||!dm.enabled)return false;
+ const s=dm.start||'',e=dm.end||'';
+ if(!s||!e||s===e)return false;
+ const now=new Date(),cur=now.getHours()*60+now.getMinutes();
+ const sm=parseInt(s.split(':')[0],10)*60+(parseInt(s.split(':')[1],10)||0);
+ const em=parseInt(e.split(':')[0],10)*60+(parseInt(e.split(':')[1],10)||0);
+ if(sm<em)return cur>=sm&&cur<em;
+ return cur>=sm||cur<em};
+function fe3DimLevel(){
+ const dm=fe3DimMirror();const lv=parseFloat(dm&&dm.level);
+ return isNaN(lv)?0.6:Math.min(1,Math.max(0.3,lv))}
+function applyDim(){
+ let ov=$('fe3dimoverlay');
+ if(!ov){ov=document.createElement('div');ov.id='fe3dimoverlay';ov.style.cssText='position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;z-index:8500;transition:opacity 1.2s';document.body.appendChild(ov)}
+ ov.style.opacity=window.sokhiDimNow()?String(1-fe3DimLevel()):'0'}
+window.fe3ApplyDim=applyDim;
+function fe3DimLevelLabel(){
+ const el=$('fe3dimlevel');const lbl=$('fe3dimlevelval');if(!el||!lbl)return;
+ const lv=parseFloat(el.value)||0.6;
+ lbl.textContent=(typeof bnDigits==='function'?bnDigits(Math.round(lv*100)):String(Math.round(lv*100)))+'%'}
+async function saveDim(){
+ const on=$('fe3dimon')?$('fe3dimon').checked:false;
+ const st=$('fe3dimstart')?($('fe3dimstart').value||'21:00'):'21:00';
+ const en=$('fe3dimend')?($('fe3dimend').value||'06:00'):'06:00';
+ const lvEl=$('fe3dimlevel');const lv=lvEl?(parseFloat(lvEl.value)||0.6):0.6;
+ try{localStorage.setItem('sokhi_dim',JSON.stringify({enabled:on,start:st,end:en,level:lv}))}catch(e){}
+ try{await api('/api/settings',{dim_start:on?st:'',dim_end:on?en:'',dim_level:lv})}catch(e){}
+ applyDim();
+ setStatus(on?'🌙 Auto-dim সেভ হয়েছে — রাতে স্ক্রিন নিজে ম্লান হবে':'Auto-dim সেভ হয়েছে (বন্ধ আছে)')}
+/* ---------- G: Wake word ইঞ্জিন ---------- */
+let wakeRec=null,wakeOn=false,wakeRestart=null;
+try{wakeOn=localStorage.getItem('sokhi_wake')==='1'}catch(e){}
+function fe3LiveOn(){const b=$('livebtn');return !!(b&&b.classList.contains('on'))}
+function fe3Speaking(){try{return !!speakingNow}catch(e){return false}}
+function startWake(){
+ if(!wakeOn||wakeRec||fe3LiveOn()||fe3Speaking())return;
+ const R=window.SpeechRecognition||window.webkitSpeechRecognition;if(!R)return;
+ let r=null;
+ try{r=new R()}catch(e){return}
+ try{r.lang='bn-BD';r.interimResults=true;r.continuous=true}
+ catch(e){try{r.continuous=false}catch(e2){}}
+ wakeRec=r;
+ r.onresult=function(ev){
+  let txt='';
+  try{for(let i=0;i<ev.results.length;i++)txt+=ev.results[i][0].transcript+' '}catch(err){}
+  if(/সখি|সখী|শখি|sokhi|sakhi/i.test(txt)){
+   stopWake(false);
+   setStatus('👂 ডাক শুনেছি!');
+   if(typeof startLive==='function')startLive();
+   else if(typeof mic==='function')mic()}};
+ r.onend=function(){
+  if(wakeRec!==r)return;wakeRec=null;
+  if(wakeOn&&!fe3LiveOn()&&!fe3Speaking()){clearTimeout(wakeRestart);wakeRestart=setTimeout(startWake,800)}};
+ r.onerror=function(ev){
+  if(ev&&ev.error==='not-allowed'){
+   if(wakeRec===r)wakeRec=null;
+   wakeOn=false;
+   try{localStorage.setItem('sokhi_wake','0')}catch(e){}
+   const wk=$('fe3wake');if(wk)wk.checked=false;
+   try{api('/api/settings',{wake_word:false}).catch(function(){})}catch(e){}
+   setStatus('🔇 Wake word-এর জন্য মাইকের অনুমতি লাগবে');
+   try{r.abort()}catch(e){}
+   return}
+  if(wakeRec!==r)return;wakeRec=null;
+  if(wakeOn&&!fe3LiveOn()&&!fe3Speaking()){clearTimeout(wakeRestart);wakeRestart=setTimeout(startWake,800)}};
+ try{r.start()}catch(e){if(wakeRec===r)wakeRec=null}}
+function stopWake(clearFlag){
+ clearTimeout(wakeRestart);
+ const r=wakeRec;wakeRec=null;
+ if(r){try{r.abort()}catch(e){}}
+ if(clearFlag){wakeOn=false;try{localStorage.setItem('sokhi_wake','0')}catch(e){}}}
+window.fe3StartWake=startWake;
+window.fe3StopWake=stopWake;
+function fe3SetWake(on){
+ wakeOn=!!on;
+ try{localStorage.setItem('sokhi_wake',wakeOn?'1':'0')}catch(e){}
+ try{api('/api/settings',{wake_word:wakeOn}).catch(function(){})}catch(e){}
+ const wk=$('fe3wake');if(wk)wk.checked=wakeOn;
+ if(wakeOn)startWake();else stopWake(false)}
+/* ---------- H: ব্যাকআপ / রিস্টোর / Sync ---------- */
+async function fe3ExportBackup(kind){
+ const msg=$('fe3backupmsg');
+ try{
+  const j=await api('/api/backup',{action:'export',kind:kind});
+  if(!j||!j.ok||!j.bundle)throw 'bad';
+  const blob=new Blob([JSON.stringify(j.bundle,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;
+  a.download=j.filename||(kind==='sync'?'sokhi-sync.json':'sokhi-backup.json');
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(function(){URL.revokeObjectURL(url)},2000);
+  if(msg)msg.textContent='✓ ব্যাকআপ নেওয়া হয়েছে';
+ }catch(e){if(msg)msg.textContent='ব্যাকআপ নেওয়া গেল না — আবার চেষ্টা করো'}}
+async function fe3ImportBackup(file){
+ const msg=$('fe3backupmsg');
+ let bundle=null;
+ try{
+  let text='';
+  if(file.text)text=await file.text();
+  else text=await new Promise(function(res,rej){const rd=new FileReader();rd.onload=function(){res(String(rd.result||''))};rd.onerror=rej;rd.readAsText(file)});
+  bundle=JSON.parse(text);
+ }catch(e){if(msg)msg.textContent='ফাইলটা ঠিকমতো পড়া গেল না।';return}
+ if(!confirm('এই ফাইলের তথ্য দিয়ে বর্তমান কথোপকথন, স্মৃতি ও সেটিংস বদলে যাবে (আগেরটা নিজে থেকে একটা snapshot-এ সেভ থাকবে)। এগোবে?'))return;
+ try{
+  const j=await api('/api/backup',{action:'import',bundle:bundle});
+  if(j&&j.ok){if(msg)msg.textContent='✓ রিস্টোর হয়েছে — পেজ আবার লোড হচ্ছে';setTimeout(function(){location.reload()},800)}
+  else if(msg)msg.textContent=(j&&j.error)?String(j.error):'রিস্টোর করা গেল না — আবার চেষ্টা করো';
+ }catch(e){if(msg)msg.textContent='রিস্টোর করা গেল না — আবার চেষ্টা করো'}}
+/* ---------- fe3 ইঞ্জিন বুট ---------- */
+function buildFe3Engines(){
+ applyDim();
+ setInterval(applyDim,30000);
+ setInterval(function(){if(wakeOn&&!wakeRec&&!fe3LiveOn()&&!fe3Speaking())startWake()},5000);
+ if(wakeOn)setTimeout(startWake,1500)}
 /* ================= বুট ================= */
 buildConvoBar();
 buildMemoryPane();
+buildPinsPane();
 buildSettingsExtras();
 buildFocusButton();
 buildBrainBadge();
@@ -6392,6 +6832,7 @@ buildPalette();
 buildHelp();
 buildOnboarding();
 buildTipCard();
+buildFe3Engines();
 try{if(typeof pin==='function'&&pin())loadActiveIntoChat()}catch(e){}
 })();
 
@@ -6481,7 +6922,7 @@ class Handler(BaseHTTPRequestHandler):
                                "knowledge": len(load_json(KNOW_FILE, {})),
                                "auto_upgrade": bool(get_config().get("auto_self_upgrade", True)),
                                "voice_engine": tts_engine_status(), "voice_rate": _clamp_voice_rate(get_config().get("voice_rate", 1.0)),
-                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
+                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
         if self.path == "/api/memory":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
@@ -6516,7 +6957,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "pin"}, 403)
             _store = convos_load()
             return self._json({"active": _store.get("active"),
-                               "items": [{"id": it.get("id"), "title": it.get("title", ""),
+                               "items": [{"id": it.get("id"), "title": it.get("title", ""), "pinned": bool(it.get("pinned")),
                                           "updated": it.get("updated", 0),
                                           "count": len(it.get("messages", []))}
                                          for it in _store.get("items", [])
@@ -6524,7 +6965,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback"):
+        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback", "/api/pins", "/api/backup"):
             return self._json({"error": "not found"}, 404)
         if not self._pin_ok():
             return self._json({"error": "pin"}, 403)
@@ -6567,6 +7008,40 @@ class Handler(BaseHTTPRequestHandler):
                         cfg[_qk] = _qv
                 save_config(cfg)
                 return self._json({"ok": True, "quiet_start": cfg.get("quiet_start", ""), "quiet_end": cfg.get("quiet_end", "")})
+            if "reply_language" in data:
+                _rl = str(data.get("reply_language") or "").strip()
+                if _rl not in ("বাংলা", "Banglish", "English"):
+                    return self._json({"ok": False, "error": "উত্তরের ভাষা হতে হবে: বাংলা, Banglish বা English।"})
+                cfg = get_config(); cfg["reply_language"] = _rl; save_config(cfg)
+                return self._json({"ok": True, "reply_language": _rl})
+            if "wake_word" in data:
+                cfg = get_config(); cfg["wake_word"] = bool(data.get("wake_word")); save_config(cfg)
+                return self._json({"ok": True, "wake_word": cfg["wake_word"]})
+            if "dim_start" in data or "dim_end" in data:
+                cfg = get_config()
+                for _dk in ("dim_start", "dim_end"):
+                    if _dk in data:
+                        _dv = str(data.get(_dk) or "").strip()
+                        if _dv and not re.match(r"^\d{2}:\d{2}$", _dv):
+                            return self._json({"ok": False, "error": "সময়টা HH:MM আকারে দাও, যেমন 23:00।"})
+                        cfg[_dk] = _dv
+                # the settings page sends dim_level in the SAME request —
+                # handle it here too or it would be dropped by this return.
+                if "dim_level" in data:
+                    try:
+                        cfg["dim_level"] = max(0.3, min(1.0, float(data.get("dim_level"))))
+                    except Exception:
+                        return self._json({"ok": False, "error": "dim_level সংখ্যা হতে হবে (0.3–1.0)।"})
+                save_config(cfg)
+                return self._json({"ok": True, "dim_start": cfg.get("dim_start", ""), "dim_end": cfg.get("dim_end", ""), "dim_level": cfg.get("dim_level", 0.6)})
+            if "dim_level" in data:
+                try:
+                    _dl = float(data.get("dim_level"))
+                except Exception:
+                    return self._json({"ok": False, "error": "dim_level সংখ্যা হতে হবে (0.3–1.0)।"})
+                _dl = max(0.3, min(1.0, _dl))
+                cfg = get_config(); cfg["dim_level"] = _dl; save_config(cfg)
+                return self._json({"ok": True, "dim_level": _dl})
             preset = str(data.get("tts_preset") or "")
             presets = {"মিষ্টি": ("-3%", "+4%"), "স্বাভাবিক": ("0%", "+1%"), "প্রাণবন্ত": ("+5%", "+5%")}
             if preset in presets:
@@ -6644,6 +7119,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(memory_api(data))
         if self.path == "/api/feedback":
             return self._json(feedback_api(data))
+        if self.path == "/api/pins":
+            return self._json(pins_api(data))
+        if self.path == "/api/backup":
+            return self._json(backup_api(data))
         if self.path == "/api/whiteboard":
             if data.get("action") == "clear":
                 wb_clear()
@@ -6759,7 +7238,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 
 def main():
@@ -6808,6 +7287,8 @@ def main():
         register_capability("pro-v12", "Professional & Comfortable: একাধিক কথোপকথন, regenerate, স্মৃতি-দর্শক, ছবি-প্রশ্ন, উত্তর-দৈর্ঘ্য পছন্দ")
         log_change("আপগ্রেড: v1.2.0 — একাধিক কথোপকথন ও খোঁজা/নাম বদল/মোছা, আবার উত্তর (regenerate), বার্তা edit-resend (truncate), স্মৃতি দেখা/মোছা/যোগ, ছবি পাঠিয়ে প্রশ্ন (Gemini vision), উত্তর-দৈর্ঘ্য পছন্দ ও quiet hours সেটিং, উত্তর রেটিং সেভ")
         log_change(f"আপগ্রেড: v{APP_VERSION} — professional UI polish + স্থির গ্রিড/প্যানেল-স্ক্রল/auto-scroll, গলার গতি ঠিক (preset পুনঃসামঞ্জস্য + মোট slowdown cap −12% + গতি স্লাইডার) ও Edge নির্ভরযোগ্যতা, reply দ্রুত (fast-first মডেল + timeout 12s + daily-release background-এ), F1–F8/N10/N11 পূর্ণ রূপ, bridge Desktop প্রোটোকল")
+        register_capability("v13-parked", "ভাষা পছন্দ (বাংলা/Banglish/English), বার্তা ও কথোপকথন pin, backup/restore, wake word, রাতের auto-dim, sync ফাইল")
+        log_change("আপগ্রেড: v1.3.0 — parked ৬টি: উত্তরের ভাষা পছন্দ, pin (বার্তা + কথোপকথন), সব কথোপকথন backup/restore, wake word 'Sokhi', রাতের auto-dim, বহু-ডিভাইস sync (ফাইল-ভিত্তিক)")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
