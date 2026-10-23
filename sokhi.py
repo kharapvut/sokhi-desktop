@@ -151,6 +151,9 @@ def get_config():
     cfg.setdefault("update_url", "")
     cfg.setdefault("tts_voice", "bn-BD-NabanitaNeural")
     cfg.setdefault("browser_voice", "")
+    cfg.setdefault("tts_engine", "edge")
+    cfg.setdefault("gemini_voice", "Aoede")
+    cfg.setdefault("gemini_tts_model", "gemini-2.5-flash-preview-tts")
     cfg.setdefault("call_name", "")
     cfg.setdefault("tts_preset", "মিষ্টি")
     cfg.setdefault("tts_rate", "-3%")
@@ -180,11 +183,12 @@ def save_config(cfg):
 TTS_VOICE_WHITELIST = {
     "bn-BD-NabanitaNeural": "নাবনিতা (নারী কণ্ঠ)",
     "bn-BD-PradeepNeural": "প্রদীপ (পুরুষ কণ্ঠ)",
+    "bn-IN-TanishaaNeural": "তানিশা (নারী কণ্ঠ)",
 }
 
 BROWSER_VOICE_MAX_LEN = 120
 
-TTS_VOICE_ERROR = "গলা বাছাই করা গেল না — শুধু নাবনিতা বা প্রদীপ গলা বেছে নাও।"
+TTS_VOICE_ERROR = "গলা বাছাই করা গেল না — শুধু নাবনিতা, প্রদীপ বা তানিশা গলা বেছে নাও।"
 BROWSER_VOICE_TYPE_ERROR = "ব্রাউজারের গলার নাম ঠিকমতো আসেনি — আবার বেছে নাও।"
 BROWSER_VOICE_LEN_ERROR = "ব্রাউজারের গলার নাম বেশি লম্বা — আবার বেছে নাও।"
 
@@ -220,6 +224,47 @@ def validate_browser_voice(v):
     if len(v) > BROWSER_VOICE_MAX_LEN:
         return (False, BROWSER_VOICE_LEN_ERROR)
     return (True, v)
+
+
+TTS_ENGINE_CHOICES = ("edge", "gemini", "browser")
+TTS_ENGINE_ERROR = "কণ্ঠের ইঞ্জিন বাছাই করা গেল না — edge, gemini বা browser-এর একটা বেছে নাও।"
+
+GEMINI_TTS_VOICES = {
+    "Aoede": "আওয়েদে (উষ্ণ নারী কণ্ঠ)",
+    "Kore": "কোরে (নারী কণ্ঠ)",
+    "Leda": "লেডা (নারী কণ্ঠ)",
+    "Callirrhoe": "ক্যালিরো (নারী কণ্ঠ)",
+    "Puck": "পাক (পুরুষ কণ্ঠ)",
+}
+GEMINI_VOICE_ERROR = "Gemini গলা বাছাই করা গেল না — তালিকার গলাগুলো থেকেই একটা বেছে নাও।"
+
+
+def validate_tts_engine(v):
+    """TTS ইঞ্জিন যাচাই (v1.9.2)। ইনপুট: settings POST-এর data["tts_engine"]।
+
+    শুধু হুবহু "edge"/"gemini"/"browser" বৈধ (কোনো case-folding নয়)।
+    Returns (True, v) অথবা (False, plain-Bangla error)।
+    Pure function: কোনো I/O নেই, exception ছোঁড়ে না।
+    """
+    if not isinstance(v, str):
+        return (False, TTS_ENGINE_ERROR)
+    if v in TTS_ENGINE_CHOICES:
+        return (True, v)
+    return (False, TTS_ENGINE_ERROR)
+
+
+def validate_gemini_voice(v):
+    """Gemini TTS গলার নাম যাচাই (v1.9.2)। ইনপুট: data["gemini_voice"]।
+
+    validate_tts_voice-এর মতোই হুবহু whitelist মিল লাগবে — Gemini-র
+    voice name case-sensitive।
+    Returns (True, v) অথবা (False, plain-Bangla error)। Pure function।
+    """
+    if not isinstance(v, str):
+        return (False, GEMINI_VOICE_ERROR)
+    if v in GEMINI_TTS_VOICES:
+        return (True, v)
+    return (False, GEMINI_VOICE_ERROR)
 
 
 def get_memory():
@@ -8124,7 +8169,7 @@ def mastery_answer(text):
 # start-sokhi.bat installs it in the background on first run. If it is
 # not there, this returns None and the browser's own voice is used.
 
-VOICE_STATE = {"engine": "", "error": ""}
+VOICE_STATE = {"engine": "", "error": "", "note": ""}
 
 _EDGE_INSTALL_FLAG = DATA / ".edge-tts-install-tried"
 _edge_install_started = False
@@ -8207,19 +8252,53 @@ def voice_identity(rate=None, pitch=None, cfg=None):
 
 
 def tts_engine_status():
-    """Human-readable state of the voice engine, from edge-tts
-    availability + the cached result of the last TTS attempt."""
-    ident = voice_identity()
+    """কণ্ঠের অবস্থা — কোন ইঞ্জিন + কোন গলা শেষবার বলেছে (বা বলবে),
+    পরিষ্কার বাংলায়, যাতে নিজে যাচাই করা যায় নীরবে ব্রাউজার-ফলব্যাকে
+    আছি কিনা। Gemini ফলব্যাকের নোট থাকলে শেষে যোগ হয়।"""
+    cfg = get_config()
+    pref = (cfg.get("tts_engine") or "edge").strip().lower()
+    ident = voice_identity(cfg=cfg)
     last = VOICE_STATE.get("engine", "")
-    if last == "edge-নাবনিতা":
-        return f"Edge — {ident['voice']} (আসল গলা)"
-    if last == "google-বাংলা":
-        return "Google fallback — Edge পাওয়া যাচ্ছে না"
-    if VOICE_STATE.get("error"):
-        return "Browser voice (শেষ আশ্রয়)"
-    if _edge_available():
-        return f"Edge — {ident['voice']} (আসল গলা)"
-    return "Google fallback — Edge পাওয়া যাচ্ছে না"
+    gvoice = cfg.get("gemini_voice") or "Aoede"
+    if gvoice not in GEMINI_TTS_VOICES:
+        gvoice = "Aoede"
+    if last == "gemini":
+        s = f"Gemini কণ্ঠ — {gvoice} (শেষবার এই গলাতেই বলেছি)"
+    elif last == "edge-নাবনিতা":
+        s = f"Edge — {ident['voice']} (আসল গলা)"
+    elif last == "google-বাংলা":
+        s = "Google fallback — Edge পাওয়া যাচ্ছে না"
+    elif last == "browser":
+        s = "ব্রাউজারের গলা (ডিভাইসের নিজের কণ্ঠ — শেষবার এটাই বলেছে)"
+    elif pref == "gemini":
+        if (cfg.get("gemini_api_key") or "").strip():
+            s = f"Gemini কণ্ঠ — {gvoice} (বেছে দেওয়া; এই সেশনে এখনো বলেনি)"
+        else:
+            s = (f"Gemini কণ্ঠ — {gvoice} বেছে দেওয়া, কিন্তু Gemini key "
+                 "বসানো নেই — Edge/Google গলা চলবে")
+    elif pref == "browser":
+        s = "ব্রাউজারের গলা (বেছে দেওয়া — ডিভাইসের নিজের কণ্ঠ)"
+    elif VOICE_STATE.get("error"):
+        s = "Browser voice (শেষ আশ্রয়)"
+    elif _edge_available():
+        s = f"Edge — {ident['voice']} (আসল গলা)"
+    else:
+        s = "Google fallback — Edge পাওয়া যাচ্ছে না"
+    _last_family = {"gemini": "gemini", "edge-নাবনিতা": "edge",
+                    "google-বাংলা": "edge", "browser": "browser"}.get(last, "")
+    if _last_family and _last_family != pref:
+        if pref == "gemini":
+            s += (f"; এখন বেছে দেওয়া: Gemini কণ্ঠ — {gvoice}"
+                  + ("" if (cfg.get("gemini_api_key") or "").strip()
+                     else " (কিন্তু key নেই — Edge/Google চলবে)"))
+        elif pref == "browser":
+            s += "; এখন বেছে দেওয়া: ব্রাউজারের গলা"
+        else:
+            s += f"; এখন বেছে দেওয়া: Edge — {ident['voice']}"
+    _note = (VOICE_STATE.get("note") or "").strip()
+    if _note:
+        s += " ⚠️ " + _note
+    return s
 
 
 def _tts_edge(text, out_file, rate=None, pitch=None):
@@ -8274,34 +8353,210 @@ def _tts_google(text, out_file, rate=None, pitch=None):
     return True
 
 
+# ------------------------------------------------- Gemini TTS (v1.9.2)
+# Gemini-র নিজের কণ্ঠ — এই মুহূর্তে সবচেয়ে প্রাণবন্ত ফ্রি পথ। চ্যাটের
+# মাথার একই ফ্রি Gemini key দিয়ে চলে (আলাদা key লাগে না)। API কাঁচা
+# PCM (16-bit, 24 kHz, mono) দেয় — stdlib wave দিয়ে WAV বানিয়ে অন্য
+# ইঞ্জিনের মতোই ফাইল ফেরত দেওয়া হয়, তাই পেজের speak() পথ আর v1.9.1
+# echo guard হুবহু একই থাকে।
+# সৎ সীমা: Gemini TTS rate/pitch প্যারামিটার নেয় না — গতি স্লাইডার
+# শুধু Edge/Google-এ কাজ করে; Gemini-র গতি/ভাব কণ্ঠের নিজের ধরনে থাকে।
+
+GEMINI_TTS_MODEL_DEFAULT = "gemini-2.5-flash-preview-tts"
+GEMINI_TTS_SAMPLE_RATE = 24000
+
+# ফলব্যাক-নোট (VOICE_STATE["note"]-এ থাকে): engine=gemini বেছে দেওয়া
+# থাকলেও key না থাকলে / API সাড়া না দিলে নোটটা status লাইন আর
+# ডাক্তার-রিপোর্টে দেখা যায় — চ্যাটে বারবার আসে না। Gemini সফল হলেই
+# নোট মোছে যায়।
+_GEMINI_TTS_NOTE_NOKEY = ("Gemini কণ্ঠ বেছে দেওয়া আছে, কিন্তু Gemini key বসানো নেই — "
+                          "আপাতত অন্য গলায় বলছি। Settings-এ ফ্রি Gemini key বসালেই Gemini কণ্ঠ চলবে।")
+
+
+def _gemini_tts_note_fail(winner_label):
+    return ("Gemini কণ্ঠ এখন সাড়া দিচ্ছে না — আপাতত " + winner_label +
+            " গলায় বলছি। পরের বার নিজে থেকেই আবার Gemini চেষ্টা করব।")
+
+
+def _tts_gemini(text, out_file, rate=None, pitch=None):
+    # rate/pitch এখানে ইচ্ছে করেই ব্যবহার হয় না (উপরের সৎ সীমা দেখো)।
+    # সফল হলে out_file-এ বৈধ WAV লিখে True; নইলে RuntimeError —
+    # make_tts_audio তখন পরের ইঞ্জিনে নামে। key কখনো error-এ যায় না:
+    # key শুধু header-এ থাকে, URL/body/log-এ নয়।
+    import base64
+    import wave
+    cfg = get_config()
+    key = (cfg.get("gemini_api_key") or "").strip()
+    if not key:
+        raise RuntimeError("Gemini key বসানো নেই")
+    voice = cfg.get("gemini_voice") or "Aoede"
+    if voice not in GEMINI_TTS_VOICES:
+        voice = "Aoede"
+    model = (cfg.get("gemini_tts_model") or GEMINI_TTS_MODEL_DEFAULT).strip() \
+        or GEMINI_TTS_MODEL_DEFAULT
+    body = {
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice}}}},
+    }
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent")
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": key},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        detail = str(e)
+        try:
+            if hasattr(e, "read"):
+                detail += " " + e.read().decode("utf-8", errors="ignore")[:200]
+        except Exception:
+            pass
+        raise RuntimeError("Gemini কণ্ঠ: " + detail[:250])
+    b64 = ""
+    try:
+        for _p in data["candidates"][0]["content"]["parts"]:
+            _in = _p.get("inlineData") or _p.get("inline_data") or {}
+            if _in.get("data"):
+                b64 = _in["data"]
+                break
+    except Exception:
+        b64 = ""
+    if not b64:
+        raise RuntimeError("Gemini কণ্ঠ খালি সাড়া দিল (অডিও পাইনি)")
+    try:
+        pcm = base64.b64decode(b64)
+    except Exception:
+        raise RuntimeError("Gemini কণ্ঠের অডিও পড়া গেল না")
+    if len(pcm) < 2000:
+        raise RuntimeError("Gemini কণ্ঠ ছোট/খালি অডিও দিল")
+    with wave.open(str(out_file), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(GEMINI_TTS_SAMPLE_RATE)
+        w.writeframes(pcm)
+    return True
+
+
 def make_tts_audio(text, rate=None, pitch=None):
     # One call = one text = one request per engine (no server-side
     # chunking — short replies are never split; the 600-char cap is a
     # safety trim only, and the page's own chunking is a client concern).
     # `rate` = mood adjustment (JS moodRate); voice_identity() folds it
-    # into the final clamped rate/pitch used by BOTH engines.
+    # into the final clamped rate/pitch used by the Edge/Google engines
+    # (Gemini TTS rate/pitch নেয় না — _tts_gemini-র নোট দেখো).
+    #
+    # v1.9.2: engine পছন্দ (cfg tts_engine) —
+    #   "gemini" : Gemini কণ্ঠ আগে (ক্যাশ, তারপর live); key না থাকলে /
+    #              API ব্যর্থ হলে Edge → Google চেইনে নামে আর
+    #              VOICE_STATE["note"]-এ সৎ বাংলা নোট থাকে (status
+    #              লাইন + ডাক্তারে দেখা যায়; Gemini সফল হলে মোছে)।
+    #   "edge"   : আগের আচরণ (Edge → Google, একই fallback order)।
+    #   "browser": সার্ভার অডিও বানায় না — None ফেরত যায়; /api/tts
+    #              তখন HTTP 500 দেয়, পেজ নিজের speechSynthesis
+    #              গলায় বলে (ডিভাইসের কণ্ঠ)।
+    # ক্যাশ ইঞ্জিনভেদে আলাদা ফাইল (Gemini=.wav, বাকিরা=.mp3), হ্যাশে
+    # ইঞ্জিন + গলার নাম থাকে — ইঞ্জিন/গলা বদলালে পুরোনো ফাইল মিলবে না।
     import hashlib
     text = (text or "").strip()[:600]
     if not text:
         return None
+    cfg = get_config()
+    pref = (cfg.get("tts_engine") or "edge").strip().lower()
+    if pref not in ("edge", "gemini", "browser"):
+        pref = "edge"
+    ident = voice_identity(rate, pitch, cfg)
+    if pref == "browser":
+        VOICE_STATE.update(engine="browser", error="", note="",
+                           rate=ident["rate"], pitch=ident["pitch"])
+        return None
     TTS_CACHE.mkdir(parents=True, exist_ok=True)
-    ident = voice_identity(rate, pitch)
     if not _edge_available():
         ensure_edge_tts()
-    h = hashlib.md5(("v4|" + ident["voice"] + "|" + ident["rate"] + "|" + ident["pitch"] + "|" + text).encode("utf-8")).hexdigest()
-    out_file = TTS_CACHE / f"{h}.mp3"
-    if out_file.exists() and out_file.stat().st_size > 1000:
-        VOICE_STATE.update(engine=VOICE_STATE.get("engine", ""), rate=ident["rate"], pitch=ident["pitch"])
-        return out_file
-    errors = []
-    for engine, fn in (("edge-নাবনিতা", _tts_edge), ("google-বাংলা", _tts_google)):
+    gvoice = cfg.get("gemini_voice") or "Aoede"
+    if gvoice not in GEMINI_TTS_VOICES:
+        gvoice = "Aoede"
+
+    def _cache_file(engine_id, ext, vlabel):
+        h = hashlib.md5(("v5|" + engine_id + "|" + vlabel + "|" +
+                         ident["rate"] + "|" + ident["pitch"] + "|" +
+                         text).encode("utf-8")).hexdigest()
+        return TTS_CACHE / f"{h}{ext}"
+
+    def _hit(engine_id, ext, vlabel):
+        f = _cache_file(engine_id, ext, vlabel)
+        if f.exists() and f.stat().st_size > 1000:
+            return f
+        return None
+
+    def _drop(engine_id, ext, vlabel):
         try:
-            if fn(text, out_file, ident["rate"], ident["pitch"]):
-                VOICE_STATE.update(engine=engine, error="", rate=ident["rate"], pitch=ident["pitch"])
-                return out_file
-        except Exception as e:
-            errors.append(str(e))
+            f = _cache_file(engine_id, ext, vlabel)
+            if f.exists():
+                f.unlink()
+        except Exception:
+            pass
+
+    errors = []
+    winner = ""
+    winner_file = None
+
+    # ধাপ ১: Gemini — শুধু বেছে দেওয়া থাকলে (ক্যাশ, তারপর live)।
+    if pref == "gemini":
+        f = _hit("gemini", ".wav", gvoice)
+        if f:
+            winner, winner_file = "gemini", f
+        else:
+            try:
+                out_file = _cache_file("gemini", ".wav", gvoice)
+                if _tts_gemini(text, out_file, ident["rate"], ident["pitch"]):
+                    winner, winner_file = "gemini", out_file
+            except Exception as e:
+                errors.append(str(e))
+                _drop("gemini", ".wav", gvoice)
+
+    # ধাপ ২: Edge → Google — ক্যাশ আগে, তারপর live (আগের ক্রমই)।
+    if not winner:
+        for engine_id, fn in (("edge-নাবনিতা", _tts_edge),
+                              ("google-বাংলা", _tts_google)):
+            f = _hit(engine_id, ".mp3", ident["voice"])
+            if f:
+                winner, winner_file = engine_id, f
+                break
+            try:
+                out_file = _cache_file(engine_id, ".mp3", ident["voice"])
+                if fn(text, out_file, ident["rate"], ident["pitch"]):
+                    winner, winner_file = engine_id, out_file
+                    break
+            except Exception as e:
+                errors.append(str(e))
+                _drop(engine_id, ".mp3", ident["voice"])
+
+    if winner:
+        VOICE_STATE.update(engine=winner, error="",
+                           rate=ident["rate"], pitch=ident["pitch"])
+        if winner == "gemini" or pref != "gemini":
+            VOICE_STATE["note"] = ""
+        else:
+            _label = "Edge" if winner == "edge-নাবনিতা" else "Google"
+            VOICE_STATE["note"] = (
+                _GEMINI_TTS_NOTE_NOKEY
+                if not (cfg.get("gemini_api_key") or "").strip()
+                else _gemini_tts_note_fail(_label))
+        return winner_file
+
     VOICE_STATE.update(engine="", error=" | ".join(errors)[:300])
+    if pref == "gemini":
+        VOICE_STATE["note"] = (
+            _GEMINI_TTS_NOTE_NOKEY
+            if not (cfg.get("gemini_api_key") or "").strip()
+            else _gemini_tts_note_fail("ব্রাউজারের"))
     try:
         (DATA / "voice-error.log").write_text(
             f"{datetime.now().isoformat(timespec='seconds')}\n" + VOICE_STATE["error"],
@@ -9519,7 +9774,8 @@ _BACKUP_CONFIG_KEYS = ("city", "tts_voice", "tts_preset", "tts_rate",
                        "reply_language", "quiet_start", "quiet_end",
                        "dim_start", "dim_end", "dim_level", "wake_word", "echo_guard",
                        "update_url", "auto_self_upgrade", "bridge_enabled",
-                       "computer_use_enabled", "away_mode", "gemini_model")
+                       "computer_use_enabled", "away_mode", "gemini_model",
+                       "tts_engine", "gemini_voice")
 
 
 def backup_api(data):
@@ -9978,11 +10234,25 @@ def doctor_report():
     except Exception:
         _vstat = ""
     _verr = (VOICE_STATE.get("error") or "").strip()
-    _add("গলা (Edge TTS)", bool(_edge and not _verr),
-         f"অবস্থা: {_vstat}"
-         + (f"; শেষ গলার ত্রুটি: {_verr[:120]}" if _verr else ""),
-         "edge-tts না থাকলে ব্রাউজারের গলা চলবে। Sokhi আবার চালু করলে "
-         "সে নিজে edge-tts বসানোর চেষ্টা করে।")
+    _vnote = (VOICE_STATE.get("note") or "").strip()
+    _tpref = (get_config().get("tts_engine") or "edge").strip().lower()
+    if _tpref == "browser":
+        _add("গলা (TTS ইঞ্জিন)", True,
+             f"বেছে দেওয়া ইঞ্জিন: ব্রাউজারের গলা। অবস্থা: {_vstat}")
+    elif _tpref == "gemini" and not _key_set:
+        _add("গলা (TTS ইঞ্জিন)", False,
+             "বেছে দেওয়া ইঞ্জিন: Gemini কণ্ঠ, কিন্তু Gemini key বসানো "
+             "নেই — তাই এখন Edge/Google/ব্রাউজার গলায় বলছি।"
+             + (f" নোট: {_vnote}" if _vnote else ""),
+             "Settings থেকে ফ্রি Gemini key বসালেই Gemini কণ্ঠ চলবে; "
+             "না চাইলে কণ্ঠের ইঞ্জিন Edge করে দাও।")
+    else:
+        _add("গলা (TTS ইঞ্জিন)", bool((_edge or _tpref == "gemini") and not _verr),
+             f"বেছে দেওয়া ইঞ্জিন: {_tpref}। অবস্থা: {_vstat}"
+             + (f"; শেষ গলার ত্রুটি: {_verr[:120]}" if _verr else "")
+             + (f"; নোট: {_vnote}" if _vnote else ""),
+             "edge-tts না থাকলে ব্রাউজারের গলা চলবে। Sokhi আবার চালু করলে "
+             "সে নিজে edge-tts বসানোর চেষ্টা করে।")
     try:
         _du = shutil.disk_usage(BASE)
         _free_gb = _du.free / (1024 ** 3)
@@ -14716,6 +14986,8 @@ function populateBrowserVoices(){
 async function fe8LoadVoices(){
  try{const s=await apiGet('/api/status');if(!s)return;
   if(s.tts_voice){const ev=$('fe8edgevoice');if(ev)ev.value=s.tts_voice}
+  if(s.tts_engine){const ge=$('fe8engine');if(ge)ge.value=s.tts_engine}
+  if(s.gemini_voice){const gv=$('fe8gemvoice');if(gv)gv.value=s.gemini_voice}
   window.browserVoiceName=s.browser_voice||'';
   populateBrowserVoices();
   const bs=$('fe8browser');if(bs&&window.browserVoiceName)bs.value=window.browserVoiceName;
@@ -14741,12 +15013,16 @@ function buildSettingsV18Voice(){
  const box=document.createElement('div');box.id='fe8settings';
  box.innerHTML=
   '<hr><div class="secttl">🗣️ কণ্ঠ বাছাই</div>'+
+  '<div style="font-size:13px;margin-top:6px">কণ্ঠের ইঞ্জিন: '+
+  '<select id="fe8engine"><option value="edge">Edge (মাইক্রোসফটের গলা)</option><option value="gemini">Gemini (সবচেয়ে প্রাণবন্ত — ফ্রি key লাগবে)</option><option value="browser">ব্রাউজারের গলা (ডিভাইসের নিজের)</option></select></div>'+
+  '<div style="font-size:13px;margin-top:6px">Gemini গলা: '+
+  '<select id="fe8gemvoice"><option value="Aoede">আওয়েদে (উষ্ণ নারী কণ্ঠ)</option><option value="Kore">কোরে (নারী কণ্ঠ)</option><option value="Leda">লেডা (নারী কণ্ঠ)</option><option value="Callirrhoe">ক্যালিরো (নারী কণ্ঠ)</option><option value="Puck">পাক (পুরুষ কণ্ঠ)</option></select></div>'+
   '<div style="font-size:13px;margin-top:6px">Edge গলা: '+
-  '<select id="fe8edgevoice"><option value="bn-BD-NabanitaNeural">নাবনিতা (নারী কণ্ঠ)</option><option value="bn-BD-PradeepNeural">প্রদীপ (পুরুষ কণ্ঠ)</option></select></div>'+
+  '<select id="fe8edgevoice"><option value="bn-BD-NabanitaNeural">নাবনিতা (নারী কণ্ঠ)</option><option value="bn-BD-PradeepNeural">প্রদীপ (পুরুষ কণ্ঠ)</option><option value="bn-IN-TanishaaNeural">তানিশা (নারী কণ্ঠ)</option></select></div>'+
   '<div style="font-size:13px;margin-top:6px">ব্রাউজারের গলা: '+
   '<select id="fe8browser"><option value="">স্বয়ংক্রিয় (ডিভাইসের সেরা বাংলা গলা)</option></select></div>'+
   '<div style="margin-top:8px"><button id="fe8voicetest" type="button">কণ্ঠ পরীক্ষা</button> <span id="fe8voicemsg" class="small"></span></div>'+
-  '<div class="hint">Edge গলা ইন্টারনেটে তৈরি হয়; ব্রাউজারের গলা ডিভাইসের নিজের। গলার গতি আগের স্লাইডারেই বদলায়।</div>';
+  '<div class="hint">Gemini কণ্ঠে চ্যাটের একই ফ্রি Gemini key লাগে; key না থাকলে বা Gemini সাড়া না দিলে নিজে থেকে Edge গলায় বলবে আর status-এ জানিয়ে দেবে। Edge গলা ইন্টারনেটে তৈরি হয়; ব্রাউজারের গলা ডিভাইসের নিজের। গলার গতি আগের স্লাইডারেই বদলায় (Gemini কণ্ঠে গতি স্লাইডার কাজ করে না)।</div>';
  if(closeBtn)panel.insertBefore(box,closeBtn);else panel.appendChild(box);
  const ev=$('fe8edgevoice');
  if(ev)ev.addEventListener('change',async function(){
@@ -14762,6 +15038,20 @@ function buildSettingsV18Voice(){
   try{const j=await api('/api/settings',{browser_voice:bs.value});
    if(j&&j.ok){if(msg)msg.textContent=bs.value?'✅ ব্রাউজারের গলা সেভ হয়েছে':'✅ ব্রাউজারের গলা স্বয়ংক্রিয় রাখা হয়েছে'}
    else{if(msg)msg.textContent='❌ '+(j&&j.error?j.error:'সেভ হয়নি')}
+  }catch(e){if(msg)msg.textContent='❌ সেভ হয়নি — আবার চেষ্টা করো'}});
+ const ge=$('fe8engine');
+ if(ge)ge.addEventListener('change',async function(){
+  const msg=$('fe8voicemsg');
+  try{const j=await api('/api/settings',{tts_engine:ge.value});
+   if(j&&j.ok){if(msg)msg.textContent='✅ কণ্ঠের ইঞ্জিন সেভ হয়েছে'}
+   else{if(msg)msg.textContent='❌ '+(j&&j.error?j.error:'সেভ হয়নি');fe8LoadVoices()}
+  }catch(e){if(msg)msg.textContent='❌ সেভ হয়নি — আবার চেষ্টা করো'}});
+ const gv=$('fe8gemvoice');
+ if(gv)gv.addEventListener('change',async function(){
+  const msg=$('fe8voicemsg');
+  try{const j=await api('/api/settings',{gemini_voice:gv.value});
+   if(j&&j.ok){if(msg)msg.textContent='✅ Gemini গলা সেভ হয়েছে'}
+   else{if(msg)msg.textContent='❌ '+(j&&j.error?j.error:'সেভ হয়নি');fe8LoadVoices()}
   }catch(e){if(msg)msg.textContent='❌ সেভ হয়নি — আবার চেষ্টা করো'}});
  const tb=$('fe8voicetest');
  if(tb)tb.addEventListener('click',function(){fe8TestVoice()});
@@ -15251,7 +15541,7 @@ class Handler(BaseHTTPRequestHandler):
                                "knowledge": len(load_json(KNOW_FILE, {})),
                                "auto_upgrade": bool(get_config().get("auto_self_upgrade", True)),
                                "voice_engine": tts_engine_status(), "voice_rate": _clamp_voice_rate(get_config().get("voice_rate", 1.0)),
-                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "echo_guard": bool(get_config().get("echo_guard", True)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
+                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "tts_engine": get_config().get("tts_engine", "edge"), "gemini_voice": get_config().get("gemini_voice", "Aoede"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "echo_guard": bool(get_config().get("echo_guard", True)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
         if self.path == "/api/memory":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
@@ -15335,17 +15625,22 @@ class Handler(BaseHTTPRequestHandler):
             data = {}
         if self.path == "/api/tts_test":
             ensure_edge_tts()
+            _tpref = (get_config().get("tts_engine") or "edge").strip().lower()
+            if _tpref == "browser":
+                return self._json({"ok": True, "engine": "browser", "voice_engine": tts_engine_status(), "voice": get_config().get("browser_voice", ""), "note": "ব্রাউজারের গলা বেছে দেওয়া — টেস্টের শব্দ ব্রাউজার থেকেই আসবে"})
             audio = make_tts_audio("আসসালামু আলাইকুম, আমি সখী।")
             if audio:
-                return self._json({"ok": True, "engine": VOICE_STATE.get("engine", ""), "voice_engine": tts_engine_status(), "voice": voice_identity()["voice"], "rate": VOICE_STATE.get("rate", ""), "pitch": VOICE_STATE.get("pitch", "")})
-            return self._json({"ok": False, "engine": VOICE_STATE.get("engine", ""), "voice_engine": tts_engine_status(), "error": VOICE_STATE.get("error", "অজানা সমস্যা")})
+                _eng = VOICE_STATE.get("engine", "")
+                _vce = (get_config().get("gemini_voice") or "Aoede") if _eng == "gemini" else voice_identity()["voice"]
+                return self._json({"ok": True, "engine": _eng, "voice_engine": tts_engine_status(), "voice": _vce, "rate": VOICE_STATE.get("rate", ""), "pitch": VOICE_STATE.get("pitch", ""), "note": VOICE_STATE.get("note", "")})
+            return self._json({"ok": False, "engine": VOICE_STATE.get("engine", ""), "voice_engine": tts_engine_status(), "error": VOICE_STATE.get("error", "অজানা সমস্যা"), "note": VOICE_STATE.get("note", "")})
         if self.path == "/api/tts":
             audio = make_tts_audio(str(data.get("text") or ""), data.get("rate") or None, data.get("pitch") or None)
             if not audio:
-                return self._json({"ok": False, "error": "edge-tts নেই — ব্রাউজারের গলা চলবে"})
+                return self._json({"ok": False, "error": "সার্ভারের গলা আসেনি — ব্রাউজারের গলা চলবে", "note": VOICE_STATE.get("note", "")}, 500)
             body_bytes = audio.read_bytes()
             self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Type", "audio/wav" if audio.suffix == ".wav" else "audio/mpeg")
             self.send_header("Content-Length", str(len(body_bytes)))
             self.end_headers()
             self.wfile.write(body_bytes)
@@ -15446,6 +15741,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": _res})
                 cfg = get_config(); cfg["browser_voice"] = _res; save_config(cfg)
                 return self._json({"ok": True, "browser_voice": _res})
+            if "tts_engine" in data:
+                _ok, _res = validate_tts_engine(data.get("tts_engine"))
+                if not _ok:
+                    return self._json({"ok": False, "error": _res})
+                cfg = get_config(); cfg["tts_engine"] = _res; save_config(cfg)
+                return self._json({"ok": True, "tts_engine": _res})
+            if "gemini_voice" in data:
+                _ok, _res = validate_gemini_voice(data.get("gemini_voice"))
+                if not _ok:
+                    return self._json({"ok": False, "error": _res})
+                cfg = get_config(); cfg["gemini_voice"] = _res; save_config(cfg)
+                return self._json({"ok": True, "gemini_voice": _res})
             if isinstance(data.get("call_name"), str):
                 cfg = get_config()
                 cfg["call_name"] = data["call_name"].strip()[:40]
@@ -15633,7 +15940,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 
 
 def main():
@@ -15690,6 +15997,8 @@ def main():
         log_change("আপগ্রেড: v1.9.0 — ELITE ব্যাচ: #763/#764/#765 বিশ্লেষণ, #755/#756/#759 প্রশিক্ষণ ও চাপ-সিমুলেশন, #766/#662/#767/#769/#770/#781/#782/#783/#784 পরিকল্পনা, ইঞ্জিন-রেডি #754/#757/#760/#761/#762/#768/#771/#776/#778/#779/#780, সুইপ #667/#703/#716/#729/#753")
         register_capability("v191-echoguard", "Echo guard: স্পিকার থেকে নিজের কণ্ঠ মাইকে ফিরে এলে চিনে ফেলে দেয় — লাইভ মোডে নিজে নিজেকে উত্তর দেয় না; আসল barge-in আগের মতোই; সেটিংসে টগল (ডিফল্ট চালু)")
         log_change("আপগ্রেড: v1.9.1 — বাগ-ফিক্স: লাইভ মোডে Sokhi নিজের বলা কথা স্পিকার→মাইক echo-তে শুনে নিজেকেই উত্তর দিত; echo guard যোগ হলো — speak()-এ বলা কথা মনে রেখে recognition-ইনপুট মিলিয়ে ফেলে দেয় (বলা চলাকালে + শেষের ৮০০ms), barge-in অক্ষত; সেটিংসে 'নিজের কণ্ঠ চেনা (echo guard)' টগল")
+        register_capability("v192-voice", "কণ্ঠের ইঞ্জিন বাছাই (Gemini/Edge/ব্রাউজার) + Gemini গলা বাছাই (ডিফল্ট Aoede) + Edge-এ তানিশা গলা; কোন ইঞ্জিন+গলা বলল status/ডাক্তারে পরিষ্কার; Gemini ফলব্যাকে সৎ নোট")
+        log_change("আপগ্রেড: v1.9.2 — কণ্ঠের মান: Settings-এ TTS ইঞ্জিন বাছাই (Gemini = সবচেয়ে প্রাণবন্ত, একই ফ্রি key; ব্যর্থ হলে Edge→Google ফলব্যাক + status/ডাক্তারে নোট), Gemini গলা বাছাই (Aoede/Kore/Leda/Callirrhoe/Puck), Edge গলায় তানিশা যোগ, /api/tts এখন WAV-ও দেয় আর ব্যর্থতায় HTTP 500 (পেজের ব্রাউজার-গলা ফলব্যাক সত্যিই চলে)")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
