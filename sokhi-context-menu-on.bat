@@ -1,31 +1,30 @@
 @echo off
 chcp 65001 >nul
-title Sokhi — ডান-ক্লিক মেনু চালু করা
+title Sokhi - Right-click menu ON
 echo ================================================
-echo   Sokhi — ডান-ক্লিক মেনু চালু করা হচ্ছে
+echo   Sokhi right-click menu is being added
 echo ================================================
 echo.
-if not exist "%~dp0Sokhi.exe" (
-  echo সতর্কতা: এই ফোল্ডারে Sokhi.exe পাওয়া যায়নি!
-  echo এই .bat ফাইলটা Sokhi.exe-র পাশের ফোল্ডারেই রাখতে হবে।
-  echo মেনু যোগ করা হলো না।
-  echo.
-  pause
-  exit /b 1
-)
+if exist "%~dp0Sokhi.exe" goto HAVE_EXE
+echo WARNING: Sokhi.exe not found in this folder!
+echo Keep this bat file in the same folder as Sokhi.exe.
+echo The menu was NOT added.
+goto END
+:HAVE_EXE
 reg add "HKCU\Software\Classes\*\shell\SokhiExplain" /ve /d "Sokhi দিয়ে বুঝাও" /f
-if errorlevel 1 (
-  echo দুঃখিত — মেনু যোগ করা যায়নি।
-  pause
-  exit /b 1
-)
+if errorlevel 1 goto FAIL
 reg add "HKCU\Software\Classes\*\shell\SokhiExplain" /v Icon /d "%~dp0sokhi.ico" /f >nul
 reg add "HKCU\Software\Classes\*\shell\SokhiExplain\command" /ve /d "\"%~dp0Sokhi.exe\" --explain \"%%1\"" /f >nul
 echo.
-echo হয়ে গেছে! এখন থেকে যেকোনো ফাইলে ডান-ক্লিক করলেই
-echo "Sokhi দিয়ে বুঝাও" মেনুটা দেখতে পাবে।
-echo ফাইলে ক্লিক করলে Sokhi সেটা সহজ বাংলায় বুঝিয়ে দেবে।
+echo DONE! Now right-click any file and you will see
+echo the "Sokhi diye bujhao" menu. Sokhi will explain
+echo the file in simple Bangla.
 echo.
-echo মেনু সরাতে চাইলে sokhi-context-menu-off.bat চালাও।
+echo To remove the menu, run sokhi-context-menu-off.bat.
+goto END
+:FAIL
+echo Sorry - the menu could not be added.
+goto END
+:END
 echo.
 pause
