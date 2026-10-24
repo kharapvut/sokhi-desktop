@@ -1401,7 +1401,8 @@ def _teacher_start(text, low):
         topic = _DEFAULT_TOPICS.get(subject, "")
     session = {"subject": subject, "topic": topic, "step": 1,
                "offline_idx": 0, "weak": [],
-               "started": str(date.today()), "last_step": ""}
+               "started": str(date.today()), "last_step": "",
+               "last_ts": time.time()}
     step_text, _ = _teacher_step_text(session, "first")
     session["last_step"] = step_text
     _study_save(_STUDY_SESSION_FILE, session)
@@ -1434,6 +1435,67 @@ def _teacher_finish(session):
     return out
 
 
+# --- v1.9.4: শিক্ষক-সেশন ফাঁদ-মুক্তি (escape + idle expiry) ---------------
+# পুরোনো সেশন শেষ না হলে teacher_handle প্রতিটি বার্তাকে যাচাই-প্রশ্নের
+# উত্তর ধরে বিচার করত (Monir-এর রিপোর্ট, 2026-10-24)। এখন: (ক) প্রশ্ন বা
+# স্পষ্ট নতুন-বিষয়/কমান্ড হলে সেশন ভদ্রভাবে শেষ করে normal routing;
+# (খ) শেষ কার্যকলাপের ৩০+ মিনিট পেরিয়ে গেলে সেশন নিজে শেষ; (গ) UI-তে
+# 'পড়া চলছে' chip-এর জন্য _teacher_public_state()।
+TEACHER_IDLE_SECONDS = 30 * 60
+TEACHER_ESCAPE_NOTE = {"text": ""}
+
+_TEACH_Q_STARTS = ("কি", "কী", "কেন", "কীভাবে", "কিভাবে", "কখন", "কোথায়",
+                   "কোথায়", "কোনটা", "কোনটি", "কোন", "কার", "কত", "কেমন",
+                   "কোথা", "কীসের", "কিসের")
+_TEACH_Q_STARTS_EN = ("what", "why", "how", "when", "where", "which", "who",
+                      "is", "are", "can", "could", "do", "does", "did")
+_TEACH_ESCAPE_PHRASES = ("আজকের খবর", "খবর বলো", "আবহাওয়া কেমন",
+                         "আবহাওয়া বলো", "গান বাজাও", "গান শোনাও",
+                         "গান চালাও", "সময় কত", "কয়টা বাজে",
+                         "ইউটিউব খোলো", "ইউটিউব খোল", "অন্য বিষয়",
+                         "পড়ব না", "শিখব না", "বাদ দাও", "লাগবে না",
+                         "মনে রেখো", "ছবি দেখো", "স্ক্রিন দেখো",
+                         "নোট লেখো", "রিমাইন্ডার দাও")
+
+
+def _teacher_escape_intent(text, low):
+    """বার্তাটা যাচাই-প্রশ্নের উত্তর না হয়ে প্রশ্ন/নতুন-বিষয়/কমান্ড
+    কিনা। ছোট উত্তর (সংখ্যা/এক-দুই শব্দ) কখনোই escape নয় — সেগুলোতে
+    প্রশ্নচিহ্ন থাকে না, প্রশ্ন-শব্দ দিয়ে শুরুও হয় না।"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if "?" in t or "？" in t:
+        return True
+    words = t.split()
+    if words:
+        first = words[0].strip(".,।!?:;—-\"'“”")
+        if first in _TEACH_Q_STARTS or first.lower() in _TEACH_Q_STARTS_EN:
+            return True
+    if any(p in t for p in _TEACH_ESCAPE_PHRASES):
+        return True
+    return False
+
+
+def _teacher_public_state():
+    """/api/status ও /api/chat-এর জন্য: (সেশন সক্রিয় কিনা, লেবেল)।
+    idle-expiry-র একই নিয়ম — মেয়াদোত্তীর্ণ সেশন 'চলছে' দেখাবে না।"""
+    try:
+        s = _load_teacher_session()
+        if not s:
+            return False, ""
+        _lts = s.get("last_ts")
+        if not isinstance(_lts, (int, float)) or \
+                (time.time() - float(_lts)) > TEACHER_IDLE_SECONDS:
+            return False, ""
+        label = str(s.get("subject") or "")
+        if s.get("topic"):
+            label += " • " + str(s.get("topic"))
+        return True, label
+    except Exception:
+        return False, ""
+
+
 def teacher_handle(text, low):
     """শিক্ষক-মোডের বার্তা সামলায়। শিক্ষক-সংক্রান্ত না হলে None ফেরত দেয়,
     যাতে handle_message পরের ধাপে যেতে পারে।"""
@@ -1457,6 +1519,16 @@ def teacher_handle(text, low):
     if not session:
         return None
 
+    # --- v1.9.4: idle expiry — শেষ কার্যকলাপের ৩০+ মিনিট পেরিয়ে
+    # গেলে (অথবা পুরোনো সেশনে last_ts-ই না থাকলে) সেশন নিজে শেষ;
+    # সে আর chat আটকাবে না, বার্তা normal পথে যাবে।
+    _lts = session.get("last_ts")
+    if not isinstance(_lts, (int, float)) or \
+            (time.time() - float(_lts)) > TEACHER_IDLE_SECONDS:
+        _study_delete(_STUDY_SESSION_FILE)
+        return None
+    session["last_ts"] = time.time()
+
     subject = session["subject"]
 
     # --- বুঝিনি / আবার বোঝাও / আস্তে
@@ -1479,6 +1551,25 @@ def teacher_handle(text, low):
         _study_save(_STUDY_SESSION_FILE, session)
         wb_add(step_text)
         return step_text
+
+    # --- v1.9.4: প্রশ্ন/নতুন-বিষয়/কমান্ড হলে সেশন থেকে বেরিয়ে
+    # normal routing — অগ্রগতি সেভ থাকে, বন্ধুত্বপূর্ণ নোটটা
+    # /api/chat উত্তর শুরুতে বসিয়ে দেয় (TEACHER_ESCAPE_NOTE)।
+    if _teacher_escape_intent(text, low):
+        try:
+            _update_progress(
+                subject, topic=session.get("topic"),
+                weak_topics=session.get("weak", []),
+                add_sessions=1,
+                add_steps=max(int(session.get("step", 1)) - 1, 0))
+        except Exception:
+            pass
+        _study_delete(_STUDY_SESSION_FILE)
+        TEACHER_ESCAPE_NOTE["text"] = (
+            f"📖 পড়াটা ({subject}) আপাতত থামিয়ে দিলাম — আবার "
+            "শিখতে চাইলে বলো 'শেখাও' আর বিষয়ের নাম।")
+        wb_add(f"⏸ শিক্ষক সেশন থামল (প্রশ্ন/নতুন বিষয়) — {subject}")
+        return None
 
     # --- বাকি সব = যাচাই-প্রশ্নের উত্তর ধরে বিচার
     step_text, was_ok = _teacher_step_text(session, "judge",
@@ -8484,6 +8575,119 @@ def _tts_gemini(text, out_file, rate=None, pitch=None):
     return True
 
 
+STT_MIME_OK = {"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg",
+               "audio/wav", "audio/x-wav", "audio/aac", "audio/flac",
+               "audio/3gpp", "audio/3gpp2", "audio/aiff", "audio/x-aiff"}
+
+
+def _log_stt_error(detail):
+    """STT-এর আসল error data/stt-error.log-এ (key কখনো লগে যায় না —
+    key শুধু request header-এ থাকে)।"""
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        with (DATA / "stt-error.log").open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"{str(detail)[:400]}\n")
+    except Exception:
+        pass
+
+
+def stt_transcribe(audio, mime=None):
+    """v1.9.4: app-উইন্ডোর (pywebview/WebView2) mic-এর জন্য সার্ভার-STT।
+
+    WebView2-তে পেজের webkitSpeechRecognition থাকে না, তাই পেজ
+    MediaRecorder দিয়ে অডিও রেকর্ড করে এখানে পাঠায়; Gemini key থাকলে
+    generateContent-এ inline_data audio দিয়ে বাংলা ট্রান্সক্রিপ্ট আনা
+    হয় (vision-এর হুবহু প্যাটার্ন)। audio হতে পারে: base64 string,
+    data-URL string, বা {"data": ..., "mime_type": ...} dict।
+    key না থাকলে/ব্যর্থ হলে পরিষ্কার বাংলা error dict ফেরে (exception
+    নয়) এবং আসল error data/stt-error.log-এ লেখা থাকে।"""
+    import base64
+    cfg = get_config()
+    key = (cfg.get("gemini_api_key") or "").strip()
+    if not key:
+        return {"ok": False, "code": "no_key",
+                "error": "app-এর ভেতরে গলা শুনতে Gemini key লাগবে — "
+                         "সেটিংসে ফ্রি key বসাও, নাহলে Chrome browser-এ "
+                         "খুলে মাইক ব্যবহার করো।"}
+    _mime = ""
+    _data = ""
+    try:
+        if isinstance(audio, dict):
+            _mime = str(audio.get("mime_type") or audio.get("mime") or "")
+            _data = str(audio.get("data") or "")
+        elif isinstance(audio, str):
+            _m = re.match(r"data:([^;,]+);[^,]*?base64,(.*)", audio, re.S)
+            if _m:
+                _mime = _m.group(1)
+                _data = _m.group(2).strip()
+            else:
+                _data = audio.strip()
+        if mime:
+            _mime = str(mime)
+    except Exception:
+        _data = ""
+    _mime = (_mime or "").split(";")[0].strip().lower()
+    if not _data:
+        return {"ok": False, "code": "bad_audio",
+                "error": "অডিওটা পাইনি — আবার রেকর্ড করে পাঠাও।"}
+    if _mime and _mime not in STT_MIME_OK:
+        return {"ok": False, "code": "bad_audio",
+                "error": f"এই অডিওর ধরনটা ({_mime}) বুঝতে পারিনি — "
+                         "অন্য browser-এ চেষ্টা করো।"}
+    if not _mime:
+        _mime = "audio/webm"
+    if len(_data) > 6_000_000:
+        return {"ok": False, "code": "bad_audio",
+                "error": "রেকর্ডিংটা বড় হয়ে গেছে — ছোট করে আবার বলো।"}
+    try:
+        base64.b64decode(_data, validate=True)
+    except Exception:
+        return {"ok": False, "code": "bad_audio",
+                "error": "অডিওটা ঠিকমতো পাইনি — আবার পাঠাও।"}
+    prompt = ("এই অডিওতে যা বলা হয়েছে, হুবহু সেটাই লিখে দাও। বাংলা হলে "
+              "বাংলা হরফে লেখো। শুধু কথাগুলোই লেখো — কোনো ভূমিকা, ব্যাখ্যা, "
+              "উদ্ধৃতি-চিহ্ন বা 'ট্রান্সক্রিপ্ট' জাতীয় শব্দ যোগ করবে না। "
+              "কিছু শোনা না গেলে একদম খালি উত্তর দাও।")
+    body = {"contents": [{"parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": _mime, "data": _data}}]}],
+            "generationConfig": {"temperature": 0}}
+    last_err = ""
+    for model in _gemini_order(cfg, False)[:2]:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent")
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": key}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            parts = data["candidates"][0]["content"]["parts"]
+            text = "".join(str(p.get("text", "")) for p in parts).strip()
+            text = text.strip('"\u201c\u201d\u2018\u2019').strip()
+            if not text:
+                return {"ok": False, "code": "empty",
+                        "error": "কথাটা ঠিক শুনতে পাইনি — আরেকবার একটু "
+                                 "কাছে থেকে, স্পষ্ট করে বলো।"}
+            return {"ok": True, "text": text}
+        except Exception as e:
+            detail = str(e)
+            try:
+                if hasattr(e, "read"):
+                    detail += " " + e.read().decode(
+                        "utf-8", errors="ignore")[:200]
+            except Exception:
+                pass
+            last_err = f"{model}: {detail[:250]}"
+            _log_stt_error(last_err)
+            continue
+    return {"ok": False, "code": "api",
+            "error": "গলা শুনতে গিয়ে সার্ভারে সমস্যা হলো — একটু পরে আবার "
+                     "বলো। (আসল কারণটা data/stt-error.log-এ লিখে রাখলাম)"}
+
+
 def make_tts_audio(text, rate=None, pitch=None):
     # One call = one text = one request per engine (no server-side
     # chunking — short replies are never split; the 600-char cap is a
@@ -13284,6 +13488,8 @@ body.guest #pane-memory,body.guest #convowrap,body.guest #rightcol{display:none!
   <div id="voicestat" class="statline">গলার অবস্থা জানা যাচ্ছে…</div>
   <div id="voiceengine" class="statline"></div>
   <button onclick="testVoice()">গলা টেস্ট করো</button>
+  <div id="micstat" class="statline">মাইকের অবস্থা জানা যাচ্ছে…</div>
+  <button onclick="testMic194()">🎤 মাইক টেস্ট করো</button>
   <div style="font-size:13px;margin-top:12px">গলার টোন:
    <select id="tonepreset" onchange="saveTone()"><option>মিষ্টি</option><option>স্বাভাবিক</option><option>প্রাণবন্ত</option></select>
   </div>
@@ -13419,6 +13625,7 @@ body.guest #pane-memory,body.guest #convowrap,body.guest #rightcol{display:none!
 </div>
 </div>
 
+<div id="teachbar"><span>📖 পড়া চলছে: <span id="teachtxt"></span></span><button onclick="stopTeach194()">পড়া থামাও</button></div>
 <div id="bar">
  <div id="suggest"></div>
  <textarea id="text" rows="1" placeholder="Sokhi-কে বলো... (বাংলা/Banglish)"></textarea>
@@ -15845,6 +16052,179 @@ function v14RemTick(){
 setInterval(v14RemTick,30000);
 })();
 </script>
+<style>
+#teachbar{display:none;align-items:center;gap:8px;margin:0 10px 6px;padding:7px 12px;background:var(--panel);border:1px solid var(--line);border-radius:10px;font-size:13.5px}
+#teachbar button{margin-left:auto;flex:none}
+</style>
+<script>
+/* ================================================================
+   v1.9.4 — app-window voice fallback + teacher chip
+   সমস্যা: pywebview/WebView2 উইন্ডোতে Web Speech API
+   (webkitSpeechRecognition) থাকে না — তাই Chrome-এ mic/live চললেও
+   app-এর ভেতরে চলত না। এই ব্লক আগের mic()/startLive()/listen()/
+   stopLive() মোড়কে দেয়: Web Speech থাকলে আগের পথই, না থাকলে
+   MediaRecorder দিয়ে রেকর্ড -> POST /api/stt (Gemini) -> লেখা।
+   ================================================================ */
+function _srOk194(){return !!(window.SpeechRecognition||window.webkitSpeechRecognition)}
+function _recOk194(){try{return !!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&window.MediaRecorder)}catch(e){return false}}
+function sttMode194(){return _srOk194()?'browser':(_recOk194()?'app':'none')}
+var _mr194={rec:null,stream:null,chunks:[],mime:'',live:false,onDone:null,heard:false,t0:0,timer:0,actx:null};
+function _micDenied194(){
+ setStatus('🎤 মাইকের অনুমতি পাইনি');
+ try{alert('মাইকের অনুমতি পাইনি। Windows Settings → Privacy → Microphone-এ গিয়ে এই app-কে মাইকের অনুমতি দাও, তারপর আবার চেষ্টা করো। (Chrome browser-এ খুললে মাইক আগের মতোই চলবে।)')}catch(e){}}
+function _mrCleanup194(){
+ if(_mr194.timer){clearInterval(_mr194.timer);_mr194.timer=0}
+ if(_mr194.actx){try{_mr194.actx.close()}catch(e){}_mr194.actx=null}
+ if(_mr194.stream){try{_mr194.stream.getTracks().forEach(function(t){t.stop()})}catch(e){}_mr194.stream=null}
+ _mr194.rec=null;_mr194.chunks=[]}
+function _mrStop194(){try{if(_mr194.rec&&_mr194.rec.state!=='inactive')_mr194.rec.stop()}catch(e){}}
+function _mrFinish194(){
+ var cb=_mr194.onDone,mime=(_mr194.mime||'audio/webm').split(';')[0],heard=_mr194.heard;
+ var blob=new Blob(_mr194.chunks,{type:_mr194.mime||'audio/webm'});
+ _mrCleanup194();
+ if(!cb)return;
+ if(!heard||!blob.size){cb(null,'silent');return}
+ var rd=new FileReader();
+ rd.onload=function(){var s=String(rd.result||'');var i=s.indexOf(',');cb({audio:i>=0?s.slice(i+1):s,mime:mime},null)};
+ rd.onerror=function(){cb(null,'read')};
+ rd.readAsDataURL(blob)}
+function _silenceWatch194(){
+ try{
+  var AC=window.AudioContext||window.webkitAudioContext;if(!AC||!_mr194.stream)return;
+  var ctx=new AC();_mr194.actx=ctx;
+  var src=ctx.createMediaStreamSource(_mr194.stream);
+  var an=ctx.createAnalyser();an.fftSize=512;src.connect(an);
+  var buf=new Uint8Array(an.frequencyBinCount);var lastLoud=Date.now();
+  _mr194.timer=setInterval(function(){
+   if(!_mr194.rec){clearInterval(_mr194.timer);_mr194.timer=0;return}
+   an.getByteTimeDomainData(buf);
+   var sum=0;for(var i=0;i<buf.length;i++){var v=(buf[i]-128)/128;sum+=v*v}
+   var rms=Math.sqrt(sum/buf.length);var now=Date.now();
+   if(rms>0.02){_mr194.heard=true;lastLoud=now}
+   if(now-_mr194.t0>(_mr194.live?15000:20000)){_mrStop194();return}
+   if(_mr194.heard&&now-lastLoud>1200){_mrStop194();return}
+   if(!_mr194.heard&&now-_mr194.t0>8000){_mrStop194();return}
+  },120);
+ }catch(e){}}
+async function _recBegin194(live,onDone){
+ if(_mr194.rec)return false;
+ var stream=null;
+ try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}
+ catch(e){_micDenied194();return false}
+ var mime='';var cands=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4','audio/ogg'];
+ for(var k=0;k<cands.length;k++){try{if(MediaRecorder.isTypeSupported(cands[k])){mime=cands[k];break}}catch(e){}}
+ var rec=null;
+ try{rec=mime?new MediaRecorder(stream,{mimeType:mime}):new MediaRecorder(stream)}
+ catch(e){try{rec=new MediaRecorder(stream)}catch(e2){try{stream.getTracks().forEach(function(t){t.stop()})}catch(e3){}_micDenied194();return false}}
+ _mr194.rec=rec;_mr194.stream=stream;_mr194.chunks=[];_mr194.mime=rec.mimeType||mime||'audio/webm';
+ _mr194.live=!!live;_mr194.onDone=onDone;_mr194.heard=false;_mr194.t0=Date.now();
+ rec.ondataavailable=function(ev){if(ev.data&&ev.data.size)_mr194.chunks.push(ev.data)};
+ rec.onstop=function(){_mrFinish194()};
+ try{rec.start(250)}catch(e){_mrCleanup194();return false}
+ _silenceWatch194();
+ return true}
+async function _sttPost194(payload){
+ return await api('/api/stt',payload)}
+/* ---------- mic বোতাম: রেকর্ডার পথ ---------- */
+async function _micRec194(){
+ if(_mr194.rec){_mrStop194();return}
+ try{stopSpeak()}catch(e){}
+ setStatus('🎤 শুনছি… (বলা শেষে একটু থামলেই পাঠিয়ে দেব; চাইলে 🎤 আবার চাপো)');
+ var orb=document.getElementById('orb');if(orb)orb.classList.add('listening');
+ var ok=await _recBegin194(false,async function(payload,err){
+  if(orb)orb.classList.remove('listening');
+  if(err||!payload){setStatus('🎤 কিছু শোনা যায়নি — আরেকবার বলো');return}
+  setStatus('🎤 লিখছি…');
+  var j=null;try{j=await _sttPost194(payload)}catch(e){}
+  if(j&&j.ok&&j.text){
+   if(isEchoOfSpeech(j.text)){setStatus('🔇 নিজের কণ্ঠ ফেলে দেওয়া হলো');return}
+   var el=document.getElementById('text');if(el)el.value=j.text;
+   send(true);
+  }else{
+   setStatus('🎤 '+((j&&j.error)||'গলা শোনা যায়নি'));
+   if(j&&j.code==='no_key'){try{alert(j.error)}catch(e){}}}});
+ if(!ok&&orb)orb.classList.remove('listening')}
+/* ---------- live voice: রেকর্ডার পথ ---------- */
+function _startLiveRec194(){
+ liveOn=true;try{setMood('listening')}catch(e){}
+ var b=document.getElementById('livebtn');if(b){b.classList.add('on');b.textContent='লাইভ চালু'}
+ add('লাইভ মোড চালু — এখন শুধু কথা বলো, আমি শুনে উত্তর দেব। থামাতে বলো: লাইভ বন্ধ।','sokhi');
+ listen()}
+async function _liveRecListen194(){
+ if(!liveOn||speakingNow)return;
+ try{stopSpeak()}catch(e){}
+ var orb=document.getElementById('orb');if(orb)orb.classList.add('listening');
+ try{setMood('listening')}catch(e){}
+ setStatus('🎧 শুনছি…');
+ var ok=await _recBegin194(true,async function(payload,err){
+  if(orb)orb.classList.remove('listening');
+  if(!liveOn)return;
+  if(err||!payload){if(liveOn)setTimeout(listen,600);return}
+  var j=null;try{j=await _sttPost194(payload)}catch(e){}
+  if(!j||!j.ok){
+   if(j&&(j.code==='no_key'||j.code==='api')){add('🎤 '+(j.error||'গলা শোনা যাচ্ছে না'),'sokhi');stopLive();return}
+   if(liveOn)setTimeout(listen,600);return}
+  var txt=(j.text||'').trim();
+  if(!txt){if(liveOn)listen();return}
+  if(isEchoOfSpeech(txt)){setStatus('🔇 নিজের কণ্ঠ ফেলে দেওয়া হলো');if(liveOn)listen();return}
+  if(/লাইভ বন্ধ|থামো|স্টপ/.test(txt)){add(txt,'me');stopLive();add('লাইভ বন্ধ করলাম।','sokhi');return}
+  add(txt,'me');setStatus('🤔 ভাবছি…');try{setMood('thinking')}catch(e){}
+  try{var r=await api('/api/chat',{message:txt});add(r.reply,'sokhi');
+   if(r.teacher_active!==undefined)updTeachChip(!!r.teacher_active,r.teacher_label||'');
+   setStatus('🗣️ বলছি…');await speak(r.reply,moodRate(txt))}catch(e){}
+  if(liveOn)listen()});
+ if(!ok){try{stopLive()}catch(e){}}}
+/* ---------- আগের ফাংশনগুলোর মোড়ক (dispatch) ---------- */
+var _micOrig194=window.mic,_startLiveOrig194=window.startLive,_stopLiveOrig194=window.stopLive,_listenOrig194=window.listen;
+window.mic=function(){if(_srOk194())return _micOrig194();return _micRec194()};
+window.startLive=function(){if(_srOk194())return _startLiveOrig194();return _startLiveRec194()};
+window.listen=function(){if(_srOk194())return _listenOrig194();return _liveRecListen194()};
+window.stopLive=function(){_mrStop194();return _stopLiveOrig194()};
+/* ---------- সেটিংস: mic মোড status + mic টেস্ট ---------- */
+var _keySet194=null;
+async function updMicStat194(){
+ var el=document.getElementById('micstat');if(!el)return;
+ var mode=sttMode194();
+ if(mode==='browser'){el.textContent='🎤 মাইক মোড: Browser voice — এই উইন্ডোতে Web Speech গলা-শোনা চলছে।';return}
+ if(mode==='none'){el.textContent='🎤 মাইক মোড: পাওয়া যাচ্ছে না — এই উইন্ডোতে গলা-শোনা চলবে না; Chrome-এ খুলে মাইক ব্যবহার করো।';return}
+ if(_keySet194===null){
+  try{var s=await api('/api/status');_keySet194=!!s.key_set;
+   if(s.teacher_active!==undefined)updTeachChip(!!s.teacher_active,s.teacher_label||'')}
+  catch(e){_keySet194=false}}
+ el.textContent=_keySet194
+  ?'🎤 মাইক মোড: App voice (Gemini) — app-এর ভেতরে কথা রেকর্ড করে Gemini দিয়ে লেখা হয়।'
+  :'🎤 মাইক মোড: App voice (Gemini) — ⚠️ Gemini key বসানো নেই; app-এ মাইক চলতে ওপরের ঘরে key বসাও, নাহলে Chrome-এ খোলো।'}
+async function testMic194(){
+ var el=document.getElementById('micstat');
+ var mode=sttMode194();
+ if(mode==='browser'){if(el)el.textContent='🎤 টেস্ট: এখন মাইক চালু করছি — কিছু বলো, লেখা উঠলেই মাইক ঠিক আছে।';mic();return}
+ if(mode==='none'){if(el)el.textContent='🎤 টেস্ট: এই উইন্ডোতে মাইক চলবে না — Chrome-এ খোলো।';return}
+ if(_mr194.rec){_mrStop194();return}
+ if(el)el.textContent='🎤 টেস্ট চলছে — কিছু বলো… (সর্বোচ্চ ৫ সেকেন্ড)';
+ setStatus('🎤 মাইক টেস্ট — বলো…');
+ var ok=await _recBegin194(false,async function(payload,err){
+  if(err||!payload){if(el)el.textContent='🎤 টেস্ট: কিছু শোনা যায়নি — আরেকবার চেষ্টা করো।';return}
+  var j=null;try{j=await _sttPost194(payload)}catch(e){}
+  if(j&&j.ok){if(el)el.textContent='🎤 টেস্ট ✅ মাইক ঠিক আছে — শুনলাম: "'+j.text+'"'}
+  else if(el){el.textContent='🎤 টেস্ট ❌ '+((j&&j.error)||'গলা শোনা যায়নি')}});
+ if(ok){setTimeout(function(){if(_mr194.rec)_mrStop194()},5000)}
+ else if(el){el.textContent='🎤 টেস্ট: মাইকের অনুমতি পাইনি — Windows Settings → Privacy → Microphone দেখো।'}}
+/* ---------- শিক্ষক: 'পড়া চলছে' chip + থামানোর বোতাম ---------- */
+function updTeachChip(on,label){
+ var b=document.getElementById('teachbar');if(!b)return;
+ if(on){b.style.display='flex';var t=document.getElementById('teachtxt');if(t)t.textContent=label||''}
+ else b.style.display='none'}
+async function pollTeach194(){
+ try{var s=await api('/api/status');updTeachChip(!!s.teacher_active,s.teacher_label||'')}catch(e){}}
+async function stopTeach194(){
+ try{var j=await api('/api/chat',{message:'আজ থাক'});
+  if(j&&j.reply)add(j.reply,'sokhi');
+  updTeachChip(!!(j&&j.teacher_active),(j&&j.teacher_label)||'')}
+ catch(e){updTeachChip(false,'')}}
+setTimeout(function(){try{updMicStat194()}catch(e){}try{pollTeach194()}catch(e){}},1200);
+setInterval(function(){try{pollTeach194()}catch(e){}},20000);
+</script>
+
 </body></html>"""
 
 
@@ -15960,7 +16340,7 @@ class Handler(BaseHTTPRequestHandler):
                                "knowledge": len(load_json(KNOW_FILE, {})),
                                "auto_upgrade": bool(get_config().get("auto_self_upgrade", True)),
                                "voice_engine": tts_engine_status(), "voice_rate": _clamp_voice_rate(get_config().get("voice_rate", 1.0)),
-                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "tts_engine": get_config().get("tts_engine", "edge"), "gemini_voice": get_config().get("gemini_voice", "Aoede"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "echo_guard": bool(get_config().get("echo_guard", True)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "guest_mode": bool(get_config().get("guest_mode")), "orb_style": get_config().get("orb_style", "blue"), "en_practice": bool(get_config().get("en_practice")), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline"})
+                               "tts_preset": get_config().get("tts_preset", "মিষ্টি"), "tts_voice": get_config().get("tts_voice", "bn-BD-NabanitaNeural"), "browser_voice": get_config().get("browser_voice", ""), "tts_engine": get_config().get("tts_engine", "edge"), "gemini_voice": get_config().get("gemini_voice", "Aoede"), "call_name": get_config().get("call_name", ""), "update_url_set": bool(get_config().get("update_url")), "voice_edge": bool(shutil.which("edge-tts") or shutil.which("edge-tts.exe")), "key_set": bool(get_config().get("gemini_api_key")), "foundation": foundation_status(), "exam_active": exam_active(), "agents_active": sum(1 for j in AGENT_JOBS if j["status"] == "চলছে"), "reply_style": get_config().get("reply_style", "স্বাভাবিক"), "quiet_start": get_config().get("quiet_start", ""), "quiet_end": get_config().get("quiet_end", ""), "reply_language": get_config().get("reply_language", "বাংলা"), "wake_word": bool(get_config().get("wake_word", False)), "echo_guard": bool(get_config().get("echo_guard", True)), "dim_start": get_config().get("dim_start", ""), "dim_end": get_config().get("dim_end", ""), "dim_level": get_config().get("dim_level", 0.6), "gemini_model": get_config().get("gemini_model", "gemini-3.8-flash"), "gemini_model_mode": get_config().get("gemini_model_mode", "auto"), "guest_mode": bool(get_config().get("guest_mode")), "orb_style": get_config().get("orb_style", "blue"), "en_practice": bool(get_config().get("en_practice")), "brain": "smart" if bool(get_config().get("gemini_api_key")) else "offline", "teacher_active": _teacher_public_state()[0], "teacher_label": _teacher_public_state()[1]})
         if self.path == "/api/memory":
             if not self._pin_ok():
                 return self._json({"error": "pin"}, 403)
@@ -16033,7 +16413,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback", "/api/pins", "/api/backup", "/api/dailyq", "/api/reminders", "/api/bazaar", "/api/wins"):
+        if self.path not in ("/api/chat", "/api/settings", "/api/testkey", "/api/tts", "/api/tts_test", "/api/agents", "/api/exam", "/api/notes", "/api/tasks", "/api/rules", "/api/whiteboard", "/api/convos", "/api/memory", "/api/feedback", "/api/pins", "/api/backup", "/api/dailyq", "/api/reminders", "/api/bazaar", "/api/wins", "/api/stt"):
             return self._json({"error": "not found"}, 404)
         if not self._pin_ok():
             return self._json({"error": "pin"}, 403)
@@ -16053,6 +16433,9 @@ class Handler(BaseHTTPRequestHandler):
                 _vce = (get_config().get("gemini_voice") or "Aoede") if _eng == "gemini" else voice_identity()["voice"]
                 return self._json({"ok": True, "engine": _eng, "voice_engine": tts_engine_status(), "voice": _vce, "rate": VOICE_STATE.get("rate", ""), "pitch": VOICE_STATE.get("pitch", ""), "note": VOICE_STATE.get("note", "")})
             return self._json({"ok": False, "engine": VOICE_STATE.get("engine", ""), "voice_engine": tts_engine_status(), "error": VOICE_STATE.get("error", "অজানা সমস্যা"), "note": VOICE_STATE.get("note", "")})
+        if self.path == "/api/stt":
+            return self._json(stt_transcribe(data.get("audio"),
+                                             data.get("mime")))
         if self.path == "/api/tts":
             audio = make_tts_audio(str(data.get("text") or ""), data.get("rate") or None, data.get("pitch") or None)
             if not audio:
@@ -16355,8 +16738,18 @@ class Handler(BaseHTTPRequestHandler):
                           f"model={LAST_LATENCY.get('model')}\n")
         except Exception:
             pass
+        _esc194 = (TEACHER_ESCAPE_NOTE.get("text") or "").strip()
+        if _esc194:
+            TEACHER_ESCAPE_NOTE["text"] = ""
+            reply = _esc194 + "\n\n" + reply
         _resp = {"reply": reply, "ms": _chat_ms}
         _resp.update(_extra)
+        try:
+            _ta194, _tl194 = _teacher_public_state()
+            _resp["teacher_active"] = _ta194
+            _resp["teacher_label"] = _tl194
+        except Exception:
+            pass
         self._json(_resp)
 
 
@@ -16371,7 +16764,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.4"
 
 
 def main():
@@ -16432,6 +16825,8 @@ def main():
         log_change("আপগ্রেড: v1.9.2 — কণ্ঠের মান: Settings-এ TTS ইঞ্জিন বাছাই (Gemini = সবচেয়ে প্রাণবন্ত, একই ফ্রি key; ব্যর্থ হলে Edge→Google ফলব্যাক + status/ডাক্তারে নোট), Gemini গলা বাছাই (Aoede/Kore/Leda/Callirrhoe/Puck), Edge গলায় তানিশা যোগ, /api/tts এখন WAV-ও দেয় আর ব্যর্থতায় HTTP 500 (পেজের ব্রাউজার-গলা ফলব্যাক সত্যিই চলে)")
         register_capability("v193-app", "Windows app সঙ্গী: toast-সারি, ফোন-জোড়া QR, অতিথি/গোপনীয়তা মোড, উপস্থিতির রঙ, মিডিয়া-নিয়ন্ত্রণ, স্ক্রিন দেখে সাহায্য, ক্লিপবোর্ড বুঝাও, খরচের খাতা, সন্ধ্যার সারাংশ, ইংরেজি প্র্যাকটিস, উৎসবের ছোঁয়া")
         log_change("আপগ্রেড: v1.9.3 — Windows app সংস্করণ: toast queue, /api/phone_qr, guest mode, orb style, media keys, screenshot-vision, clipboard explain, expense book, evening summary, English practice, festival touch")
+        register_capability("v194-voicefix", "app-উইন্ডোতে মাইক: Web Speech না থাকলে MediaRecorder + Gemini STT fallback (mic ও live voice), সেটিংসে mic-মোড status + mic টেস্ট; শিক্ষক-সেশন ফাঁদ-মুক্তি (প্রশ্নে escape, ৩০ মিনিট idle expiry, পড়া-চলছে chip)")
+        log_change("আপগ্রেড: v1.9.4 — ফিক্স: (১) Windows app (WebView2) উইন্ডোতে mic/live voice চলত না (Web Speech API নেই) — MediaRecorder + /api/stt (Gemini) fallback, mic status + টেস্ট বোতাম; (২) পুরোনো শিক্ষক-সেশন সব বার্তাকে যাচাই-উত্তর ধরে আটকাত — প্রশ্ন/কমান্ড escape, ৩০-মিনিট idle expiry, 'পড়া চলছে' chip + থামানোর বোতাম")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
