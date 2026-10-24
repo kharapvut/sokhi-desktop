@@ -16764,7 +16764,7 @@ def local_ip():
         return "127.0.0.1"
 
 
-APP_VERSION = "1.9.4"
+APP_VERSION = "1.9.5"
 
 
 def main():
@@ -16827,6 +16827,8 @@ def main():
         log_change("আপগ্রেড: v1.9.3 — Windows app সংস্করণ: toast queue, /api/phone_qr, guest mode, orb style, media keys, screenshot-vision, clipboard explain, expense book, evening summary, English practice, festival touch")
         register_capability("v194-voicefix", "app-উইন্ডোতে মাইক: Web Speech না থাকলে MediaRecorder + Gemini STT fallback (mic ও live voice), সেটিংসে mic-মোড status + mic টেস্ট; শিক্ষক-সেশন ফাঁদ-মুক্তি (প্রশ্নে escape, ৩০ মিনিট idle expiry, পড়া-চলছে chip)")
         log_change("আপগ্রেড: v1.9.4 — ফিক্স: (১) Windows app (WebView2) উইন্ডোতে mic/live voice চলত না (Web Speech API নেই) — MediaRecorder + /api/stt (Gemini) fallback, mic status + টেস্ট বোতাম; (২) পুরোনো শিক্ষক-সেশন সব বার্তাকে যাচাই-উত্তর ধরে আটকাত — প্রশ্ন/কমান্ড escape, ৩০-মিনিট idle expiry, 'পড়া চলছে' chip + থামানোর বোতাম")
+        register_capability("v195-rerelease", "v1.9.4-এর একই ফিক্স (app-উইন্ডো mic/STT fallback + শিক্ষক-সেশন ফাঁদ-মুক্তি) — কোডে নতুন বদল নেই, শুধু সংস্করণ-সংখ্যা")
+        log_change("আপগ্রেড: v1.9.5 — 1.9.4-এর একই ফিক্স, সংখ্যা-সংঘর্ষ এড়াতে পুনঃপ্রকাশ (ল্যাপটপের দৈনিক সংস্করণ-শৃঙ্খল আগেই 1.9.4 দেখানোয় updater 1.9.4 নিত না; কোড হুবহু একই)")
     register_capability("core", "কথা, স্মৃতি, PC কমান্ড, আবহাওয়া, খবর, ওয়েব সার্চ")
     daily_release_if_due()
     pin = get_pin()
